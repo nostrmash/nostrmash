@@ -4,7 +4,7 @@
 # stage. Do not put ${SOURCE_COMMIT} in docker-compose.coolify.yml —
 # Coolify then locks it as a UI env var that cannot be deleted.
 ARG SOURCE_COMMIT=
-FROM golang:1.26.11-alpine AS build
+FROM golang:1.27.0-alpine AS build
 
 WORKDIR /src
 
@@ -76,7 +76,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 		CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="$LDFLAGS" -o /out/migrate ./cmd/migrate \
 	'
 
-FROM alpine:3.20
+FROM alpine:3.24
 # No apk in the runtime stage: Coolify deploys have failed on Alpine CDN
 # fetches, and the Go binaries are static. alpine ships
 # ca-certificates-bundle plus busybox wget (used by Compose healthchecks).
