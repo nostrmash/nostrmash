@@ -1,0 +1,10 @@
+{
+  "body": {
+    "error": {
+      "code": "internal_error",
+      "message": "internal server error",
+      "request_id": "req-user-infos-err"
+    }
+  },
+  "status": 500
+}

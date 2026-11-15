@@ -1,0 +1,17 @@
+package query
+
+import "strings"
+
+// DiscoveryScope narrows one ranking to a single language. The zero value
+// ranks every language and must keep the unscoped response unchanged.
+type DiscoveryScope struct {
+	Language string
+	// Viewer is the canonical hex pubkey of the account whose follow list
+	// should tilt this ranking. Empty keeps the global list.
+	Viewer string
+}
+
+// Lang returns the normalized language code, or empty for every language.
+func (s DiscoveryScope) Lang() string {
+	return strings.ToLower(strings.TrimSpace(s.Language))
+}

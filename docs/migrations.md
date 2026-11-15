@@ -1,0 +1,93 @@
+# Migration Safety Guide
+
+Use this page when a change affects schema, rebuild posture, startup safety, or rollback assumptions. Migration design is part of the production surface, not a side task.
+
+Use this guide with:
+
+- `../RELEASE.md` for release/rollback notes
+- `operations.md` for runtime validation and incident triage
+- `../VERSIONING.md` and `compatibility.md` when schema changes alter external behavior
+
+## Who applies migrations
+
+There are two supported modes, controlled by `MIGRATE_ON_BOOT` (default `true`):
+
+- **Migrate on boot** (default, dev/test): every service applies pending embedded migrations during startup, serialized by a Postgres advisory lock. Simple, but a slow migration blocks boot and can be killed mid-flight by container health checks.
+- **Dedicated migrate step** (production): the one-shot `cmd/migrate` binary applies all pending migrations and exits; serving processes boot with `MIGRATE_ON_BOOT=false` and only *wait* (up to 5 minutes, polling the `schema_migrations_audit` table) until the schema reaches head, then proceed. The Coolify compose file wires this up: a `migrate` service runs first and api/ingestor/worker/trust_worker `depends_on` its successful completion.
+
+Run the migrate step manually with:
+
+```bash
+DATABASE_URL=postgres://... go run ./cmd/migrate   # or /app/migrate in the container image
+```
+
+A process booting with `MIGRATE_ON_BOOT=false` against a schema that never reaches head fails after the wait timeout with the list of pending migrations, rather than serving against a stale schema.
+
+## Choosing the right rollout posture
+
+| Change shape | Default posture |
+| --- | --- |
+| Additive table/column/index | normal release, still verify boot and runtime health |
+| Hot-table rewrite or large index build | staged rollout plus rehearsal when feasible |
+| Queue/checkpoint/rebuild-state change | treat as high risk and pair with explicit rollback notes |
+| Irreversible data transformation | require operator communication and a deliberate cutover plan |
+
+## Safety rules
+
+- **Append-only migration history**: never edit or reorder old migration files once applied in any environment.
+- **Prefer additive changes first**: add new tables/columns/indexes before removing old structures.
+- **Avoid long blocking operations in one step**: split risky backfills or large index/table changes into staged releases.
+- **Keep rollout reversible at release level**: if full DB rollback is not realistic, make application rollout/rollback safe by avoiding immediate destructive schema changes.
+- **Document operational impact** in release notes when migrations can change boot time, lock behavior, storage growth, or rebuild/job throughput.
+
+## Rollback-aware practices
+
+Schema rollback is often harder than binary rollback. Plan for this explicitly:
+
+1. **Expand phase**: introduce schema additions that old and new binaries can both tolerate.
+2. **Switch phase**: ship binaries that read/write the new shape while preserving compatibility where possible.
+3. **Contract phase**: only remove legacy columns/indexes/tables in a later release after operational confirmation.
+
+For changes that cannot be expanded/contracted cleanly (for example, major table rewrites), use staged rollout and explicit operator communication before cutover.
+
+Example mental model:
+
+- if old and new binaries can safely coexist, prefer expand/contract
+- if they cannot, treat the migration as a release event, not just a schema patch
+
+## Changes requiring extra scrutiny
+
+- large index builds or table rewrites on hot tables
+- changes to queue/job state tables
+- changes affecting checkpoint durability or replay/rebuild surfaces
+- irreversible data transformations
+- anything that can materially increase startup migration time
+
+For these changes, require:
+
+- staging-like rehearsal with representative data volume when feasible
+- explicit rollback notes in `RELEASE.md` output
+- post-release monitoring focus via `docs/operations.md`
+
+## Operational validation checklist
+
+After deploying schema changes:
+
+- verify all services boot cleanly (`/health`, `/ready`)
+- inspect queue/job and checkpoint behavior (`GET /admin/v1/jobs`, `GET /admin/v1/relays`)
+- inspect derivation/rebuild state (`GET /admin/v1/derivation-versions`, `GET /admin/v1/rebuilds`)
+- watch DB/pool saturation and operation error metrics for regressions
+
+## Contributor checklist for migration PRs
+
+For migration-related changes, include in PR description:
+
+1. Migration risk class (low/medium/high) and why.
+2. Rollout order assumptions (single-step vs staged).
+3. Rollback posture (binary-only vs requires operator action).
+4. Validation evidence from staging-like environment when change is high risk.
+
+## Scope limits
+
+- This project does **not** promise instant reversible down-migrations for every change.
+- Safety is achieved through phased schema design, staged rollout, and operational readiness rather than aggressive automatic rollback tooling.

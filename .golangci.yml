@@ -1,0 +1,94 @@
+run:
+  timeout: 7m
+
+linters-settings:
+  govet:
+    enable:
+      - nilness
+  revive:
+    confidence: 0.8
+    rules:
+      - name: empty-block
+      - name: unreachable-code
+      - name: superfluous-else
+      - name: context-as-argument
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: if-return
+      - name: indent-error-flow
+      - name: increment-decrement
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: var-declaration
+  gosec:
+    excludes:
+      - G306
+      - G115
+  depguard:
+    rules:
+      store-no-derivation:
+        files:
+          - internal/store/**/*.go
+          - '!**/*_test.go'
+        deny:
+          - pkg: github.com/nostrmash/nostrmash/internal/derivation
+            desc: store must remain independent from derivation
+      query-no-transport:
+        files:
+          - internal/query/**/*.go
+          - '!**/*_test.go'
+        deny:
+          - pkg: github.com/nostrmash/nostrmash/internal/api
+            desc: query must stay transport-agnostic
+          - pkg: github.com/nostrmash/nostrmash/internal/api_primal
+            desc: query must stay transport-agnostic
+          - pkg: github.com/nostrmash/nostrmash/internal/transport
+            desc: query must stay transport-agnostic
+      api-no-primal:
+        files:
+          - internal/api/**/*.go
+          - '!**/*_test.go'
+        deny:
+          - pkg: github.com/nostrmash/nostrmash/internal/api_primal
+            desc: native API transport must not depend on primal transport
+      primal-no-api:
+        files:
+          - internal/api_primal/**/*.go
+          - '!**/*_test.go'
+        deny:
+          - pkg: github.com/nostrmash/nostrmash/internal/api
+            desc: primal transport must not depend on native API transport
+
+linters:
+  disable-all: true
+  enable:
+    - bodyclose
+    - errcheck
+    - depguard
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+
+issues:
+  exclude-rules:
+    # Test helpers idiomatically take testing.TB first; the ctx-first rule is
+    # for production APIs, so scope it out of test code.
+    - linters:
+        - revive
+      text: "context-as-argument"
+      path: (_test\.go|internal/testutil/)
+    - linters:
+        - unused
+      path: internal/config/config\.go
+      text: "func `getEnvInt64` is unused"
+    - linters:
+        - unused
+      path: internal/api_primal/ws_gateway\.go
+      text: "func `WSGateway\\.resolveThreadViewDescending` is unused"

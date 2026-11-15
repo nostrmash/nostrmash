@@ -1,0 +1,21 @@
+{
+  "body": {
+    "events": [
+      {
+        "content": "hello primal",
+        "id": "evt_1",
+        "kind": 1,
+        "pubkey": "pubkey_1"
+      },
+      {
+        "content": "note-3",
+        "id": "evt_3",
+        "kind": 7
+      }
+    ],
+    "missing_event_ids": [
+      "evt_2"
+    ]
+  },
+  "status": 200
+}

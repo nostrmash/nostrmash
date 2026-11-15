@@ -1,0 +1,197 @@
+package meili
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func loadNoteDocumentsByIDs(ctx context.Context, pool *pgxpool.Pool, ids []string) ([]NoteDocument, error) {
+	rows, err := pool.Query(ctx, noteDocumentSelect+`
+		WHERE e.id = ANY($1::text[])
+		  AND `+indexedNotesWhere+`
+	`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("query note meilisearch docs: %w", err)
+	}
+	defer rows.Close()
+	out := make([]NoteDocument, 0, len(ids))
+	for rows.Next() {
+		row, _, err := scanNoteDocument(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan note meilisearch doc: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read note meilisearch docs: %w", err)
+	}
+	return out, nil
+}
+
+func loadProfileDocumentsByPubkeys(ctx context.Context, pool *pgxpool.Pool, pubkeys []string) ([]ProfileDocument, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT
+			p.pubkey,
+			p.metadata_event_id,
+			p.metadata_created_at,
+			coalesce(p.name, ''),
+			coalesce(p.display_name, ''),
+			coalesce(p.about, ''),
+			coalesce(p.nip05, ''),
+			`+nip05VerifiedSQL+`,
+			coalesce(stats.follower_count, 0) + coalesce(stats.note_count, 0)
+		FROM profiles_latest p
+		LEFT JOIN profile_public_stats stats ON stats.pubkey = p.pubkey
+		WHERE p.pubkey = ANY($1::text[])
+		  AND `+namedProfileSQL+`
+	`, pubkeys)
+	if err != nil {
+		return nil, fmt.Errorf("query profile meilisearch docs: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ProfileDocument, 0, len(pubkeys))
+	for rows.Next() {
+		row, err := scanProfileDocument(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan profile meilisearch doc: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read profile meilisearch docs: %w", err)
+	}
+	return out, nil
+}
+
+// searchDocumentColumns is selected by every branch below. An OR across
+// entity types made the planner sequentially scan search_documents (about
+// 6s and a multi-GB read per call). Each UNION ALL branch matches one index:
+// the primary key for note, profile, and hashtag, and the identity GIN for
+// identity_tokens.
+const searchDocumentColumns = `
+	entity_type,
+	entity_id,
+	coalesce(title, ''),
+	coalesce(body, ''),
+	aliases,
+	identity_tokens,
+	freshness,
+	popularity,
+	trust_score`
+
+func loadSearchDocumentsForNote(ctx context.Context, pool *pgxpool.Pool, eventID string) ([]SearchDocument, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'note' AND entity_id = $1
+		UNION ALL
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'hashtag' AND entity_id IN (
+			SELECT hashtag FROM event_hashtags WHERE event_id = $1
+		)
+	`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("query search_documents for note sync: %w", err)
+	}
+	defer rows.Close()
+	return scanSearchDocuments(rows)
+}
+
+// loadSearchDocumentsForBatch returns all search_documents touched by a
+// batch of note event IDs and profile pubkeys in a single round-trip.
+// Rows are deduplicated on (entity_type, entity_id) so the same hashtag
+// referenced by multiple notes only appears once in the resulting
+// upsert payload.
+func loadSearchDocumentsForBatch(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	noteIDs []string,
+	profilePubkeys []string,
+) ([]SearchDocument, error) {
+	if len(noteIDs) == 0 && len(profilePubkeys) == 0 {
+		return nil, nil
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'note' AND entity_id = ANY($1::text[])
+		UNION ALL
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'profile' AND entity_id = ANY($2::text[])
+		UNION ALL
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'hashtag' AND entity_id IN (
+			SELECT DISTINCT hashtag FROM event_hashtags
+			WHERE event_id = ANY($1::text[])
+		)
+		UNION ALL
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'identity' AND identity_tokens && $2::text[]
+	`, noteIDs, profilePubkeys)
+	if err != nil {
+		return nil, fmt.Errorf("query search_documents for batch sync: %w", err)
+	}
+	defer rows.Close()
+	return scanSearchDocuments(rows)
+}
+
+func loadSearchDocumentsForProfile(ctx context.Context, pool *pgxpool.Pool, pubkey string) ([]SearchDocument, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'profile' AND entity_id = $1
+		UNION ALL
+		SELECT `+searchDocumentColumns+`
+		FROM search_documents
+		WHERE entity_type = 'identity' AND identity_tokens && ARRAY[$1]::text[]
+	`, pubkey)
+	if err != nil {
+		return nil, fmt.Errorf("query search_documents for profile sync: %w", err)
+	}
+	defer rows.Close()
+	return scanSearchDocuments(rows)
+}
+
+func scanSearchDocuments(rows pgx.Rows) ([]SearchDocument, error) {
+	out := make([]SearchDocument, 0)
+	for rows.Next() {
+		var (
+			row       SearchDocument
+			freshness time.Time
+		)
+		if err := rows.Scan(
+			&row.EntityType,
+			&row.EntityID,
+			&row.Title,
+			&row.Body,
+			&row.Aliases,
+			&row.IdentityTokens,
+			&freshness,
+			&row.Popularity,
+			&row.TrustScore,
+		); err != nil {
+			return nil, fmt.Errorf("scan search_document row: %w", err)
+		}
+		row.ID = safeMeiliDocID(row.EntityType, row.EntityID)
+		row.Freshness = freshness.UTC().Unix()
+		if row.Aliases == nil {
+			row.Aliases = []string{}
+		}
+		if row.IdentityTokens == nil {
+			row.IdentityTokens = []string{}
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read search_document rows: %w", err)
+	}
+	return out, nil
+}

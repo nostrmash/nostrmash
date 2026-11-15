@@ -1,0 +1,328 @@
+package query
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/readmodel"
+)
+
+// Profile is re-exported from the neutral readmodel package so lower-level
+// adapters (e.g. meili) can return it without importing query.
+type Profile = readmodel.Profile
+
+type ProfilePublicStats struct {
+	Pubkey            string
+	FollowerCount     int64
+	FollowingCount    int64
+	NoteCount         int64
+	ReplyCount        int64
+	RecentActivityAt  *int64
+	LongFormNoteCount int64
+	MediaCount        int64
+	ZapReceivedCount  int64
+	SatsZapped        int64
+	ContentZapCount   int64
+	TimeJoined        *int64
+}
+
+type ProfilePublicSummary struct {
+	Profile      Profile
+	Stats        ProfilePublicStats
+	TrustSummary *TrustSummary
+}
+
+type ContactList struct {
+	Pubkey          string
+	EventID         string
+	CreatedAt       int64
+	DerivationVer   int
+	ContactsJSONRaw json.RawMessage
+}
+
+type RelayList struct {
+	Pubkey        string
+	EventID       string
+	CreatedAt     int64
+	DerivationVer int
+	RelaysJSONRaw json.RawMessage
+}
+
+type NetworkStats struct {
+	Events   int64 `json:"events"`
+	Profiles int64 `json:"profiles"`
+	Relays   int64 `json:"relays"`
+}
+
+type WindowedCount struct {
+	Last24h int64 `json:"24h"`
+	Last7d  int64 `json:"7d"`
+	// Last30d is omitted when zero so relay payloads stay 24h/7d.
+	Last30d int64 `json:"30d,omitempty"`
+}
+
+type RelayUsageSummary struct {
+	RelayURL      string `json:"relay_url"`
+	EventCount    int64  `json:"event_count"`
+	UniqueAuthors int64  `json:"unique_authors"`
+}
+
+type RelaySummaryStats struct {
+	Total         int64         `json:"total"`
+	Active24h     int64         `json:"active_24h"`
+	Active7d      int64         `json:"active_7d"`
+	EventVolume   WindowedCount `json:"event_volume"`
+	UniqueAuthors WindowedCount `json:"unique_authors"`
+}
+
+type LanguageSummary struct {
+	Language string `json:"language"`
+	Count    int64  `json:"count"`
+}
+
+type TrendingHashtagWindows struct {
+	Last24h []TrendingHashtag `json:"24h"`
+	Last7d  []TrendingHashtag `json:"7d"`
+	Last30d []TrendingHashtag `json:"30d,omitempty"`
+}
+
+// PublicStatsSectionTimes records when each homepage snapshot row was
+// computed. Zero means that row was missing.
+type PublicStatsSectionTimes struct {
+	Home24h      time.Time
+	Home7d       time.Time
+	Languages24h time.Time
+	Languages7d  time.Time
+	Hashtags24h  time.Time
+	Hashtags7d   time.Time
+	Home30d      time.Time
+	Languages30d time.Time
+	Hashtags30d  time.Time
+	Relays       time.Time
+	TopRelays24h time.Time
+	TopRelays7d  time.Time
+}
+
+type PublicDiscoveryNetworkStats struct {
+	EventsIngested    int64                   `json:"events_ingested"`
+	ProjectedProfiles int64                   `json:"projected_profiles"`
+	ComputedAt        *time.Time              `json:"computed_at,omitempty"`
+	Relays            int64                   `json:"relays"`
+	RelaySummary      RelaySummaryStats       `json:"relay_summary"`
+	TopRelays         []RelayUsageSummary     `json:"top_relays,omitempty"`
+	TopRelays24h      []RelayUsageSummary     `json:"top_relays_24h,omitempty"`
+	TopRelays7d       []RelayUsageSummary     `json:"top_relays_7d,omitempty"`
+	ActiveAuthors     WindowedCount           `json:"active_authors"`
+	NoteVolume        WindowedCount           `json:"note_volume"`
+	TopHashtags       *TrendingHashtagWindows `json:"top_hashtags,omitempty"`
+	TopLanguages24h   []LanguageSummary       `json:"top_languages_24h,omitempty"`
+	TopLanguages7d    []LanguageSummary       `json:"top_languages_7d,omitempty"`
+	TopLanguages30d   []LanguageSummary       `json:"top_languages_30d,omitempty"`
+	SectionTimes      PublicStatsSectionTimes `json:"-"`
+}
+
+type DiscoveryStatsSeriesPoint struct {
+	T time.Time
+	V int64
+}
+
+type DiscoveryStatsSeries struct {
+	Metric     string
+	Window     string
+	ComputedAt *time.Time
+	Points     []DiscoveryStatsSeriesPoint
+}
+
+type CuratedRecommendedRead struct {
+	EventID string `json:"event_id"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Rank    int    `json:"rank"`
+}
+
+type CuratedReadsTopic struct {
+	Topic string `json:"topic"`
+	Rank  int    `json:"rank"`
+}
+
+type CuratedFeaturedAuthor struct {
+	Pubkey string `json:"pubkey"`
+	Rank   int    `json:"rank"`
+}
+
+type TrendingHashtag struct {
+	Hashtag       string `json:"hashtag"`
+	EventCount    int64  `json:"event_count"`
+	UniqueAuthors int64  `json:"unique_authors"`
+	// CohortEvidence is how many of the viewer's follows used the hashtag.
+	// BlendScore is the normalized mix of that cohort with the global list.
+	CohortEvidence float64 `json:"-"`
+	BlendScore     float64 `json:"-"`
+}
+
+type HashtagActivity struct {
+	EventCount    int64 `json:"event_count"`
+	UniqueAuthors int64 `json:"unique_authors"`
+}
+
+type HashtagActivityStats struct {
+	Last24h HashtagActivity `json:"24h"`
+	Last7d  HashtagActivity `json:"7d"`
+	Last30d HashtagActivity `json:"30d"`
+	All     HashtagActivity `json:"all"`
+}
+
+type HashtagSummary struct {
+	Hashtag       string               `json:"hashtag"`
+	LatestEventAt *int64               `json:"latest_event_at,omitempty"`
+	Activity      HashtagActivityStats `json:"activity"`
+}
+
+type RelatedHashtag struct {
+	Hashtag             string `json:"hashtag"`
+	CoOccurrenceCount   int64  `json:"co_occurrence_count"`
+	CoOccurrenceAuthors int64  `json:"co_occurrence_authors"`
+}
+
+type EventDomainLink struct {
+	EventID string `json:"event_id"`
+	URL     string `json:"url"`
+	Domain  string `json:"domain"`
+}
+
+type DomainStat struct {
+	Domain        string `json:"domain"`
+	LinkCount     int64  `json:"link_count"`
+	NoteCount     int64  `json:"note_count"`
+	UniqueAuthors int64  `json:"unique_authors"`
+}
+
+type DomainActivity struct {
+	LinkCount     int64 `json:"link_count"`
+	NoteCount     int64 `json:"note_count"`
+	UniqueAuthors int64 `json:"unique_authors"`
+}
+
+type DomainActivityStats struct {
+	Last24h DomainActivity `json:"24h"`
+	Last7d  DomainActivity `json:"7d"`
+	Last30d DomainActivity `json:"30d"`
+	All     DomainActivity `json:"all"`
+}
+
+type DomainSummary struct {
+	Domain         string              `json:"domain"`
+	LatestEventAt  *int64              `json:"latest_event_at,omitempty"`
+	Activity       DomainActivityStats `json:"activity"`
+	RecentNotes    []TrendingNote      `json:"recent_notes"`
+	TopNotes       []TrendingNote      `json:"top_notes"`
+	CohortEvidence float64             `json:"-"`
+	BlendScore     float64             `json:"-"`
+}
+
+type TrendingNote struct {
+	EventID       string  `json:"event_id"`
+	AuthorPubkey  string  `json:"author_pubkey"`
+	CreatedAt     int64   `json:"created_at"`
+	Content       string  `json:"content"`
+	Kind          int     `json:"kind,omitempty"`
+	Language      string  `json:"language,omitempty"`
+	ReplyCount    int64   `json:"reply_count"`
+	RepostCount   int64   `json:"repost_count"`
+	ReactionCount int64   `json:"reaction_count"`
+	ZapCount      int64   `json:"zap_count"`
+	ZapMSats      int64   `json:"zap_msats"`
+	BookmarkCount int64   `json:"bookmark_count,omitempty"`
+	Score         float64 `json:"score"`
+	// CohortEvidence is engagement from accounts the viewer follows.
+	// Zero on a global ranking.
+	CohortEvidence float64 `json:"-"`
+}
+
+type DiscoveryEvidence struct {
+	Metric string  `json:"metric"`
+	Value  float64 `json:"value"`
+	Unit   string  `json:"unit,omitempty"`
+}
+
+type DiscoveryReason struct {
+	Code     string              `json:"code"`
+	Evidence []DiscoveryEvidence `json:"evidence,omitempty"`
+}
+
+type DiscoveryItemRanking struct {
+	Rank          int               `json:"rank"`
+	Score         float64           `json:"score"`
+	PreviousRank  *int              `json:"previous_rank,omitempty"`
+	RankDelta     *int              `json:"rank_delta,omitempty"`
+	Reasons       []DiscoveryReason `json:"reasons,omitempty"`
+	SourceBreadth *int64            `json:"source_breadth,omitempty"`
+	Confidence    string            `json:"confidence,omitempty"`
+}
+
+type DiscoveryListMeta struct {
+	Window         string     `json:"window"`
+	ComputedAt     *time.Time `json:"computed_at,omitempty"`
+	RankingVersion string     `json:"ranking_version"`
+	Confidence     string     `json:"confidence"`
+}
+
+type HotConversation struct {
+	RootEventID      string  `json:"root_event_id"`
+	AuthorPubkey     string  `json:"author_pubkey"`
+	CreatedAt        int64   `json:"created_at"`
+	Content          string  `json:"content"`
+	ReplyCount       int64   `json:"reply_count"`
+	RepostCount      int64   `json:"repost_count"`
+	ReactionCount    int64   `json:"reaction_count"`
+	ZapCount         int64   `json:"zap_count"`
+	ZapMSats         int64   `json:"zap_msats"`
+	ParticipantCount int     `json:"participant_count"`
+	LastActivityAt   int64   `json:"last_activity_at"`
+	Replies24h       int64   `json:"replies_24h"`
+	Replies7d        int64   `json:"replies_7d"`
+	Replies30d       int64   `json:"replies_30d"`
+	VelocityScore    float64 `json:"velocity_score"`
+	Consistency      string  `json:"consistency"`
+	CohortEvidence   float64 `json:"-"`
+	BlendScore       float64 `json:"-"`
+}
+
+type TrendingProfile struct {
+	Pubkey                   string  `json:"pubkey"`
+	Score                    float64 `json:"score"`
+	RecentPostCount          int64   `json:"recent_post_count"`
+	RecentReplyCount         int64   `json:"recent_reply_count"`
+	RecentEngagementReceived int64   `json:"recent_engagement_received"`
+	RecentNewFollowers       int64   `json:"recent_new_followers"`
+	RecentZapVolumeMSats     int64   `json:"recent_zap_volume_msats"`
+	RecentActiveDays         int     `json:"recent_active_days"`
+	RecentActivityAt         *int64  `json:"recent_activity_at,omitempty"`
+	FollowerCount            int64   `json:"follower_count"`
+	// TrustedFollowerCount is the Most followed rank: followers in the
+	// published trust graph. Zero on every other profile list.
+	TrustedFollowerCount int64 `json:"trusted_follower_count,omitempty"`
+	// Scored* are the (optionally trust-weighted) inputs the profile's
+	// score actually used. Nil means the row predates scored-input
+	// persistence and ranking reasons should fall back to the raw Recent*
+	// counters. Zero means the score credited nothing.
+	ScoredEngagementReceived *float64 `json:"-"`
+	ScoredNewFollowers       *float64 `json:"-"`
+	SupporterCount           int64    `json:"-"`
+	RawSats                  int64    `json:"-"`
+	CappedSats               int64    `json:"-"`
+	CohortEvidence           float64  `json:"-"`
+	// ViewerFollows reports that this profile is already on the viewer's
+	// contact list. The most-followed ranking keeps those rows.
+	ViewerFollows bool `json:"-"`
+}
+
+type RelatedProfile struct {
+	Pubkey               string   `json:"pubkey"`
+	TopicOverlap         int64    `json:"topic_overlap"`
+	ReplyAdjacency       int64    `json:"reply_adjacency"`
+	InteractionAdjacency int64    `json:"interaction_adjacency"`
+	QuoteRepostAdjacency int64    `json:"quote_repost_adjacency"`
+	Reasons              []string `json:"reasons"`
+	Score                int64    `json:"score"`
+}

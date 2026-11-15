@@ -1,0 +1,106 @@
+package retention
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/metrics"
+	"github.com/nostrmash/nostrmash/internal/store/retention/retentiondb"
+)
+
+// supersededReplaceableKinds are the replaceable kinds whose older versions
+// carry no value once a newer version wins. Two families share this purge:
+//   - non-parameterized (addressable by pubkey+kind, d_tag always ”):
+//     profile metadata (0), contact/follow lists (3), relay lists (10002),
+//     mute lists (10000), pin lists (10001), bookmark lists (10003).
+//   - parameterized (addressable by pubkey+kind+d_tag): long-form articles
+//     (30023), categorized people lists (30000), live activities (30311),
+//     and addressable video (34235, 34236). Each distinct d_tag is its own
+//     latest-wins address.
+//
+// Nostr semantics define all of these as latest-wins, so every superseded
+// version is dead weight. The purge query derives each candidate's d_tag and
+// joins replaceable_state on (pubkey, kind, d_tag), which reduces to d_tag=”
+// for the non-parameterized family.
+var supersededReplaceableKinds = []int{
+	0, 3, 10000, 10001, 10002, 10003, 10006, 10007, 10009, 10012, 10015, 10019, 10030, 10050, 10063,
+	30000, 30002, 30004, 30005, 30008, 30009, 30015, 30023, 30311, 30315, 34235, 34236,
+	39000, 39001, 39002, 39003,
+}
+
+// PurgeSupersededReplaceableEvents deletes a bounded batch of raw replaceable
+// events that have been strictly superseded by a newer winner recorded in
+// replaceable_state. The current winner is never touched
+// (replaceable_state.event_id points at it), and a newer event that has not
+// yet been projected is also protected because it ranks above the recorded
+// winner rather than below it.
+//
+// Cascade FKs (event_tags, event_relays, event_references,
+// follower_edges, …) clean the dependent rows. The latest-version projections
+// (contact_lists_latest, relay_lists_latest, profiles_latest, replaceable_state)
+// all reference the winner, so deleting older versions leaves the read models
+// intact.
+//
+// Safety guards:
+//   - supersededBefore filters on events.first_seen_at, so a version that was
+//     ingested recently (even if its author-claimed created_at is ancient,
+//     e.g. during a backfill) is left alone until it has been stable for the
+//     operator's grace window.
+//   - A candidate is skipped while its derive_event_bundle job is pending or
+//     running, and while that job is dead but was last updated after
+//     deadGraceBefore. Past deadGraceBefore a permanently-dead derivation no
+//     longer pins disk.
+//
+// Candidates come from replaceable_event_purge. A newer version queues the
+// winner it displaces, and a losing derivation queues itself. The queue is ordered by
+// created_at, the grace window is a primary-key lookup of events.first_seen_at,
+// and the jobs lookup is the unique index on jobs.idempotency_key. An empty
+// queue is one index probe. The statement deletes the event and its queue row.
+func (s *Retention) PurgeSupersededReplaceableEvents(
+	ctx context.Context,
+	supersededBefore time.Time,
+	deadGraceBefore time.Time,
+	limit int,
+) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, fmt.Errorf("store is not initialized")
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("limit must be > 0")
+	}
+	if supersededBefore.IsZero() {
+		return 0, fmt.Errorf("supersededBefore is required")
+	}
+	if deadGraceBefore.IsZero() {
+		return 0, fmt.Errorf("deadGraceBefore is required")
+	}
+
+	started := time.Now()
+	var rows int64
+	err := s.guarded(ctx, func(q *retentiondb.Queries) error {
+		var err error
+		rows, err = q.PurgeSupersededReplaceableEvents(ctx, retentiondb.PurgeSupersededReplaceableEventsParams{
+			Kinds:            int32Kinds(supersededReplaceableKinds),
+			SupersededBefore: tsz(supersededBefore.UTC()),
+			DeadGraceBefore:  tsz(deadGraceBefore.UTC()),
+			RowLimit:         int32(limit),
+		})
+		return err
+	})
+	metrics.ObserveDBOperation("purge_superseded_replaceable_events", dbResultFromErr(err), time.Since(started))
+	if err != nil {
+		return 0, fmt.Errorf("purge superseded replaceable events: %w", err)
+	}
+	return rows, nil
+}
+
+// int32Kinds narrows the package-level int kind list to the []int32 the
+// generated ANY($1::int[]) parameter expects.
+func int32Kinds(kinds []int) []int32 {
+	out := make([]int32, len(kinds))
+	for i, k := range kinds {
+		out[i] = int32(k)
+	}
+	return out
+}

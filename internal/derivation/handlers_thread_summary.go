@@ -1,0 +1,372 @@
+package derivation
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+func (h *Handlers) updateThreadSummaryWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
+	if h == nil || h.pool == nil {
+		return fmt.Errorf("handlers are not initialized")
+	}
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return fmt.Errorf("event id is required")
+	}
+	var kind int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT kind
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&kind); err != nil {
+		return fmt.Errorf("load event for thread summary projection: %w", err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationThreadSummary,
+		ThreadSummaryVersion,
+		"Project root-level thread summary counters and velocity hints",
+		versionOverride,
+	)
+	if err != nil {
+		return err
+	}
+	rootsToRefresh, err := h.collectThreadSummaryRootsTx(ctx, tx, eventID, kind)
+	if err != nil {
+		return err
+	}
+	if err := h.refreshThreadSummariesTx(ctx, tx, rootsToRefresh, writeVersion); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit thread summary projection tx: %w", err)
+	}
+	return nil
+}
+
+func (h *Handlers) collectThreadSummaryRootsTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID string,
+	kind int,
+) (map[string]struct{}, error) {
+	roots := make(map[string]struct{}, 2)
+	var edgeRootID *string
+	var edgeParentID string
+	err := tx.QueryRow(ctx, `
+		SELECT root_event_id, parent_event_id
+		FROM thread_edges
+		WHERE child_event_id = $1
+	`, eventID).Scan(&edgeRootID, &edgeParentID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("load existing thread edge for summary roots: %w", err)
+		}
+		if kind == 1 {
+			roots[eventID] = struct{}{}
+		}
+		return roots, nil
+	}
+	if edgeRootID != nil {
+		rootID := strings.TrimSpace(*edgeRootID)
+		if rootID != "" {
+			roots[rootID] = struct{}{}
+		}
+	}
+	parentID := strings.TrimSpace(edgeParentID)
+	if parentID != "" {
+		roots[parentID] = struct{}{}
+	}
+	if len(roots) == 0 && kind == 1 {
+		roots[eventID] = struct{}{}
+	}
+	return roots, nil
+}
+
+func (h *Handlers) refreshThreadSummariesTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	roots map[string]struct{},
+	writeVersion int,
+) error {
+	for rootID := range roots {
+		rootID = strings.TrimSpace(rootID)
+		if rootID == "" {
+			continue
+		}
+		if err := h.refreshThreadSummaryTx(ctx, tx, rootID, writeVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handlers) refreshThreadSummaryTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	rootEventID string,
+	writeVersion int,
+) error {
+	rootEventID = strings.TrimSpace(rootEventID)
+	if rootEventID == "" {
+		return nil
+	}
+	var rootCreatedAt int64
+	var rootKind int
+	var rootPubkey string
+	err := tx.QueryRow(ctx, `
+		SELECT created_at, kind, pubkey
+		FROM events
+		WHERE id = $1
+	`, rootEventID).Scan(&rootCreatedAt, &rootKind, &rootPubkey)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if _, deleteErr := tx.Exec(ctx, `
+				DELETE FROM thread_summaries
+				WHERE root_event_id = $1
+			`, rootEventID); deleteErr != nil {
+				return fmt.Errorf("delete thread summary for missing root: %w", deleteErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("load root event for thread summary: %w", err)
+	}
+	if rootKind != 1 {
+		if _, deleteErr := tx.Exec(ctx, `
+			DELETE FROM thread_summaries
+			WHERE root_event_id = $1
+		`, rootEventID); deleteErr != nil {
+			return fmt.Errorf("delete thread summary for non-note root: %w", deleteErr)
+		}
+		return nil
+	}
+
+	var replyCount int64
+	var participantCount int
+	var lastActivityAt int64
+	var replies24h int64
+	var replies7d int64
+	var replies30d int64
+	var authors24h int
+	var authors7d int
+	var authors30d int
+	if err := tx.QueryRow(ctx, `
+		WITH descendant_events AS (
+			SELECT e.pubkey, e.created_at, te.child_created_at
+			FROM thread_edges te
+			INNER JOIN events e ON e.id = te.child_event_id
+			WHERE te.root_event_id = $1
+		),
+		thread_participants AS (
+			SELECT pubkey, created_at
+			FROM descendant_events
+			UNION ALL
+			SELECT e.pubkey, e.created_at
+			FROM events e
+			WHERE e.id = $1
+		)
+		SELECT
+			COALESCE((SELECT COUNT(*) FROM descendant_events), 0) AS reply_count,
+			COALESCE((SELECT COUNT(DISTINCT pubkey) FROM thread_participants), 1) AS participant_count,
+			COALESCE((SELECT MAX(created_at) FROM thread_participants), $2) AS last_activity_at,
+			COALESCE((
+				SELECT COUNT(*)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (24 * 60 * 60)
+			), 0) AS replies_24h,
+			COALESCE((
+				SELECT COUNT(*)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (7 * 24 * 60 * 60)
+			), 0) AS replies_7d,
+			COALESCE((
+				SELECT COUNT(*)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (30 * 24 * 60 * 60)
+			), 0) AS replies_30d,
+			-- The root always counts as one author. Everyone else counts only
+			-- when they replied inside the window.
+			1 + COALESCE((
+				SELECT COUNT(DISTINCT pubkey)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (24 * 60 * 60)
+				  AND pubkey <> $3
+			), 0) AS authors_24h,
+			1 + COALESCE((
+				SELECT COUNT(DISTINCT pubkey)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (7 * 24 * 60 * 60)
+				  AND pubkey <> $3
+			), 0) AS authors_7d,
+			1 + COALESCE((
+				SELECT COUNT(DISTINCT pubkey)
+				FROM descendant_events
+				WHERE child_created_at >= extract(epoch FROM now())::bigint - (30 * 24 * 60 * 60)
+				  AND pubkey <> $3
+			), 0) AS authors_30d
+	`, rootEventID, rootCreatedAt, rootPubkey).Scan(
+		&replyCount,
+		&participantCount,
+		&lastActivityAt,
+		&replies24h,
+		&replies7d,
+		&replies30d,
+		&authors24h,
+		&authors7d,
+		&authors30d,
+	); err != nil {
+		return fmt.Errorf("compute thread summary aggregates: %w", err)
+	}
+
+	// Velocity score inputs: unique repliers excluding the root author,
+	// optionally trust-weighted. Raw replies_24h/7d above stay as display
+	// counters. thread_summary_velocity stores the hot-conversation rank
+	// from these weights, so self-replies buy zero velocity.
+	nowUnix := time.Now().UTC().Unix()
+	reply24h, err := loadWindowedThreadReplyWeight(ctx, tx, rootEventID, rootPubkey, nowUnix, 24*time.Hour, h.engagementWeighting)
+	if err != nil {
+		return err
+	}
+	reply7d, err := loadWindowedThreadReplyWeight(ctx, tx, rootEventID, rootPubkey, nowUnix, 7*24*time.Hour, h.engagementWeighting)
+	if err != nil {
+		return err
+	}
+	reply30d, err := loadWindowedThreadReplyWeight(ctx, tx, rootEventID, rootPubkey, nowUnix, 30*24*time.Hour, h.engagementWeighting)
+	if err != nil {
+		return err
+	}
+	replyWeight24h := reply24h.Total
+	replyWeight7d := reply7d.Total
+	replyWeight30d := reply30d.Total
+
+	var maxDepth int
+	var directReplies int
+	var firstReplyAt *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)::int, min(child.created_at)
+		FROM thread_edges te
+		JOIN events child ON child.id = te.child_event_id
+		WHERE te.root_event_id = $1 AND te.parent_event_id = $1
+	`, rootEventID).Scan(&directReplies, &firstReplyAt); err != nil {
+		return fmt.Errorf("compute thread shape: %w", err)
+	}
+	firstReplyLatency := 0
+	if firstReplyAt != nil && *firstReplyAt >= rootCreatedAt {
+		firstReplyLatency = int(*firstReplyAt - rootCreatedAt)
+	}
+
+	if err := tx.QueryRow(ctx, `
+		WITH RECURSIVE thread_tree(event_id, depth, path) AS (
+			SELECT $1::text, 0, ARRAY[$1::text]
+			UNION ALL
+			SELECT
+				te.child_event_id,
+				thread_tree.depth + 1,
+				thread_tree.path || te.child_event_id
+			FROM thread_tree
+			INNER JOIN thread_edges te ON te.parent_event_id = thread_tree.event_id
+			WHERE te.root_event_id = $1
+			  AND NOT te.child_event_id = ANY(thread_tree.path)
+			  AND thread_tree.depth < 200
+		)
+		SELECT COALESCE(MAX(depth), 0)
+		FROM thread_tree
+	`, rootEventID).Scan(&maxDepth); err != nil {
+		return fmt.Errorf("compute thread summary max depth: %w", err)
+	}
+	branchingX100 := 0
+	if maxDepth > 0 {
+		branchingX100 = int(replyCount) * 100 / maxDepth
+	}
+	halfLifeS := 0
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO thread_summaries (
+			root_event_id,
+			reply_count,
+			participant_count,
+			max_depth,
+			last_activity_at,
+			replies_24h,
+			replies_7d,
+			replies_30d,
+			reply_weight_24h,
+			reply_weight_7d,
+			reply_weight_30d,
+			authors_24h,
+			authors_7d,
+			authors_30d,
+			derivation_version,
+			direct_reply_count,
+			first_reply_latency_s,
+			branching_x100,
+			half_life_s,
+			velocity_24h,
+			velocity_7d,
+			velocity_30d
+		)
+		VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+			thread_summary_velocity($15, $3, $6, $9, $12, 4),
+			thread_summary_velocity($15, $3, $7, $10, $13, 4),
+			thread_summary_velocity($15, $3, $8, $11, $14, 5)
+		)
+		ON CONFLICT (root_event_id) DO UPDATE
+		SET reply_count = EXCLUDED.reply_count,
+		    participant_count = EXCLUDED.participant_count,
+		    max_depth = EXCLUDED.max_depth,
+		    last_activity_at = EXCLUDED.last_activity_at,
+		    replies_24h = EXCLUDED.replies_24h,
+		    replies_7d = EXCLUDED.replies_7d,
+		    replies_30d = EXCLUDED.replies_30d,
+		    reply_weight_24h = EXCLUDED.reply_weight_24h,
+		    reply_weight_7d = EXCLUDED.reply_weight_7d,
+		    reply_weight_30d = EXCLUDED.reply_weight_30d,
+		    authors_24h = EXCLUDED.authors_24h,
+		    authors_7d = EXCLUDED.authors_7d,
+		    authors_30d = EXCLUDED.authors_30d,
+		    derivation_version = EXCLUDED.derivation_version,
+		    direct_reply_count = EXCLUDED.direct_reply_count,
+		    first_reply_latency_s = EXCLUDED.first_reply_latency_s,
+		    branching_x100 = EXCLUDED.branching_x100,
+		    half_life_s = EXCLUDED.half_life_s,
+		    velocity_24h = EXCLUDED.velocity_24h,
+		    velocity_7d = EXCLUDED.velocity_7d,
+		    velocity_30d = EXCLUDED.velocity_30d,
+		    projected_at = now()
+	`,
+		rootEventID,
+		replyCount,
+		participantCount,
+		maxDepth,
+		lastActivityAt,
+		replies24h,
+		replies7d,
+		replies30d,
+		replyWeight24h,
+		replyWeight7d,
+		replyWeight30d,
+		authors24h,
+		authors7d,
+		authors30d,
+		writeVersion,
+		directReplies,
+		firstReplyLatency,
+		branchingX100,
+		halfLifeS,
+	); err != nil {
+		return fmt.Errorf("upsert thread summary: %w", err)
+	}
+	return nil
+}

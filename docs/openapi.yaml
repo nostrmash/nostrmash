@@ -1,0 +1,3154 @@
+openapi: 3.0.3
+info:
+  title: NostrMash API
+  version: 0.15.0
+  description: Native, admin, and Primal compatibility APIs.
+servers:
+  - url: /
+tags:
+  - name: public
+  - name: admin
+  - name: primal
+paths:
+  /health:
+    get:
+      tags: [public]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                required: [status]
+  /ready:
+    get:
+      tags: [public]
+      summary: Readiness probe
+      responses:
+        '200':
+          description: Database is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+                required: [status]
+        '503':
+          $ref: '#/components/responses/Error'
+  /metrics:
+    get:
+      tags: [public]
+      summary: Prometheus metrics exposition
+      responses:
+        '200':
+          description: Prometheus text format metrics
+
+  /api/v1/events/{id}:
+    get:
+      tags: [public]
+      summary: Get canonical event plus relay provenance
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Event and provenance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event:
+                    type: object
+                    additionalProperties: true
+                  provenance:
+                    type: object
+                    properties:
+                      relays:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            relay_url: { type: string }
+                            seen_at: { type: string, format: date-time }
+                  consistency: { type: string, enum: [strong] }
+                required: [event, provenance, consistency]
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/events/batch:
+    post:
+      tags: [public]
+      summary: Batch fetch canonical events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+              required: [ids]
+      responses:
+        '200':
+          description: >
+            Found and missing events. Found event payloads include eventual
+            engagement counters (`reply_count`, `repost_count`, `reaction_count`,
+            `zap_count`, `zap_msats`, and nested `counts`) for note-card rendering.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  missing:
+                    type: array
+                    items: { type: string }
+                required: [events, missing]
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/events/{id}/seen-on:
+    get:
+      tags: [public]
+      summary: Get relay provenance for one event
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Seen-on rows
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/events/{id}/counts:
+    get:
+      tags: [public]
+      summary: Get eventual interaction counters
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Reply/reaction/repost counters
+  /api/v1/events/{id}/replies:
+    get:
+      tags: [public]
+      summary: Get direct replies with cursor pagination
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Reply page with eventual engagement counters attached for note-card
+            rendering.
+  /api/v1/events/{id}/ancestors:
+    get:
+      tags: [public]
+      summary: Get root-to-parent chain
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: max_depth
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+      responses:
+        '200':
+          description: >
+            Ancestor chain with missing IDs. Present ancestor payloads include
+            eventual engagement counters for note-card rendering.
+  /api/v1/events/{id}/actions:
+    get:
+      tags: [public]
+      summary: Repost, reaction, or zap-receipt events for one note
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: kind
+          required: true
+          schema: { type: integer, enum: [6, 7, 9735] }
+          description: 6 reposts, 7 reactions, or 9735 zap receipts. The page items are those events.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Action events (id, pubkey, kind, created_at, tags, content) for the
+            requested kind, newest first, with next_cursor when another page exists.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/events/{id}/zaps:
+    get:
+      tags: [public]
+      summary: Kind 9735 zap receipts for one note
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Zap receipt events, newest first, with next_cursor when another page exists.
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/threads/{eventId}:
+    get:
+      tags: [public]
+      summary: Get thread slice for one event
+      parameters:
+        - in: path
+          name: eventId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: max_depth
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Thread view
+  /api/v1/threads/{root_event_id}/summary:
+    get:
+      tags: [public]
+      summary: Get root-level thread summary projection
+      parameters:
+        - in: path
+          name: root_event_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Thread summary primitives and velocity hints
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/threads/{root_event_id}/activity:
+    get:
+      tags: [public]
+      summary: Get root-level thread activity hotspot metrics
+      parameters:
+        - in: path
+          name: root_event_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+      responses:
+        '200':
+          description: Thread activity snapshot with velocity score
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/notes/{event_id}/summary:
+    get:
+      tags: [public]
+      summary: Product-shaped summary payload for one note page
+      parameters:
+        - in: path
+          name: event_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: include_activity
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Note payload with author summary, counts, thread context, quote/repost context, and optional conversation activity
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/notes/{event_id}/related:
+    get:
+      tags: [public]
+      summary: Bounded related notes for one focal note
+      parameters:
+        - in: path
+          name: event_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Related note cards with bounded heuristic reasons
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/{pubkey}:
+    get:
+      tags: [public]
+      summary: Get projected latest profile
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Profile projection
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/{pubkey}/topics:
+    get:
+      tags: [public]
+      summary: Profile topic affinity rows from author analytics rollups
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Profile topic usage rows for the selected window
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/batch:
+    post:
+      tags: [public]
+      summary: Batch get profile projections
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkeys:
+                  type: array
+                  items: { type: string }
+              required: [pubkeys]
+      responses:
+        '200':
+          description: Found and missing profiles
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/events:
+    get:
+      tags: [public]
+      summary: Recent authored events
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: kind
+          schema: { type: integer, minimum: 0 }
+          description: Optional kind filter (e.g. 9735 for sent zap receipts in author feed)
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: >
+            Opaque keyset continuation token from a prior response's
+            `next_cursor`. Omit for the first page.
+      responses:
+        '200':
+          description: >
+            Event list with eventual engagement counters attached
+            (`reply_count`, `repost_count`, `reaction_count`, `zap_count`,
+            `zap_msats`, and nested `counts`) for note-card rendering.
+            Includes `next_cursor` when another page exists. When the local
+            projection is thin, the first page may be augmented on demand
+            from fallback relays (results are persisted asynchronously).
+  /api/v1/authors/{pubkey}/replies:
+    get:
+      tags: [public]
+      summary: Replies authored by pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Opaque keyset continuation token from a prior response's next_cursor.
+      responses:
+        '200':
+          description: >
+            Reply list with eventual engagement counters attached
+            (`reply_count`, `repost_count`, `reaction_count`, `zap_count`,
+            `zap_msats`, and nested `counts`) for note-card rendering.
+            Includes next_cursor when another page exists.
+  /api/v1/authors/{pubkey}/zaps:
+    get:
+      tags: [public]
+      summary: Zap receipts sent by pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string, description: Hex pubkey or npub }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Sent zap records with optional embedded target notes
+  /api/v1/authors/{pubkey}/reactions:
+    get:
+      tags: [public]
+      summary: Kind 7 reactions authored by pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string, description: Hex pubkey or npub }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Reaction records with optional embedded target notes
+  /api/v1/authors/{pubkey}/analytics/summary:
+    get:
+      tags: [public]
+      summary: Windowed author analytics summary for account intelligence
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Author analytics windows with cadence, engagement, and media mix
+  /api/v1/authors/{pubkey}/analytics/topics:
+    get:
+      tags: [public]
+      summary: Top author hashtags for selected analytics window
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Author topic usage rows for the selected window
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/grouped-notes:
+    get:
+      tags: [public]
+      summary: Generic grouped-note analytics rollup for one author and group key
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: group_by
+          schema: { type: string, enum: [hashtag, metadata], default: hashtag }
+        - in: query
+          name: group_key
+          required: true
+          schema: { type: string, maxLength: 128 }
+        - in: query
+          name: metadata_tag
+          schema: { type: string, enum: [d, g, group, series] }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+        - in: query
+          name: top_notes_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 5 }
+        - in: query
+          name: topics_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 5 }
+      responses:
+        '200':
+          description: Grouped note count, engagement totals, top notes, and grouped media/topic summaries
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/media-mix:
+    get:
+      tags: [public]
+      summary: Author media mix for selected analytics window
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+      responses:
+        '200':
+          description: Author media mix counts for the selected window
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/activity-windows:
+    get:
+      tags: [public]
+      summary: Author audience activity windows by UTC hour/day over rolling windows
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+      responses:
+        '200':
+          description: Engagement timing aggregates (UTC) by hour, day, and heatmap buckets
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/posting-patterns:
+    get:
+      tags: [public]
+      summary: Author posting cadence by UTC hour/day over rolling windows
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+      responses:
+        '200':
+          description: Posting cadence aggregates (UTC) by hour, day, and heatmap buckets
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/top-notes:
+    get:
+      tags: [public]
+      summary: Top-performing authored notes by explicit weighted engagement
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Ranked top notes with weighted engagement scores, media segment, and primary topic
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/performance-summary:
+    get:
+      tags: [public]
+      summary: Recent author performance summary with averages, medians, totals, and prior-window comparison
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+      responses:
+        '200':
+          description: Window-scoped performance summary with weighted engagement formula and comparison deltas
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/recycle-candidates:
+    get:
+      tags: [public]
+      summary: Bounded list of older authored notes suitable for repost/recycle workflows
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [7d, 30d, 90d], default: 90d }
+        - in: query
+          name: min_age
+          schema: { type: string, enum: [3d, 7d, 14d, 30d, 60d, 90d, 180d, 365d], default: 30d }
+        - in: query
+          name: min_performance_percentile
+          schema: { type: number, minimum: 0, maximum: 100, default: 70 }
+        - in: query
+          name: include_replies
+          schema: { type: boolean, default: false }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        '200':
+          description: Ranked recycle candidates filtered by age, percentile, and recent repost markers
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/relays/health:
+    get:
+      tags: [public]
+      summary: Aggregate persisted relay ingest health
+      responses:
+        '200':
+          description: Relay health rows from checkpoint state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  consistency: { type: string }
+                  scope:
+                    type: string
+                    description: ingest_checkpoints. Each row is one relay URL, mode, and filter group. total is that row count, not a relay population.
+                  total: { type: integer }
+                  relays:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        relay_url: { type: string }
+                        mode:
+                          type: string
+                          description: Subscription kind (live or backfill), not a liveness flag.
+                        filter_group: { type: string }
+                        status:
+                          type: string
+                          description: Stored checkpoint status. Not rewritten when the row is old.
+                        stale:
+                          type: boolean
+                          description: True when latest_checkpoint_at is older than 24h. mode remains the subscription kind.
+                        last_error: { type: string, nullable: true }
+                        latest_checkpoint_at: { type: string, format: date-time }
+                        eose_seen_at: { type: string, format: date-time, nullable: true }
+  /api/v1/relays/popular:
+    get:
+      tags: [public]
+      summary: Most popular relays from user relay lists
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: >
+            Popular relays ranked by distinct user count. Localhost, loopback,
+            link-local, and private-network URLs are omitted. total is the full
+            ranked population after that filter; relays is capped by limit.
+            When the relay is in the registry and a NIP-11 fetch succeeded,
+            name, icon, auth_required, and payment_required are included.
+            auth_required and payment_required are omitted when the relay did
+            not say. They are the relay's claim, not a probe result.
+  /api/v1/relays/catalog:
+    get:
+      tags: [public]
+      summary: Popular relays with a recent successful read probe
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 100 }
+      responses:
+        '200':
+          description: >
+            Relays from relay_registry with a successful read probe inside
+            the freshness window, ordered by distinct_users, score, then
+            relay_url. A later failed attempt does not remove the relay until
+            that success ages out. Localhost, private-network, and directory
+            relays are omitted, as are blocked and drained relays. Admission
+            state is ignored. generated_at is the query time. freshness_seconds
+            is the window. Each relay has relay_url, distinct_users, score
+            (number), last_probe_at, last_probe_status, avg_connect_latency_ms,
+            and avg_eose_latency_ms. last_probe_at and last_probe_status are the
+            latest attempt, which can be a failure while the relay is still
+            listed. name, icon, auth_required, and payment_required
+            are added when a stored NIP-11 document includes them. auth_required
+            and payment_required are omitted when the relay did not say. An
+            empty relays array is a successful response.
+        '400':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/relays/info:
+    get:
+      tags: [public]
+      summary: One registry relay, including its stored NIP-11 document
+      parameters:
+        - in: query
+          name: relay_url
+          required: true
+          schema: { type: string }
+          description: Websocket URL. It is normalized the same way as registry keys.
+      responses:
+        '200':
+          description: >
+            The registry row for relay_url. distinct_users and score match the
+            catalog. probe is the latest read-probe rollup; last_probe_status
+            is empty when the relay has not been probed. activity.event_count_24h
+            and activity.event_count_7d are sums from the hourly event rollup.
+            nip11 is null until a background fetch has completed. nip11.ok false
+            means the last fetch failed; nip11.error is a short code (timeout,
+            connect_failed, private_address, redirect_rejected, too_large,
+            not_json, or http_<status>). nip11.info is what the relay published.
+            auth_required and payment_required inside nip11.info.limitation are
+            omitted when the relay did not say.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/relays/probe-health:
+    get:
+      tags: [public]
+      summary: Health probe results for monitored relays
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        '200':
+          description: Relay probe health summaries. total is the number of registry relays that have been probed; relays is the score-ordered page after limit, skipping rows that have never been probed.
+  /api/v1/contact-lists/{pubkey}:
+    get:
+      tags: [public]
+      summary: Latest projected contact list
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Contact list projection
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/relay-lists/{pubkey}:
+    get:
+      tags: [public]
+      summary: Latest projected relay list
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Relay list projection
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/replaceable:
+    get:
+      tags: [public]
+      summary: Current parameterized replaceable event
+      parameters:
+        - in: query
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: kind
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: identifier
+          required: true
+          schema: { type: string }
+          description: d-tag identifier. An empty string is a valid d-tag.
+      responses:
+        '200':
+          description: The current raw event.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/search:
+    get:
+      tags: [public]
+      summary: Combined event/profile full-text search
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+          description: >
+            Search text. Quoted phrases are a phrase operator (`"not your keys"`).
+            A weak typo may be rewritten; see `corrected_query`.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: include
+          description: Optional comma-separated extras. `suggest` folds suggestion profiles/hashtags into the response.
+          schema: { type: string, enum: [suggest] }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [relevant, latest], default: relevant }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: all }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+      responses:
+        '200':
+          description: >
+            Search results with trust metadata (`trust_mode`, `trust_applied`,
+            `result_scope`), `consistency`, and `search_engine`. `total` is a
+            corpus estimate (`total_is_estimate` says whether it is exact).
+            `section_totals` is `{notes, profiles, hashtags, relays}`.
+            `corrected_query` and `correction_applied` report spelling
+            correction. `surface_cursors.notes` and `surface_cursors.profiles`
+            are opaque cursors for the notes and profiles routes.
+            `surface_errors` is present when a section was dropped instead of
+            failing the request. Profile rows include `name`, `follower_count`,
+            `recent_post_count`, `recent_activity_at`, `nip05`, and `bot`.
+            When `include=suggest`, also returns `suggested_profiles`,
+            `suggested_hashtags`, and `profile_suggestions`.
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/search/notes:
+    get:
+      tags: [public]
+      summary: Notes-only full-text search with minimal product filters
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [relevant, latest], default: relevant }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: all }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: >
+            Opaque continuation token from a prior response's `next_cursor`.
+            Mutually exclusive with `offset`; bound to the original `q`,
+            `sort`, `window`, and `lang`.
+      responses:
+        '200':
+          description: >
+            Notes search results with trust metadata (`trust_mode`,
+            `trust_applied`, `result_scope`) and eventual engagement counters
+            on each note payload for note-card rendering. Includes `total`,
+            `total_is_estimate`, `correction_applied`, optional
+            `corrected_query`, and `next_cursor` when another page may exist.
+            Ranking matches `GET /api/v1/search` for the same `q`.
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/search/profiles:
+    get:
+      tags: [public]
+      summary: Profiles-only full-text search with minimal product filters
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [relevant, latest], default: relevant }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: all }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: >
+            Opaque continuation token from a prior response's `next_cursor`.
+            Mutually exclusive with `offset`; bound to the original `q`,
+            `sort`, `window`, and `lang`.
+      responses:
+        '200':
+          description: >
+            Profiles search results with trust metadata (`trust_mode`,
+            `trust_applied`, `result_scope`). Each row includes `name`,
+            `follower_count`, `recent_post_count`, `recent_activity_at`,
+            `nip05`, and `bot`. Includes `total`, `total_is_estimate`,
+            `correction_applied`, optional `corrected_query`, and
+            `next_cursor` when another page may exist. Ranking matches
+            `GET /api/v1/search` for the same `q`.
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/search/suggest:
+    get:
+      tags: [public]
+      summary: Lightweight grouped suggestions for profiles, hashtags, and notes
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 8 }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [relevant, latest], default: relevant }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: all }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+      responses:
+        '200':
+          description: >
+            Grouped suggestions. `profiles` use the same ranking as
+            `/api/v1/search/profiles` and include `follower_count` and
+            `nip05`. `notes` contains up to 3 previews
+            (`id`, `pubkey`, `created_at`, `content_preview`, `match_spans`).
+            `corrected_query` and `correction_applied` report spelling
+            correction. `hashtags` is unchanged.
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/notes/trending:
+    get:
+      tags: [public]
+      summary: Trending notes from projection-backed discovery stats
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked trending notes (kind 1 only) with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/long-form/trending:
+    get:
+      tags: [public]
+      summary: Trending long-form articles (kind 30023) from projection-backed discovery stats
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked trending long-form articles with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/media/trending:
+    get:
+      tags: [public]
+      summary: Trending media from projection-backed discovery stats
+      description: >
+        Ranked separately by format so pictures, videos, and shorts do not
+        share one score list. `pictures` is kind 20. `videos` is kinds 21 and
+        34235. `shorts` is kinds 22 and 34236.
+      parameters:
+        - in: query
+          name: format
+          required: true
+          schema: { type: string, enum: [pictures, videos, shorts] }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked media events for one format, with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/conversations/hot:
+    get:
+      tags: [public]
+      summary: Hot conversations from projection-backed thread activity windows
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: >
+            Active conversation hotspots ranked by velocity score and recency.
+            Each conversation includes thread reply totals (`reply_count`,
+            `activity.replies_24h` / `replies_7d`) from `thread_summaries` plus
+            root-note engagement (`repost_count`, `reaction_count`, `zap_count`,
+            `zap_msats`) from `note_discovery_stats`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/notes/bookmarked:
+    get:
+      tags: [public]
+      summary: Notes and articles people currently have saved
+      description: >
+        Ranks kind-1 notes and kind-30023 articles by distinct public
+        bookmarkers (kind 10003 lists and kind 30003 bookmark sets). A person
+        counts once even if they save the same event in more than one list.
+        The author saving their own note does not count. There is no time
+        window: `window` is `all`. `lang` filters the saved notes. Each note
+        includes `bookmark_count`. `reasons[0].code` is `saved_by`.
+      parameters:
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Notes and articles ranked by current public bookmarks
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/notes/zapped:
+    get:
+      tags: [public]
+      summary: Notes and articles ranked by sats received in the window
+      description: >
+        Ranks root kind-1 notes and kind-30023 articles that were published
+        inside the window by sats other people zapped onto them during that
+        same window. An older note zapped today is not on the 24h list.
+        Replies are omitted. A zap the author sent to their own note does
+        not count. `zap_msats` and `zap_count` are the window totals, and
+        `score` is the window sats. The default window is 7d. The worker
+        refreshes this list every few minutes. `reasons[0].code` is
+        `zap_volume`.
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Notes and articles ranked by sats received in the window
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/home:
+    get:
+      tags: [public]
+      summary: Product-shaped homepage discovery bundle for nostrmash.com
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: notes_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 10 }
+        - in: query
+          name: hashtags_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 10 }
+        - in: query
+          name: profiles_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 10 }
+        - in: query
+          name: domains_limit
+          schema: { type: integer, minimum: 1, maximum: 20, default: 10 }
+        - in: query
+          name: hashtag_stat_limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Homepage discovery bundle with bounded notes, hashtags, domains, network summary, and inline-hydrated profile ranking sections
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryHomeResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/profiles/trending:
+    get:
+      tags: [public]
+      summary: Profiles ranked by engagement earned per post ("Profiles in motion")
+      description: >
+        Ranks profiles by how much engagement their posts earn (engagement
+        received per post), not by raw posting volume or audience size —
+        intended to back a "Profiles in motion" UI surface. Profiles with
+        no (optionally trust-weighted) engagement in the window are
+        ineligible, so posting volume or consistency alone cannot occupy a
+        slot. `reasons[0]` is one metric that does not rise down the page.
+        On a 24h list that is `engagement_quality` when the per-post rate is
+        non-increasing; otherwise `engagement_received`, `recency`, or
+        `combined_engagement` (no number) when no single metric agrees with
+        the order. The 7d list does not cite a per-post rate, because stored
+        post counts are the 24h window. Evidence cites the same scored
+        engagement the ranking used. Does not use `follower_growth`; see
+        `/discovery/profiles/rising` for that.
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked trending profiles with inline identity fields (`npub`, `name`, `display_name`, `picture`, `about`, `nip05`, `lud16`, `website`) and profile discovery metrics (`recent_post_count`, `recent_reply_count`, `recent_engagement_received`, `recent_new_followers`, `recent_zap_volume_msats`, `recent_active_days`, `recent_activity_at`, `follower_count`) plus trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/profiles/rising:
+    get:
+      tags: [public]
+      summary: Small accounts gaining momentum fast ("Up and coming")
+      description: >
+        Ranks small/lower-follower profiles that are either gaining
+        followers quickly or earning engagement that's large relative to
+        their own (small) audience, even without new followers yet —
+        intended to back an "Up and coming" UI surface. Audience size is
+        penalized continuously (no hard follower-count cutoff), with a
+        steeper hinge above ~500 followers so the list stays mostly
+        sub-500 without excluding larger accounts that have enormous
+        growth. New-follower counts of 2 or fewer are treated as noise
+        (common for any brand-new account) and both omitted from the
+        `follower_growth` reason and discounted in the underlying score, so
+        accounts with substantial absolute growth (e.g. +60 followers on a
+        400-follower account) reliably outrank barely-started ones (e.g. +5
+        followers on a 5-follower account) rather than the reverse.
+        Engagement has a matching noise floor: a single (weighted)
+        interaction contributes nothing, and the engagement-momentum term
+        is shrunk for small samples and discounted when concentrated in a
+        single day of activity, so a lone boosted note (the bridged-bot
+        pattern) cannot carry an account into the list -- while sustained,
+        multi-account engagement on a tiny account still can. Eligibility
+        requires above-noise follower growth or engagement of the
+        account's own; a trending score alone does not qualify. Meaningful
+        follower growth can rank even when the profile has no trending
+        engagement. Reason evidence cites the same scored (optionally
+        trust-weighted) engagement and new-follower values the ranking
+        used. `reasons[0]` is the larger additive piece of that score when
+        the piece does not rise down the page. `follower_growth` evidence is
+        audience-adjusted momentum (the first two followers never count, and
+        growth past 500 followers is divided by followers/500), and only when
+        that term dominates the row. Otherwise the row cites
+        `relative_engagement_growth`, `engagement_received`, `recency`, or
+        `combined_engagement` when no single metric agrees with the order.
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked rising profiles with inline identity fields (`npub`, `name`, `display_name`, `picture`, `about`, `nip05`, `lud16`, `website`) and profile discovery metrics (`recent_post_count`, `recent_reply_count`, `recent_engagement_received`, `recent_new_followers`, `recent_zap_volume_msats`, `recent_active_days`, `recent_activity_at`, `follower_count`) plus trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/profiles/followed:
+    get:
+      tags: [public]
+      summary: Accounts ranked by trusted follower count
+      description: >
+        Directory of accounts that have a profile, ordered by how many
+        followers are in the published trust graph (`trusted_follower_count`),
+        then pubkey. Dormant accounts and accounts under 1000 raw followers
+        stay in the list when that count is positive. A trusted count of
+        zero does not rank. `window` is `all`. `lang` is accepted and
+        ignored. `follower_count` is everyone on a latest contact list.
+        `trusted_follower_count` and the `reasons[0]` evidence value are the
+        trust-graph count. `score` matches that count on the global list.
+        With `viewer` set, `score` is the blended rank and a profile the
+        viewer already follows has `viewer_follows: true`. `reasons[0].code`
+        is `audience_size` and the unit is `followers`.
+      parameters:
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Profiles ranked by trusted follower count
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/profiles/supported:
+    get:
+      tags: [public]
+      summary: Accounts ranked by capped sats received in the window
+      description: >
+        Ranks profiles by sats received in the window after each sender is
+        capped at `sender_cap_sats` (100000). A self-zap does not count.
+        The default window is 30d. `capped_sats` is the rank score,
+        `sats_received` is the uncapped total, and `supporter_count` is the
+        number of distinct senders. The worker refreshes this list every
+        few minutes. `lang` is accepted and ignored. `reasons[0].code` is
+        `supporter_sats`.
+      parameters:
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 30d }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Profiles ranked by capped sats received in the window
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/profiles/{pubkey}/related:
+    get:
+      tags: [public]
+      summary: Bounded related profiles for one focal pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Related profiles ranked by bounded topic overlap, reply/interaction adjacency, and quote/repost adjacency with inline identity fields (`npub`, `name`, `display_name`, `picture`, `about`, `nip05`, `lud16`, `website`) plus trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/hashtags/trending:
+    get:
+      tags: [public]
+      summary: Trending hashtags over rolling windows
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked trending hashtags with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/hashtags/{hashtag}:
+    get:
+      tags: [public]
+      summary: Hashtag page summary with bounded activity stats
+      parameters:
+        - in: path
+          name: hashtag
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Hashtag summary and recent activity windows with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/hashtags/{hashtag}/notes:
+    get:
+      tags: [public]
+      summary: Hashtag notes feed (latest or top) over bounded windows
+      parameters:
+        - in: path
+          name: hashtag
+          required: true
+          schema: { type: string }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [latest, top], default: latest }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: 24h }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+        - in: query
+          name: cursor
+          description: Opaque continuation token from a previous response's `next_cursor`. Mutually exclusive with `offset`; scoped to the same hashtag, sort, and window.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Hashtag notes list with trust metadata (`trust_mode`, `trust_applied`, `result_scope`). Includes `next_cursor` when another page is available.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/hashtags/{hashtag}/related:
+    get:
+      tags: [public]
+      summary: Bounded related hashtags for one hashtag
+      parameters:
+        - in: path
+          name: hashtag
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Related hashtags with co-occurrence counts and trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/domains/trending:
+    get:
+      tags: [public]
+      summary: Trending linked domains over rolling windows
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 24h }
+        - $ref: '#/components/parameters/DiscoveryLanguage'
+        - $ref: '#/components/parameters/Viewer'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Ranked trending domains with bounded trend windows and trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiscoveryListResponse' }
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/domains/{domain}:
+    get:
+      tags: [public]
+      summary: Domain summary page with trend windows and recent/top notes
+      parameters:
+        - in: path
+          name: domain
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Domain summary with link/note/author counts and recent/top note lists
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/domains/{domain}/notes:
+    get:
+      tags: [public]
+      summary: Domain-linked notes feed (latest or top) over bounded windows
+      parameters:
+        - in: path
+          name: domain
+          required: true
+          schema: { type: string }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [latest, top], default: latest }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d, all], default: 24h }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+      responses:
+        '200':
+          description: Domain-linked note list with trust metadata (`trust_mode`, `trust_applied`, `result_scope`)
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/network:
+    get:
+      tags: [public]
+      summary: Public product-shaped discovery network stats
+      responses:
+        '200':
+          description: >
+            Public network stats snapshot. Network and content stats are rendered
+            from one shared snapshot. sections describes each count (scope,
+            trust_applied, summary, computed_at). result_scope is mixed because
+            note volume is all indexed notes while hashtags are trust-graph scoped.
+            relays.top is the 7-day leaderboard; relays.top_24h and relays.top_7d
+            are both present.
+  /api/v1/discovery/stats/content:
+    get:
+      tags: [public]
+      summary: Public product-shaped discovery content stats
+      responses:
+        '200':
+          description: >
+            Public content stats from the same snapshot as network stats.
+            sections carries per-count scope and computed_at.
+  /api/v1/discovery/stats/relays:
+    get:
+      tags: [public]
+      summary: Public relay summary stats
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d], default: 7d }
+          description: Selects which leaderboard is returned as relays.top. Both windows are also returned as relays.top_24h and relays.top_7d.
+      responses:
+        '200':
+          description: >
+            Relay activity snapshot. total is distinct relay URLs that have delivered
+            events, excluding localhost, 127.0.0.0/8, and [::1]. unique_authors counts
+            every pubkey seen on a counted relay. relays.top follows window and is
+            ranked by event count.
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/clients:
+    get:
+      tags: [public]
+      summary: Client, bridge, content-warning, and proof-of-work mix
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Daily client and content-flag rollups
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/identity:
+    get:
+      tags: [public]
+      summary: Profile identity and NIP-05 verification coverage
+      responses:
+        '200':
+          description: >
+            Kind-0 field prevalence and provider domains. profiles counts
+            profile_fields rows, the same population as
+            /discovery/stats/accounts profiles.
+  /api/v1/discovery/stats/zaps:
+    get:
+      tags: [public]
+      summary: Lightning and nutzap volume
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Daily zap and nutzap totals, histogram, and participant counts
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/accounts:
+    get:
+      tags: [public]
+      summary: New authors, posting activity, and profile age
+      responses:
+        '200':
+          description: >
+            new_authors is pubkeys first seen by the index, by day.
+            active_authors_1d, active_authors_7d, and active_authors_30d
+            count pubkeys with a post in that window, including pubkeys
+            that never published a kind-0 profile. profiles is the kind-0
+            population (same count as /discovery/stats/identity profiles).
+            profiles_posted_30d is how many of those profiles posted in 30
+            days, and dormant_30d is the rest. account_age buckets those
+            profiles by the oldest stored event created_at into indices
+            0 through 5 (under 1 day, 1–7, 7–30, 30–90, 90–365, 1 year or
+            more). account_age_unknown counts profiles whose oldest event
+            is missing, in the future, or before 2020-01-01.
+  /api/v1/relays/propagation:
+    get:
+      tags: [public]
+      summary: Per-relay first-seen, exclusivity, and latency
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Completed UTC-day relay propagation rollups
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/relays/overlap:
+    get:
+      tags: [public]
+      summary: Pairwise event overlap for admitted relays
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Shared-event counts for admitted relay pairs
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/authors/{pubkey}/analytics/zaps:
+    get:
+      tags: [public]
+      summary: Zap and nutzap series for one author
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Daily sent and received zap totals
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/{pubkey}/identity:
+    get:
+      tags: [public]
+      summary: Decomposed profile fields and NIP-05 verification status
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Identity fields, verification status, and nutzap acceptance
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/{pubkey}/external-identities:
+    get:
+      tags: [public]
+      summary: NIP-39 external identity claims from the latest kind-0 event
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Platform, identity, and proof for each claim
+  /api/v1/events/{id}/labels:
+    get:
+      tags: [public]
+      summary: NIP-32 labels on one event
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Self labels and labels that target this event
+  /api/v1/discovery/stats/labels:
+    get:
+      tags: [public]
+      summary: Label distribution and language-label agreement
+      responses:
+        '200':
+          description: Top namespace/label pairs and ISO-639-1 agreement totals
+  /api/v1/discovery/stats/emoji:
+    get:
+      tags: [public]
+      summary: Custom emoji shortcode counts
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Shortcode counts for the window
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/groups:
+    get:
+      tags: [public]
+      summary: Relay groups ordered by activity, members, or recency
+      parameters:
+        - in: query
+          name: sort
+          schema: { type: string, enum: [active, members, recent], default: recent }
+      responses:
+        '200':
+          description: Group list
+  /api/v1/groups/{relayHost}/{groupId}:
+    get:
+      tags: [public]
+      summary: One relay group
+      parameters:
+        - { in: path, name: relayHost, required: true, schema: { type: string } }
+        - { in: path, name: groupId, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Group metadata
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/groups/{relayHost}/{groupId}/messages:
+    get:
+      tags: [public]
+      summary: Recent messages in one relay group
+      parameters:
+        - { in: path, name: relayHost, required: true, schema: { type: string } }
+        - { in: path, name: groupId, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Group messages
+  /api/v1/relays/{relayHost}/groups:
+    get:
+      tags: [public]
+      summary: Groups hosted by one relay
+      parameters:
+        - { in: path, name: relayHost, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Groups on the relay
+  /api/v1/discovery/stats/groups:
+    get:
+      tags: [public]
+      summary: Group census
+      responses:
+        '200':
+          description: Group counts and recent message volume
+  /api/v1/live/{address}/chat:
+    get:
+      tags: [public]
+      summary: Live-activity chat counters
+      parameters:
+        - { in: path, name: address, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Chat count and unique chatters
+  /api/v1/events/{id}/poll:
+    get:
+      tags: [public]
+      summary: Poll question and option counts
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Poll
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/polls:
+    get:
+      tags: [public]
+      summary: Recent or most-voted polls
+      parameters:
+        - in: query
+          name: sort
+          schema: { type: string, enum: [recent, votes], default: recent }
+      responses:
+        '200':
+          description: Poll list
+  /api/v1/discovery/stats/polls:
+    get:
+      tags: [public]
+      summary: Poll census
+      responses:
+        '200':
+          description: Poll and vote counts
+  /api/v1/profiles/{pubkey}/badges:
+    get:
+      tags: [public]
+      summary: Badges awarded to and accepted by a profile
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Badge awards and accepted badges
+  /api/v1/badges/{address}:
+    get:
+      tags: [public]
+      summary: One badge definition
+      parameters:
+        - { in: path, name: address, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Badge definition
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/badges:
+    get:
+      tags: [public]
+      summary: Badge census
+      responses:
+        '200':
+          description: Definition and award counts
+  /api/v1/events/{id}/goal:
+    get:
+      tags: [public]
+      summary: Zap goal progress
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Goal amount and raised sats
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/goals:
+    get:
+      tags: [public]
+      summary: Zap goals ordered by sats raised
+      responses:
+        '200':
+          description: Goal list
+  /api/v1/profiles/{pubkey}/status:
+    get:
+      tags: [public]
+      summary: Latest user status
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Status records
+  /api/v1/discovery/curation-sets:
+    get:
+      tags: [public]
+      summary: Article and bookmark curation sets
+      responses:
+        '200':
+          description: Curation sets
+  /api/v1/curation-sets/{address}:
+    get:
+      tags: [public]
+      summary: One curation set and its items
+      parameters:
+        - { in: path, name: address, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Curation set
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/profiles/{pubkey}/interests:
+    get:
+      tags: [public]
+      summary: Hashtags a profile lists as interests
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Interest lists
+  /api/v1/profiles/{pubkey}/lists:
+    get:
+      tags: [public]
+      summary: Relay preference lists for a profile
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: List summaries
+  /api/v1/discovery/stats/kinds:
+    get:
+      tags: [public]
+      summary: Event volume grouped by kind family
+      parameters:
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Family totals and per-kind counts
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/stats/conversations:
+    get:
+      tags: [public]
+      summary: Daily thread shape
+      responses:
+        '200':
+          description: Thread shape series
+  /api/v1/discovery/zaps/leaderboard:
+    get:
+      tags: [public]
+      summary: Top zap senders or receivers
+      parameters:
+        - in: query
+          name: role
+          schema: { type: string, enum: [sender, receiver], default: receiver }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: Zap leaderboard
+  /api/v1/discovery/stats/zaps/heatmap:
+    get:
+      tags: [public]
+      summary: Zap volume by weekday and hour
+      responses:
+        '200':
+          description: Zap heatmap
+  /api/v1/hashtags/emerging:
+    get:
+      tags: [public]
+      summary: Hashtags gaining volume
+      responses:
+        '200':
+          description: Emerging hashtags
+  /api/v1/discovery/domains/emerging:
+    get:
+      tags: [public]
+      summary: Domains shared by more people than their recent pace
+      responses:
+        '200':
+          description: Emerging domains
+  /api/v1/discovery/archive:
+    get:
+      tags: [public]
+      summary: UTC days that have an overview snapshot
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 30, maximum: 366 }
+      responses:
+        '200':
+          description: Archived days, newest first
+  /api/v1/discovery/archive/{date}:
+    get:
+      tags: [public]
+      summary: Overview snapshot for one UTC day
+      parameters:
+        - { in: path, name: date, required: true, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Archived overview
+        '404':
+          description: That day has not been archived
+  /api/v1/relays/coverage-changes:
+    get:
+      tags: [public]
+      summary: Relays added to or dropped from the index
+      responses:
+        '200':
+          description: Coverage change log
+  /api/v1/hashtags/{tag}/history:
+    get:
+      tags: [public]
+      summary: Daily history for one hashtag
+      parameters:
+        - { in: path, name: tag, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Hashtag history
+  /api/v1/discovery/stats/deletions:
+    get:
+      tags: [public]
+      summary: Deletion volume and time to delete
+      responses:
+        '200':
+          description: Deletion stats
+  /api/v1/discovery/stats/moderation:
+    get:
+      tags: [public]
+      summary: Report volume and most-reported targets
+      responses:
+        '200':
+          description: Moderation stats
+  /api/v1/profiles/{pubkey}/moderation:
+    get:
+      tags: [public]
+      summary: Mute and report counts for a profile
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Profile moderation stats
+  /api/v1/discovery/stats/spam:
+    get:
+      tags: [public]
+      summary: Duplicate content clusters and burst authors
+      responses:
+        '200':
+          description: Spam stats
+  /api/v1/discovery/stats/relay-lists:
+    get:
+      tags: [public]
+      summary: Declared relay list size
+      responses:
+        '200':
+          description: Relay list stats
+  /api/v1/relays/{relayHost}/health/history:
+    get:
+      tags: [public]
+      summary: Daily relay probe history
+      parameters:
+        - { in: path, name: relayHost, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Relay health history
+  /api/v1/discovery/stats/relay-software:
+    get:
+      tags: [public]
+      summary: Relay software and NIP-11 limitation share
+      responses:
+        '200':
+          description: Relay software matrix
+  /api/v1/discovery/stats/media-hosts:
+    get:
+      tags: [public]
+      summary: Observed media hosts and declared Blossom servers
+      responses:
+        '200':
+          description: Media host share
+  /api/v1/profiles/{pubkey}/labels:
+    get:
+      tags: [public]
+      summary: Labels applied to or by a profile
+      parameters:
+        - { in: path, name: pubkey, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Profile labels
+  /api/v1/discovery/stats/series:
+    get:
+      tags: [public]
+      summary: Hourly history of rolling 24-hour discovery metrics
+      parameters:
+        - in: query
+          name: metric
+          required: true
+          schema: { type: string, enum: [note_volume, active_authors, relay_events, zap_count_24h, sats_24h, new_authors_24h, nip17_dm_count_24h, bridged_share_bps, group_messages_24h, poll_votes_24h, live_chat_24h, reports_24h, deletions_24h, labels_24h, census_events_24h] }
+        - in: query
+          name: window
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+          description: How much hourly history to return. Each point is a rolling 24-hour total sampled once per UTC hour, not an hourly increment.
+      responses:
+        '200':
+          description: "Eventual-consistency series of rolling 24-hour totals sampled hourly (`{ metric, window, computed_at, points: [{ t, v }], consistency, trust_applied, result_scope, point_meaning, summary }`)"
+        '400':
+          $ref: '#/components/responses/Error'
+  /api/v1/discovery/network/stats:
+    get:
+      tags: [public]
+      summary: Discovery network-level content stats
+      responses:
+        '200':
+          description: Current network stats snapshot
+  /api/v1/discovery/content/stats:
+    get:
+      tags: [public]
+      summary: Discovery content-level stats
+      responses:
+        '200':
+          description: Current content stats snapshot
+  /api/v1/users/{pubkey}/bookmarks:
+    get:
+      tags: [public]
+      summary: Kind 10003 bookmark events for pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Bookmark events
+  /api/v1/users/{pubkey}/highlights:
+    get:
+      tags: [public]
+      summary: Kind 9802 highlight events for pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: >
+            Highlight events with eventual engagement counters attached for
+            note-card rendering.
+  /api/v1/users/{pubkey}/media:
+    get:
+      tags: [public]
+      summary: Picture and video events for pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: >
+            Kinds 20, 21, 22, 34235, and 34236. Addressable video is the current
+            replaceable winner. Envelope is pubkey, items, and consistency.
+  /api/v1/users/{pubkey}/live:
+    get:
+      tags: [public]
+      summary: Current kind 30311 live activities for pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Latest kind 30311 row per d tag for the pubkey.
+  /api/v1/users/{pubkey}/pins:
+    get:
+      tags: [public]
+      summary: e and a tags from the latest kind 10001 pin list
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Pin items as tag and value, with eventual consistency.
+  /api/v1/live:
+    get:
+      tags: [public]
+      summary: Current kind 30311 live activities
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [planned, live, ended], default: live }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Current live activities. status=live keeps streams whose start and end still cover the present, ordered by current viewers, then replies, reposts, reactions, and zaps. planned and ended stay in start-time order. Counts are attached beside the event.
+  /api/v1/events/{id}/comments:
+    get:
+      tags: [public]
+      summary: Kind 1111 comments on an event or its address
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Comment events with eventual consistency.
+  /api/v1/events/{id}/reports:
+    get:
+      tags: [public]
+      summary: NIP-56 reports targeting an event
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Report targets for the event.
+  /api/v1/users/{pubkey}/reports:
+    get:
+      tags: [public]
+      summary: NIP-56 reports targeting a pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Report targets for the pubkey.
+  /api/v1/users/{pubkey}/long-form:
+    get:
+      tags: [public]
+      summary: Kind 30023 long-form events for pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Opaque keyset continuation token from a prior response's next_cursor.
+      responses:
+        '200':
+          description: >
+            Kind 30023 events the index still has for the pubkey, newest first,
+            with eventual engagement counters. Includes next_cursor when another
+            page exists. The same kind can also be paged via
+            /api/v1/authors/{pubkey}/events?kind=30023.
+  /api/v1/users/{pubkey}/zaps:
+    get:
+      tags: [public]
+      summary: Zap receipts received by pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Zap events
+  /api/v1/users/{pubkey}/mentions:
+    get:
+      tags: [public]
+      summary: Events referencing pubkey in p-tags
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Referencing events
+  /api/v1/users/{pubkey}/followers:
+    get:
+      tags: [public]
+      summary: Followers derived from latest kind-3 contact lists
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: >
+            Opaque keyset token. Order is contact_list_created_at DESC,
+            source_event_id DESC, follower_pubkey ASC.
+      responses:
+        '200':
+          description: Follower edge rows, with next_cursor when another page exists.
+  /api/v1/users/{pubkey}/mutual-follows:
+    get:
+      tags: [public]
+      summary: Mutual follow pubkeys
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: user_pubkey
+          schema: { type: string }
+          description: Second account. Omit it, or pass the path pubkey, for that account's mutuals.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Pubkeys ordered ascending, with next_cursor when another page exists.
+  /api/v1/users/{pubkey}/notifications:
+    get:
+      tags: [public]
+      summary: Engagement notifications for one pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Page of likes, reposts, quote reposts, zaps, replies, mentions, and
+            new follows. Each row has type, created_at, actor_pubkey, and event_id.
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/users/{pubkey}/mute-list:
+    get:
+      tags: [public]
+      summary: Muted identifiers from the user's latest kind-10000 mute list
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Mute list with typed tags (p, e, t, word) and the raw kind 10000
+            event when the index has it. mute_list remains the tag values.
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/users/{pubkey}/muted-by:
+    get:
+      tags: [public]
+      summary: Authors whose latest kind-10000 mute list includes this pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Muter rows (muter pubkey + source mute-list event metadata)
+        '501':
+          $ref: '#/components/responses/Error'
+  /api/v1/users/{pubkey}/summary:
+    get:
+      tags: [public]
+      summary: Public profile explorer summary for one user
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            Product-shaped profile explorer payload with a single identity-first `hero` section plus ordered exploration modules:
+            `recent_notes`, `related_discovery`, and `identity_details`.
+
+            The response keeps legacy compatibility fields (`pubkey`, `metadata_event_id`, `metadata_created_at`, `profile`, `stats`) while adding:
+            - `hero` (avatar, display identity, compact counter row, metadata strip, discovery actions)
+            - `recent_notes` (authored notes surface)
+            - `related_discovery` (`related_profiles` + `rising_profiles`)
+            - `identity_details` (truncated/copy-friendly metadata primitives)
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/trust/scores/{pubkey}:
+    get:
+      tags: [public]
+      summary: Published trust score for a single pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Trust score row
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/trust/scores:
+    get:
+      tags: [public]
+      summary: Top published trust scores
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: Ranked trust score rows
+        '400':
+          $ref: '#/components/responses/Error'
+
+  /primal/v1/events/{id}:
+    get:
+      tags: [primal]
+      summary: Primal-compatible event by id
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Compatibility event payload
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/events/batch:
+    post:
+      tags: [primal]
+      summary: Primal-compatible batch events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: Found and missing compatibility events
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/profiles/{pubkey}:
+    get:
+      tags: [primal]
+      summary: Primal-compatible profile by pubkey
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Compatibility profile payload
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/user_infos:
+    post:
+      tags: [primal]
+      summary: Primal-compatible batch profile lookup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkeys:
+                  type: array
+                  items: { type: string }
+              required: [pubkeys]
+      responses:
+        '200':
+          description: Found and missing profiles
+        '400':
+          $ref: '#/components/responses/Error'
+  /primal/v1/threads/{eventId}:
+    get:
+      tags: [primal]
+      summary: Primal-compatible thread view
+      parameters:
+        - in: path
+          name: eventId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: max_depth
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Thread view
+  /primal/v1/authors/{pubkey}/events:
+    get:
+      tags: [primal]
+      summary: Primal-compatible author events
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Author events
+  /primal/v1/authors/{pubkey}/replies:
+    get:
+      tags: [primal]
+      summary: Primal-compatible author replies
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Author replies
+  /primal/v1/events/{id}/actions:
+    get:
+      tags: [primal]
+      summary: Primal-compatible event action counters
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Action counters
+  /primal/v1/contact-lists/{pubkey}:
+    get:
+      tags: [primal]
+      summary: Primal-compatible contact list projection
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Contact list projection
+  /primal/v1/relay-lists/{pubkey}:
+    get:
+      tags: [primal]
+      summary: Primal-compatible relay list projection
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Relay list projection
+  /primal/v1/dms/messages:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM message history
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkey: { type: string }
+                peer_pubkey: { type: string }
+                sender: { type: string }
+                since: { type: integer }
+                until: { type: integer }
+                limit: { type: integer, minimum: 1, maximum: 10000, default: 20 }
+                offset: { type: integer, minimum: 0, default: 0 }
+              required: [pubkey]
+      responses:
+        '200':
+          description: Mixed event envelope mirroring legacy get_directmsgs output
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/dms/contacts:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM contact summary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkey: { type: string }
+                relation:
+                  type: string
+                  enum: [any, follows, other]
+                since: { type: integer }
+                until: { type: integer }
+                limit: { type: integer, minimum: 1, maximum: 10000, default: 20 }
+                offset: { type: integer, minimum: 0, default: 0 }
+              required: [pubkey]
+      responses:
+        '200':
+          description: Mixed event envelope mirroring legacy get_directmsg_contacts output
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/dms/count:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM unread count
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkey: { type: string }
+                sender: { type: string }
+              required: [pubkey]
+      responses:
+        '200':
+          description: Direct-message count kind envelope
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/dms/count2:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM unread count v2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pubkey: { type: string }
+                sender: { type: string }
+              required: [pubkey]
+      responses:
+        '200':
+          description: Direct-message count v2 kind envelope
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/dms/reset-count:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM counter reset for a peer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                peer_pubkey: { type: string }
+                sender: { type: string }
+                event_from_user:
+                  type: object
+                  additionalProperties: true
+              required: [event_from_user]
+      responses:
+        '200':
+          description: Empty event list on successful reset
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/v1/dms/reset-counts:
+    post:
+      tags: [primal]
+      summary: Primal-compatible DM counter reset for all peers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event_from_user:
+                  type: object
+                  additionalProperties: true
+              required: [event_from_user]
+      responses:
+        '200':
+          description: Empty event list on successful reset-all
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /primal/ws:
+    get:
+      tags: [primal]
+      summary: Primal-compatible WebSocket REQ/CLOSE gateway
+      responses:
+        '101':
+          description: WebSocket protocol switch
+  /primal/ws/v1:
+    get:
+      tags: [primal]
+      summary: Primal iOS cache WebSocket (zlib EVENTS, mega feeds, enrichment)
+      responses:
+        '101':
+          description: WebSocket protocol switch
+
+  /admin/v1/relays:
+    get:
+      tags: [admin]
+      summary: Relay ingest state by relay URL
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Relay checkpoint and config status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  relays:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        relay_url: { type: string }
+                        configured: { type: boolean }
+                        disabled: { type: boolean }
+                        latest_checkpoint_at: { type: string, format: date-time, nullable: true }
+                        checkpoints:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              mode: { type: string }
+                              filter_group: { type: string }
+                              state: { type: string }
+                              status: { type: string }
+                              since: { type: integer, nullable: true }
+                              until: { type: integer, nullable: true }
+                              cursor: { type: string, nullable: true }
+                              last_connected_at: { type: string, format: date-time, nullable: true }
+                              last_disconnected_at: { type: string, format: date-time, nullable: true }
+                              last_progress_at: { type: string, format: date-time, nullable: true }
+                              last_error: { type: string, nullable: true }
+                              last_error_at: { type: string, format: date-time, nullable: true }
+                              eose_seen_at: { type: string, format: date-time, nullable: true }
+                              updated_at: { type: string, format: date-time }
+  /admin/v1/relays/suggestions:
+    get:
+      tags: [admin]
+      summary: Trust-informed relay suggestion state
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Relay recommendation rows
+  /admin/v1/jobs:
+    get:
+      tags: [admin]
+      summary: Queue status and recent jobs
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Queue counts and sample jobs
+  /admin/v1/invalid-events:
+    get:
+      tags: [admin]
+      summary: Invalid event quarantine stats and latest rows
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Invalid event stats + records
+  /admin/v1/status/projections:
+    get:
+      tags: [admin]
+      summary: Projection freshness and stale-subsystem summary
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Projection freshness overview for operators
+  /admin/v1/status/discovery:
+    get:
+      tags: [admin]
+      summary: Discovery ranking freshness and readiness summary
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Discovery freshness and stale subsystem flags
+  /admin/v1/status/search:
+    get:
+      tags: [admin]
+      summary: Search freshness and readiness summary
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Search freshness and stale subsystem flags
+  /admin/v1/rebuilds:
+    get:
+      tags: [admin]
+      summary: Projection rebuild run history
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Rebuild runs
+    post:
+      tags: [admin]
+      summary: Enqueue projection rebuild run
+      security: [{ BearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                derivation_name: { type: string }
+                target_version: { type: integer, minimum: 1 }
+                scope:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [full, event, pubkey, time_range]
+                    event_id: { type: string }
+                    pubkey: { type: string }
+                    start_created_at: { type: integer }
+                    end_created_at: { type: integer }
+                  required: [type]
+              required: [derivation_name, scope]
+      responses:
+        '202':
+          description: Rebuild run accepted and enqueued
+        '400':
+          $ref: '#/components/responses/Error'
+  /admin/v1/storage:
+    get:
+      tags: [admin]
+      summary: Storage footprint and core table cardinality
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Storage stats
+  /admin/v1/storage/indexes:
+    get:
+      tags: [admin]
+      summary: Index usage audit evidence (pg_stat_user_indexes) and per-table dead-tuple pressure
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Per-index scan counts and sizes plus per-table vacuum stats
+  /admin/v1/system:
+    get:
+      tags: [admin]
+      summary: Runtime and DB health snapshot
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Runtime + pool + ping status
+  /admin/v1/derivation-versions:
+    get:
+      tags: [admin]
+      summary: Active vs target projection versions
+      security: [{ BearerToken: [] }]
+      responses:
+        '200':
+          description: Derivation version status list
+  /admin/v1/trust/runs:
+    get:
+      tags: [admin]
+      summary: Trust run history and current phase metadata
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Trust runs
+    post:
+      tags: [admin]
+      summary: Enqueue a new trust run
+      security: [{ BearerToken: [] }]
+      responses:
+        '202':
+          description: Trust run accepted and enqueued
+  /admin/v1/trust/runs/{runID}:
+    get:
+      tags: [admin]
+      summary: Trust run detail by run id
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: path
+          name: runID
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Trust run detail
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+  /admin/v1/trust/scores:
+    get:
+      tags: [admin]
+      summary: Top published trust scores for operator inspection
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: Ranked trust score rows
+        '400':
+          $ref: '#/components/responses/Error'
+  /admin/v1/trust/interaction-rank-comparison:
+    get:
+      tags: [admin]
+      summary: Compare follow-only vs follow+interaction trust rankings
+      description: >
+        Operator-facing report for evaluating TRUST_ENABLE_INTERACTION_GRAPH before
+        enabling it for score publication. Expensive on large graphs.
+      security: [{ BearerToken: [] }]
+      parameters:
+        - in: query
+          name: top_n
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: refresh
+          schema: { type: boolean, default: false }
+          description: When true, rebuild trust_interaction_edge_weights before comparing.
+      responses:
+        '200':
+          description: Rank correlation and top-N overlap report
+        '400':
+          $ref: '#/components/responses/Error'
+components:
+  parameters:
+    Viewer:
+      name: viewer
+      in: query
+      description: >
+        Personalize this ranking for one account. Hex pubkey or npub.
+        No authentication: follow lists are public. The list blends
+        engagement from that account's follows with the global ranking
+        (default cohort weight 0.85). Zero follows returns the global
+        ranking with personalization.source global_fallback. A follow
+        list above the cap keeps the most trusted follows and sets
+        follows_truncated. Offset is capped at 500 when viewer is set.
+        The response is Cache-Control private. An invalid value is 400.
+        When personalized discovery is disabled, a valid viewer is ignored.
+      schema: { type: string }
+    DiscoveryLanguage:
+      name: lang
+      in: query
+      description: >
+        Restrict rankings to one language. Lowercase 2-8 letter code, "und",
+        or "und-uncertain". Omit to rank every language. Responses echo
+        `language` and include global `top_languages` for 24h, 7d, and 30d.
+        Each window lists the 15 highest real language codes (`^[a-z]{2,3}$`)
+        when that many are indexed, plus `und` and `und-uncertain` when those
+        buckets have notes. The unmarked buckets do not count toward the 15.
+        No parameter changes how many languages are returned.
+      schema: { type: string, minLength: 2, maxLength: 16 }
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: OpaqueToken
+  schemas:
+    DiscoveryEvidence:
+      type: object
+      properties:
+        metric: { type: string }
+        value: { type: number }
+        unit: { type: string }
+      required: [metric, value]
+    DiscoveryReason:
+      type: object
+      properties:
+        code: { type: string }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryEvidence' }
+      required: [code]
+    DiscoveryItemRanking:
+      type: object
+      properties:
+        rank: { type: integer, minimum: 1 }
+        score: { type: number }
+        previous_rank: { type: integer, minimum: 1 }
+        rank_delta: { type: integer }
+        reasons:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryReason' }
+        source_breadth: { type: integer, minimum: 0 }
+        confidence: { type: string, enum: [low, medium, high] }
+      required: [rank, score]
+    DiscoveryListMeta:
+      type: object
+      properties:
+        window: { type: string, enum: [24h, 7d, 30d, all] }
+        computed_at: { type: string, format: date-time }
+        ranking_version: { type: string }
+        confidence: { type: string, enum: [low, medium, high] }
+      required: [window, ranking_version, confidence]
+    DiscoveryRankedItem:
+      type: object
+      additionalProperties: true
+      properties:
+        ranking: { $ref: '#/components/schemas/DiscoveryItemRanking' }
+    DiscoveryListResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        surface: { type: string }
+        window: { type: string, enum: [24h, 7d, 30d, all] }
+        computed_at: { type: string, format: date-time }
+        ranking_version: { type: string }
+        meta: { $ref: '#/components/schemas/DiscoveryListMeta' }
+        notes:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        articles:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        profiles:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        hashtags:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        domains:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        conversations:
+          type: array
+          items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        personalization: { $ref: '#/components/schemas/Personalization' }
+    Personalization:
+      type: object
+      properties:
+        viewer: { type: string, description: Canonical hex pubkey }
+        source: { type: string, enum: [personalized, global_fallback] }
+        follow_count: { type: integer }
+        follows_truncated: { type: boolean }
+        cohort_weight: { type: number }
+      required: [viewer, source, follow_count, follows_truncated, cohort_weight]
+    DiscoveryHomeResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        surface: { type: string, const: home }
+        window: { type: string, enum: [24h, 7d, 30d] }
+        computed_at: { type: string, format: date-time }
+        ranking_version: { type: string }
+        meta: { $ref: '#/components/schemas/DiscoveryListMeta' }
+        sections:
+          type: object
+          additionalProperties: true
+          properties:
+            trending_notes:
+              type: array
+              items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+            trending_hashtags:
+              type: array
+              items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+            trending_domains:
+              type: array
+              items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+            profiles:
+              type: object
+              additionalProperties: true
+              properties:
+                trending:
+                  type: array
+                  items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+                rising:
+                  type: array
+                  items: { $ref: '#/components/schemas/DiscoveryRankedItem' }
+        personalization: { $ref: '#/components/schemas/Personalization' }
+  responses:
+    Error:
+      description: Structured API error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  request_id: { type: string }
+                required: [code, message, request_id]
+            required: [error]

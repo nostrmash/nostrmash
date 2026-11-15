@@ -1,0 +1,1580 @@
+package derivation
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// Ledger projection names for applied_stat_deltas. Each event may claim at
+// most one row per projection, which gates the whole multi-pubkey delta set
+// for that projection so retries are exactly-once. The same row is also the
+// reversal gate: retention purges delete it before decrementing, so an
+// event can only ever be un-applied once, and only if it was ever applied.
+const (
+	statDeltaProfilePublicStats   = "profile_public_stats"
+	statDeltaAuthorActivityDaily  = "author_activity_daily"
+	statDeltaAuthorHashtagDaily   = "author_hashtag_daily"
+	statDeltaAuthorMediaDaily     = "author_media_daily"
+	statDeltaAuthorHourlyActivity = "author_hourly_activity"
+	statDeltaFollowerCounts       = "profile_public_stats_followers"
+	statDeltaFollowerGainEvents   = "follower_gain_events"
+)
+
+// ApplyIncrementalAuthorStats applies O(1) counter deltas for the
+// projections that used to be full-history recomputes. It is a no-op when
+// both incremental profile-public-stats and author-activity-daily flags are
+// disabled.
+//
+// Must run after the cheap projections that establish the facts this path
+// reads (hashtags, note_discovery_stats media flags, reaction/repost/zap
+// rows, contact lists). Idempotent via applied_stat_deltas.
+func (h *Handlers) ApplyIncrementalAuthorStats(ctx context.Context, eventID string) error {
+	if h == nil || h.pool == nil {
+		return fmt.Errorf("handlers are not initialized")
+	}
+	if !h.incrementalProfilePublicStats && !h.incrementalAuthorActivityDaily && !h.incrementalProfileDiscoveryStats {
+		return nil
+	}
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return fmt.Errorf("event id is required")
+	}
+
+	var pubkey string
+	var kind int
+	var createdAt int64
+	if err := h.pool.QueryRow(ctx, `
+		SELECT pubkey, kind, created_at
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&pubkey, &kind, &createdAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("load event for incremental stats: %w", err)
+	}
+	// Gift wraps are signed by an ephemeral key. Touching profile and
+	// activity rows for that key creates one stats row per wrap and
+	// does not describe a person.
+	if kind == 1059 {
+		return nil
+	}
+
+	tags, err := h.loadEventTags(ctx, eventID)
+	if err != nil {
+		return err
+	}
+	isReply, replyTargetEventID := replyTargetFromTags(eventID, tags)
+
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin incremental stats tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if h.incrementalProfilePublicStats {
+		if err := h.applyIncrementalProfilePublicStatsTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply); err != nil {
+			return err
+		}
+	}
+	if h.incrementalAuthorActivityDaily {
+		if err := h.applyIncrementalAuthorActivityDailyTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply, replyTargetEventID, tags); err != nil {
+			return err
+		}
+		if err := h.applyIncrementalAuthorHashtagDailyTx(ctx, tx, eventID, pubkey, kind, createdAt); err != nil {
+			return err
+		}
+		if err := h.applyIncrementalAuthorMediaDailyTx(ctx, tx, eventID, pubkey, kind, createdAt); err != nil {
+			return err
+		}
+		if err := h.applyIncrementalAuthorHourlyActivityTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply, replyTargetEventID, tags); err != nil {
+			return err
+		}
+	}
+	if h.incrementalProfileDiscoveryStats {
+		if err := h.applyIncrementalProfileDiscoveryRecentActivityTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply, replyTargetEventID, tags); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit incremental stats tx: %w", err)
+	}
+	return nil
+}
+
+// ReverseIncrementalAuthorStatsTx undoes whatever O(1) deltas
+// ApplyIncrementalAuthorStats previously applied for eventID, one
+// projection at a time, gated by whether that projection actually claimed
+// an applied_stat_deltas row for this event. It deliberately ignores the
+// *current* incremental-stats feature flags: those only gate whether new
+// deltas get applied, not whether previously-applied ones need to be
+// undone (an event created while a flag was on can still be purged after
+// the flag is later disabled).
+//
+// Callers MUST run this inside the same transaction that will delete the
+// events row for eventID (and its cascaded children in event_hashtags,
+// note_discovery_stats, event_tags, ...), and BEFORE issuing that delete:
+// several sub-projections re-derive the facts they originally used from
+// those still-intact rows. See internal/store/retention for the purge
+// wrappers that wire this in.
+//
+// Deliberate simplification: this decrements note, reply, media, and zap
+// counters and rolls time_joined forward when this event is the stored
+// oldest, but it does not roll back profile_public_stats.recent_activity_at.
+// That would require the pubkey's second-most-recent timestamp. Retention
+// only purges old events, so the purged event is essentially never the
+// current recent_activity_at. A purge batch can reverse several of one
+// author's events before any of them are deleted; RefreshProfileTimeJoinedTx
+// runs after that delete and sets time_joined from the events that remain.
+func (h *Handlers) ReverseIncrementalAuthorStatsTx(ctx context.Context, tx pgx.Tx, eventID string) error {
+	if h == nil {
+		return fmt.Errorf("handlers are not initialized")
+	}
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return nil
+	}
+
+	var pubkey string
+	var kind int
+	var createdAt int64
+	if err := tx.QueryRow(ctx, `
+		SELECT pubkey, kind, created_at
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&pubkey, &kind, &createdAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Already gone (e.g. a retried purge batch); nothing to reverse.
+			return nil
+		}
+		return fmt.Errorf("load event for incremental stats reversal: %w", err)
+	}
+
+	tags, err := loadEventTagsTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	isReply, replyTargetEventID := replyTargetFromTags(eventID, tags)
+
+	if err := h.reverseIncrementalProfilePublicStatsTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply); err != nil {
+		return err
+	}
+	if err := h.reverseIncrementalAuthorActivityDailyTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply, replyTargetEventID, tags); err != nil {
+		return err
+	}
+	if err := h.reverseIncrementalAuthorHashtagDailyTx(ctx, tx, eventID, pubkey, kind, createdAt); err != nil {
+		return err
+	}
+	if err := h.reverseIncrementalAuthorMediaDailyTx(ctx, tx, eventID, pubkey, kind, createdAt); err != nil {
+		return err
+	}
+	return h.reverseIncrementalAuthorHourlyActivityTx(ctx, tx, eventID, pubkey, kind, createdAt, isReply, replyTargetEventID, tags)
+}
+
+// replyTargetFromTags derives whether an event is a reply and, if so, the
+// event id it replies to. Shared by the apply and reverse paths so both
+// classify the same event identically. Uses thread-parent semantics (reply,
+// else root) so single unmarked #e notes count as replies.
+func replyTargetFromTags(eventID string, tags [][]string) (isReply bool, replyTargetEventID string) {
+	parent := replyParentEventID(deriveEventReferences(eventID, tags))
+	if parent == "" {
+		return false, ""
+	}
+	return true, parent
+}
+
+// loadEventTagsTx is the transaction-scoped counterpart to loadEventTags,
+// used by the reversal path so the read happens on the same transaction
+// that will (later, in the same tx) delete the row — never on a separate
+// pool connection.
+func loadEventTagsTx(ctx context.Context, tx pgx.Tx, eventID string) ([][]string, error) {
+	var rawEvent string
+	if err := tx.QueryRow(ctx, `SELECT raw_json::text FROM events WHERE id = $1`, eventID).Scan(&rawEvent); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load raw event for incremental stats reversal: %w", err)
+	}
+	var payload struct {
+		Tags [][]string `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(rawEvent), &payload); err != nil {
+		return nil, fmt.Errorf("decode event tags for incremental stats reversal: %w", err)
+	}
+	return payload.Tags, nil
+}
+
+func claimStatDeltaTx(ctx context.Context, tx pgx.Tx, eventID, projection string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO applied_stat_deltas (event_id, projection)
+		VALUES ($1, $2)
+		ON CONFLICT (event_id, projection) DO NOTHING
+	`, eventID, projection)
+	if err != nil {
+		return false, fmt.Errorf("claim stat delta %s/%s: %w", eventID, projection, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// unclaimStatDeltaTx removes a previously-claimed applied_stat_deltas row,
+// returning whether one existed. This is the reversal-side mirror of
+// claimStatDeltaTx: a projection is only decremented if it was previously
+// incremented, and removing the ledger row makes a repeated reversal
+// attempt (e.g. a retried purge batch) a safe no-op.
+func unclaimStatDeltaTx(ctx context.Context, tx pgx.Tx, eventID, projection string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM applied_stat_deltas
+		WHERE event_id = $1 AND projection = $2
+	`, eventID, projection)
+	if err != nil {
+		return false, fmt.Errorf("unclaim stat delta %s/%s: %w", eventID, projection, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// applyIncrementalProfilePublicStatsTx upserts profile_public_stats for the
+// event author. Matches the full-rebuild semantics in
+// projectProfilePublicStatsForPubkeysTx:
+//
+//   - every event kind creates/touches a row for its author (rebuild iterates
+//     every event id and recomputes that author's row)
+//   - recent_activity_at tracks MAX(created_at) across all of the author's
+//     events (rebuild uses SELECT MAX(created_at) FROM events WHERE pubkey=$1;
+//     we approximate that with GREATEST against the current event)
+//   - note_count / reply_count only move for kind=1
+//   - media_count moves for kind 20 and for kind 1 that contains an image,
+//     a video, or an imeta tag
+//   - time_joined moves down to the oldest created_at seen for the author
+//   - kind 9735 moves zap counters for the payer stored on the receipt
+//     (the zap-request author, not the lightning service) and the receiver
+//   - long_form_note_count is maintained when the kind-30023 address is
+//     first stored, in UpdateReplaceableState, not here
+func (h *Handlers) applyIncrementalProfilePublicStatsTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+) error {
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaProfilePublicStats)
+	if err != nil || !claimed {
+		return err
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationProfilePublicStats,
+		ProfilePublicStatsVersion,
+		"Project public profile counters and recent activity",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	noteDelta := int64(0)
+	replyDelta := int64(0)
+	if kind == 1 {
+		if isReply {
+			replyDelta = 1
+		} else {
+			noteDelta = 1
+		}
+	}
+	mediaDelta, err := profileMediaDeltaTx(ctx, tx, eventID, kind)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_public_stats (
+			pubkey,
+			follower_count,
+			following_count,
+			note_count,
+			reply_count,
+			recent_activity_at,
+			media_count,
+			time_joined,
+			derivation_version
+		)
+		VALUES ($1, 0, 0, $2, $3, $4, $5, $4, $6)
+		ON CONFLICT (pubkey) DO UPDATE
+		SET note_count = GREATEST(profile_public_stats.note_count + EXCLUDED.note_count, 0),
+		    reply_count = GREATEST(profile_public_stats.reply_count + EXCLUDED.reply_count, 0),
+		    media_count = GREATEST(profile_public_stats.media_count + EXCLUDED.media_count, 0),
+		    recent_activity_at = GREATEST(
+				COALESCE(profile_public_stats.recent_activity_at, 0),
+				COALESCE(EXCLUDED.recent_activity_at, 0)
+			),
+		    time_joined = CASE
+				WHEN profile_public_stats.time_joined IS NULL OR EXCLUDED.time_joined < profile_public_stats.time_joined
+				THEN EXCLUDED.time_joined
+				ELSE profile_public_stats.time_joined
+			END,
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+	`, pubkey, noteDelta, replyDelta, createdAt, mediaDelta, writeVersion); err != nil {
+		return fmt.Errorf("apply profile public stats delta: %w", err)
+	}
+	if kind == 9735 {
+		if err := applyZapProfileCountersTx(ctx, tx, eventID, pubkey, 1, writeVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reverseIncrementalProfilePublicStatsTx undoes the note, reply, media, zap,
+// and time_joined deltas applied for this event. recent_activity_at is left
+// in place; see ReverseIncrementalAuthorStatsTx. A kind-30023 event that is
+// still the current address also decrements long_form_note_count.
+func (h *Handlers) reverseIncrementalProfilePublicStatsTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+) error {
+	unclaimed, err := unclaimStatDeltaTx(ctx, tx, eventID, statDeltaProfilePublicStats)
+	if err != nil {
+		return err
+	}
+	if unclaimed {
+		writeVersion, err := resolveDerivationWriteVersion(
+			ctx,
+			tx,
+			DerivationProfilePublicStats,
+			ProfilePublicStatsVersion,
+			"Project public profile counters and recent activity",
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+		noteDelta := int64(0)
+		replyDelta := int64(0)
+		if kind == 1 {
+			if isReply {
+				replyDelta = -1
+			} else {
+				noteDelta = -1
+			}
+		}
+		mediaDelta, err := profileMediaDeltaTx(ctx, tx, eventID, kind)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE profile_public_stats
+			SET note_count = GREATEST(note_count + $2, 0),
+			    reply_count = GREATEST(reply_count + $3, 0),
+			    media_count = GREATEST(media_count - $4, 0),
+			    derivation_version = $5,
+			    updated_at = now()
+			WHERE pubkey = $1
+		`, pubkey, noteDelta, replyDelta, mediaDelta, writeVersion); err != nil {
+			return fmt.Errorf("reverse profile public stats delta: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE profile_public_stats
+			SET time_joined = (
+				    SELECT MIN(created_at) FROM events WHERE pubkey = $1 AND id <> $2
+			    ),
+			    derivation_version = $4,
+			    updated_at = now()
+			WHERE pubkey = $1
+			  AND time_joined IS NOT DISTINCT FROM $3
+		`, pubkey, eventID, createdAt, writeVersion); err != nil {
+			return fmt.Errorf("reverse profile time_joined: %w", err)
+		}
+		if kind == 9735 {
+			if err := applyZapProfileCountersTx(ctx, tx, eventID, pubkey, -1, writeVersion); err != nil {
+				return err
+			}
+		}
+	}
+	if kind == 30023 {
+		if err := reverseLongFormIfCurrentTx(ctx, tx, eventID, pubkey); err != nil {
+			return err
+		}
+	}
+	if kind == 34235 || kind == 34236 {
+		if err := reverseAddressableMediaIfCurrentTx(ctx, tx, eventID, pubkey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// profileMediaDeltaTx reports 1 when this event counts as a media post.
+// Kind 20 is a picture event. Kind 1 counts when it has an image, a video,
+// or an imeta tag. The full recompute in profilePublicStatsComputeSQL uses
+// the same rule.
+func profileMediaDeltaTx(ctx context.Context, tx pgx.Tx, eventID string, kind int) (int64, error) {
+	switch kind {
+	case 20, 21, 22:
+		return 1, nil
+	case 1:
+		hasImage, hasVideo, _, _, _, err := loadNoteMediaFlagsTx(ctx, tx, eventID)
+		if err != nil {
+			return 0, err
+		}
+		if hasImage || hasVideo {
+			return 1, nil
+		}
+		var hasImeta bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM event_tags
+				WHERE event_id = $1 AND LOWER(tag_name) = 'imeta'
+			)
+		`, eventID).Scan(&hasImeta); err != nil {
+			return 0, fmt.Errorf("check imeta tag: %w", err)
+		}
+		if hasImeta {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, nil
+	}
+}
+
+func applyZapProfileCountersTx(ctx context.Context, tx pgx.Tx, eventID, eventPubkey string, sign int64, writeVersion int) error {
+	var storedSender string
+	var receiver *string
+	var amount int64
+	err := tx.QueryRow(ctx, `
+		SELECT sender_pubkey, NULLIF(receiver_pubkey, ''), amount_sats
+		FROM zap_receipts
+		WHERE zap_receipt_id = $1
+	`, eventID).Scan(&storedSender, &receiver, &amount)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("load zap receipt for profile stats: %w", err)
+	}
+	sender := strings.TrimSpace(storedSender)
+	if sender == "" {
+		sender = strings.TrimSpace(eventPubkey)
+	}
+	received := sign
+	sats := amount * sign
+	if receiver != nil && *receiver == sender {
+		return adjustProfileZapCountersTx(ctx, tx, sender, received, sats, sign, writeVersion)
+	}
+	if err := adjustProfileZapCountersTx(ctx, tx, sender, 0, 0, sign, writeVersion); err != nil {
+		return err
+	}
+	if receiver == nil || *receiver == "" {
+		return nil
+	}
+	return adjustProfileZapCountersTx(ctx, tx, *receiver, received, sats, 0, writeVersion)
+}
+
+func adjustProfileZapCountersTx(ctx context.Context, tx pgx.Tx, pubkey string, receivedDelta, satsDelta, sentDelta int64, writeVersion int) error {
+	if receivedDelta == 0 && satsDelta == 0 && sentDelta == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_public_stats (
+			pubkey, follower_count, following_count, note_count, reply_count,
+			zap_received_count, sats_zapped, content_zap_count, derivation_version
+		)
+		VALUES ($1, 0, 0, 0, 0, GREATEST($2, 0), GREATEST($3, 0), GREATEST($4, 0), $5)
+		ON CONFLICT (pubkey) DO UPDATE
+		SET zap_received_count = GREATEST(profile_public_stats.zap_received_count + $2, 0),
+		    sats_zapped = GREATEST(profile_public_stats.sats_zapped + $3, 0),
+		    content_zap_count = GREATEST(profile_public_stats.content_zap_count + $4, 0),
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+	`, pubkey, receivedDelta, satsDelta, sentDelta, writeVersion); err != nil {
+		return fmt.Errorf("adjust zap profile counters for %s: %w", pubkey, err)
+	}
+	return nil
+}
+
+func reverseLongFormIfCurrentTx(ctx context.Context, tx pgx.Tx, eventID, pubkey string) error {
+	// Delete the address row so a retried reversal, before the event delete
+	// commits, does not decrement the count twice. A replaced article is
+	// not this event_id, so it deletes nothing and leaves the count.
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM replaceable_state
+		WHERE event_id = $1 AND kind = 30023
+	`, eventID)
+	if err != nil {
+		return fmt.Errorf("check current long-form address: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationProfilePublicStats,
+		ProfilePublicStatsVersion,
+		"Project public profile counters and recent activity",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE profile_public_stats
+		SET long_form_note_count = GREATEST(long_form_note_count - 1, 0),
+		    derivation_version = $2,
+		    updated_at = now()
+		WHERE pubkey = $1
+	`, pubkey, writeVersion); err != nil {
+		return fmt.Errorf("reverse long-form note count: %w", err)
+	}
+	return nil
+}
+
+func reverseAddressableMediaIfCurrentTx(ctx context.Context, tx pgx.Tx, eventID, pubkey string) error {
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM replaceable_state
+		WHERE event_id = $1 AND kind IN (34235, 34236)
+	`, eventID)
+	if err != nil {
+		return fmt.Errorf("check current addressable media: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationProfilePublicStats,
+		ProfilePublicStatsVersion,
+		"Project public profile counters and recent activity",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE profile_public_stats
+		SET media_count = GREATEST(media_count - 1, 0),
+		    derivation_version = $2,
+		    updated_at = now()
+		WHERE pubkey = $1
+	`, pubkey, writeVersion); err != nil {
+		return fmt.Errorf("reverse addressable media count: %w", err)
+	}
+	return nil
+}
+
+// RefreshProfileTimeJoinedTx sets time_joined to the oldest stored event
+// for each pubkey, or NULL when none remain. Retention calls it after the
+// event delete, because reversing a batch leaves every doomed row visible
+// until that delete.
+func (h *Handlers) RefreshProfileTimeJoinedTx(ctx context.Context, tx pgx.Tx, pubkeys []string) error {
+	if h == nil || len(pubkeys) == 0 {
+		return nil
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationProfilePublicStats,
+		ProfilePublicStatsVersion,
+		"Project public profile counters and recent activity",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE profile_public_stats AS s
+		SET time_joined = m.min_created,
+		    derivation_version = $2,
+		    updated_at = now()
+		FROM (
+			SELECT p.pubkey,
+			       (SELECT MIN(e.created_at) FROM events e WHERE e.pubkey = p.pubkey) AS min_created
+			FROM unnest($1::text[]) AS p(pubkey)
+		) AS m
+		WHERE s.pubkey = m.pubkey
+		  AND s.time_joined IS DISTINCT FROM m.min_created
+	`, pubkeys, writeVersion); err != nil {
+		return fmt.Errorf("refresh profile time_joined: %w", err)
+	}
+	return nil
+}
+
+func (h *Handlers) applyFollowerCountDeltasTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, authorPubkey string,
+	previousFollowed, contacts []string,
+	versionOverride *int,
+) error {
+	if !h.incrementalProfilePublicStats {
+		return nil
+	}
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaFollowerCounts)
+	if err != nil || !claimed {
+		return err
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationProfilePublicStats,
+		ProfilePublicStatsVersion,
+		"Project public profile counters and recent activity",
+		versionOverride,
+	)
+	if err != nil {
+		return err
+	}
+
+	prev := make(map[string]struct{}, len(previousFollowed))
+	for _, p := range previousFollowed {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		prev[p] = struct{}{}
+	}
+	next := make(map[string]struct{}, len(contacts))
+	for _, p := range contacts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		next[p] = struct{}{}
+	}
+
+	authorPubkey = strings.TrimSpace(authorPubkey)
+	// One lookup per contact-list rewrite. The author is the follower on
+	// every edge this rewrite adds or removes. Self-follows stay in the raw
+	// counts and out of the trusted count, matching follower_gain_events.
+	inAudience, err := followerInTrustedAudience(ctx, tx, authorPubkey, h.engagementWeighting)
+	if err != nil {
+		return err
+	}
+	trustedStep := int64(0)
+	if inAudience {
+		trustedStep = 1
+	}
+
+	type delta struct {
+		pubkey               string
+		followerDelta        int64
+		followingDelta       int64
+		trustedFollowerDelta int64
+	}
+	deltas := map[string]*delta{}
+	bump := func(pubkey string, followerDelta, followingDelta, trustedFollowerDelta int64) {
+		pubkey = strings.TrimSpace(pubkey)
+		if pubkey == "" {
+			return
+		}
+		d, ok := deltas[pubkey]
+		if !ok {
+			d = &delta{pubkey: pubkey}
+			deltas[pubkey] = d
+		}
+		d.followerDelta += followerDelta
+		d.followingDelta += followingDelta
+		d.trustedFollowerDelta += trustedFollowerDelta
+	}
+
+	for followed := range next {
+		if _, ok := prev[followed]; ok {
+			continue
+		}
+		trustedDelta := int64(0)
+		if followed != authorPubkey {
+			trustedDelta = trustedStep
+		}
+		bump(authorPubkey, 0, 1, 0)
+		bump(followed, 1, 0, trustedDelta)
+	}
+	for followed := range prev {
+		if _, ok := next[followed]; ok {
+			continue
+		}
+		trustedDelta := int64(0)
+		if followed != authorPubkey {
+			trustedDelta = trustedStep
+		}
+		bump(authorPubkey, 0, -1, 0)
+		bump(followed, -1, 0, -trustedDelta)
+	}
+
+	// Stable pubkey order. Two contact-list rewrites that touch the same
+	// profiles otherwise lock profile_public_stats in map order and deadlock.
+	pubkeys := make([]string, 0, len(deltas))
+	for pubkey := range deltas {
+		pubkeys = append(pubkeys, pubkey)
+	}
+	sort.Strings(pubkeys)
+	for _, pubkey := range pubkeys {
+		d := deltas[pubkey]
+		if d.followerDelta == 0 && d.followingDelta == 0 && d.trustedFollowerDelta == 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO profile_public_stats (
+				pubkey,
+				follower_count,
+				following_count,
+				trusted_follower_count,
+				note_count,
+				reply_count,
+				recent_activity_at,
+				derivation_version
+			)
+			VALUES ($1, GREATEST($2, 0), GREATEST($3, 0), GREATEST($4, 0), 0, 0, NULL, $5)
+			ON CONFLICT (pubkey) DO UPDATE
+			SET follower_count = GREATEST(profile_public_stats.follower_count + $2, 0),
+			    following_count = GREATEST(profile_public_stats.following_count + $3, 0),
+			    trusted_follower_count = GREATEST(profile_public_stats.trusted_follower_count + $4, 0),
+			    derivation_version = EXCLUDED.derivation_version,
+			    updated_at = now()
+		`, d.pubkey, d.followerDelta, d.followingDelta, d.trustedFollowerDelta, writeVersion); err != nil {
+			return fmt.Errorf("apply follower count delta for %s: %w", d.pubkey, err)
+		}
+	}
+	return nil
+}
+
+// followerInTrustedAudience reports whether follower's follows count toward
+// trusted_follower_count. A positive untrusted weight counts every follower.
+// Zero counts a published hop within the same limit discovery engagement uses.
+// Score-only rows (NULL min_hops) and hops past the limit do not count.
+func followerInTrustedAudience(ctx context.Context, tx pgx.Tx, follower string, weighting EngagementWeightingOptions) (bool, error) {
+	weighting = weighting.normalized()
+	follower = strings.TrimSpace(follower)
+	if follower == "" {
+		return false, nil
+	}
+	if weighting.UntrustedWeight > 0 {
+		return true, nil
+	}
+	var hops *int
+	err := tx.QueryRow(ctx, `
+		SELECT min_hops
+		FROM trust_pubkeys_latest
+		WHERE pubkey = $1
+	`, follower).Scan(&hops)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load trust hops for follower %s: %w", follower, err)
+	}
+	if hops == nil || *hops > weighting.MaxHops {
+		return false, nil
+	}
+	return true, nil
+}
+
+type activityDailyDelta struct {
+	pubkey             string
+	activityDate       time.Time
+	postCount          int64
+	noteCount          int64
+	replyCount         int64
+	engagementReceived int64
+	engagementGiven    int64
+	zapMsatsReceived   int64
+}
+
+// computeActivityDailyDeltas derives the author_activity_daily row deltas
+// a single event contributes. It is pure with respect to the ledger (no
+// claim/unclaim, no writes) so both the forward-apply and reversal paths
+// can call it and get an identical delta shape — reversal just negates the
+// numeric fields before writing.
+func computeActivityDailyDeltas(
+	ctx context.Context,
+	tx pgx.Tx,
+	pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) ([]activityDailyDelta, error) {
+	activityDate := time.Unix(createdAt, 0).UTC().Truncate(24 * time.Hour)
+	deltas := make([]activityDailyDelta, 0, 2)
+
+	switch kind {
+	case 1:
+		d := activityDailyDelta{
+			pubkey:       pubkey,
+			activityDate: activityDate,
+			postCount:    1,
+		}
+		if isReply {
+			d.replyCount = 1
+		} else {
+			d.noteCount = 1
+		}
+		deltas = append(deltas, d)
+		if isReply && replyTargetEventID != "" {
+			targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, replyTargetEventID)
+			if err != nil {
+				return nil, err
+			}
+			// engagement_given only counts when the reply target resolves to
+			// a known, different author — the same rule kinds 6/7 apply and
+			// the same projection-time semantics the full recompute reads
+			// via reply_count_contributions.target_pubkey. Counting replies
+			// to unknown targets inflated mass-repliers (one bot accrued
+			// 35k phantom engagement_given vs 6.6k real) and made every
+			// reconciliation heal drift right back.
+			if ok && targetPubkey != "" && targetPubkey != pubkey {
+				deltas[0].engagementGiven = 1
+				deltas = append(deltas, activityDailyDelta{
+					pubkey:             targetPubkey,
+					activityDate:       activityDate,
+					engagementReceived: 1,
+				})
+			}
+		}
+	case 6, 7:
+		targetEventID := firstReferencedEventID(tags)
+		if targetEventID == "" {
+			return nil, nil
+		}
+		targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, targetEventID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || targetPubkey == "" || targetPubkey == pubkey {
+			return nil, nil
+		}
+		deltas = append(deltas,
+			activityDailyDelta{pubkey: pubkey, activityDate: activityDate, engagementGiven: 1},
+			activityDailyDelta{pubkey: targetPubkey, activityDate: activityDate, engagementReceived: 1},
+		)
+	case 9735:
+		sender := zapReceiptSender(pubkey, tags)
+		receiver := firstTagValue(tags, "p")
+		if receiver == "" || receiver == sender {
+			return nil, nil
+		}
+		zapMsats := zapReceiptAmountSats(tags) * 1000
+		deltas = append(deltas,
+			activityDailyDelta{pubkey: sender, activityDate: activityDate, engagementGiven: 1},
+			activityDailyDelta{
+				pubkey:             receiver,
+				activityDate:       activityDate,
+				engagementReceived: 1,
+				zapMsatsReceived:   zapMsats,
+			},
+		)
+	default:
+		return nil, nil
+	}
+	return deltas, nil
+}
+
+func negateActivityDailyDelta(d activityDailyDelta) activityDailyDelta {
+	d.postCount = -d.postCount
+	d.noteCount = -d.noteCount
+	d.replyCount = -d.replyCount
+	d.engagementReceived = -d.engagementReceived
+	d.engagementGiven = -d.engagementGiven
+	d.zapMsatsReceived = -d.zapMsatsReceived
+	return d
+}
+
+func (h *Handlers) applyIncrementalAuthorActivityDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) error {
+	deltas, err := computeActivityDailyDeltas(ctx, tx, pubkey, kind, createdAt, isReply, replyTargetEventID, tags)
+	if err != nil {
+		return err
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorActivityDaily)
+	if err != nil || !claimed {
+		return err
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationAuthorActivityDaily,
+		AuthorActivityDailyVersion,
+		"Project per-author daily post cadence and engagement aggregates",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	for _, d := range deltas {
+		if err := upsertAuthorActivityDailyDeltaTx(ctx, tx, d, writeVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reverseIncrementalAuthorActivityDailyTx undoes the author_activity_daily
+// deltas applyIncrementalAuthorActivityDailyTx previously applied, by
+// recomputing the identical delta set (events are immutable, so the
+// classification can't have changed) and applying it negated.
+func (h *Handlers) reverseIncrementalAuthorActivityDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) error {
+	unclaimed, err := unclaimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorActivityDaily)
+	if err != nil || !unclaimed {
+		return err
+	}
+	deltas, err := computeActivityDailyDeltas(ctx, tx, pubkey, kind, createdAt, isReply, replyTargetEventID, tags)
+	if err != nil {
+		return err
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+	writeVersion, err := resolveDerivationWriteVersion(
+		ctx,
+		tx,
+		DerivationAuthorActivityDaily,
+		AuthorActivityDailyVersion,
+		"Project per-author daily post cadence and engagement aggregates",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	for _, d := range deltas {
+		if err := upsertAuthorActivityDailyDeltaTx(ctx, tx, negateActivityDailyDelta(d), writeVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func upsertAuthorActivityDailyDeltaTx(ctx context.Context, tx pgx.Tx, d activityDailyDelta, writeVersion int) error {
+	if d.pubkey == "" {
+		return nil
+	}
+	if d.postCount == 0 && d.noteCount == 0 && d.replyCount == 0 && d.engagementReceived == 0 && d.engagementGiven == 0 && d.zapMsatsReceived == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO author_activity_daily (
+			pubkey,
+			activity_date,
+			post_count,
+			note_count,
+			reply_count,
+			engagement_received,
+			engagement_given,
+			zap_msats_received,
+			derivation_version
+		)
+		VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (pubkey, activity_date) DO UPDATE
+		SET post_count = GREATEST(author_activity_daily.post_count + EXCLUDED.post_count, 0),
+		    note_count = GREATEST(author_activity_daily.note_count + EXCLUDED.note_count, 0),
+		    reply_count = GREATEST(author_activity_daily.reply_count + EXCLUDED.reply_count, 0),
+		    engagement_received = GREATEST(author_activity_daily.engagement_received + EXCLUDED.engagement_received, 0),
+		    engagement_given = GREATEST(author_activity_daily.engagement_given + EXCLUDED.engagement_given, 0),
+		    zap_msats_received = GREATEST(author_activity_daily.zap_msats_received + EXCLUDED.zap_msats_received, 0),
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+	`, d.pubkey, d.activityDate, d.postCount, d.noteCount, d.replyCount, d.engagementReceived, d.engagementGiven, d.zapMsatsReceived, writeVersion)
+	if err != nil {
+		return fmt.Errorf("upsert author_activity_daily delta for %s: %w", d.pubkey, err)
+	}
+	return nil
+}
+
+func (h *Handlers) applyIncrementalAuthorHashtagDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+) error {
+	if kind != 1 {
+		return nil
+	}
+	hashtags, err := loadEventHashtagsTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	if len(hashtags) == 0 {
+		return nil
+	}
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorHashtagDaily)
+	if err != nil || !claimed {
+		return err
+	}
+	activityDate := time.Unix(createdAt, 0).UTC().Truncate(24 * time.Hour)
+	for _, hashtag := range hashtags {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO author_hashtag_daily (
+				pubkey, activity_date, hashtag, usage_count, derivation_version
+			)
+			VALUES ($1, $2::date, $3, 1, $4)
+			ON CONFLICT (pubkey, activity_date, hashtag) DO UPDATE
+			SET usage_count = GREATEST(author_hashtag_daily.usage_count + 1, 0),
+			    derivation_version = EXCLUDED.derivation_version,
+			    updated_at = now()
+		`, pubkey, activityDate, hashtag, AuthorTopicStatsVersion); err != nil {
+			return fmt.Errorf("upsert author_hashtag_daily: %w", err)
+		}
+	}
+	return nil
+}
+
+// reverseIncrementalAuthorHashtagDailyTx undoes the author_hashtag_daily
+// deltas applyIncrementalAuthorHashtagDailyTx previously applied. It reads
+// event_hashtags for eventID, so it must run before that row's cascaded
+// delete.
+func (h *Handlers) reverseIncrementalAuthorHashtagDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+) error {
+	if kind != 1 {
+		return nil
+	}
+	unclaimed, err := unclaimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorHashtagDaily)
+	if err != nil || !unclaimed {
+		return err
+	}
+	hashtags, err := loadEventHashtagsTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	if len(hashtags) == 0 {
+		return nil
+	}
+	activityDate := time.Unix(createdAt, 0).UTC().Truncate(24 * time.Hour)
+	for _, hashtag := range hashtags {
+		if _, err := tx.Exec(ctx, `
+			UPDATE author_hashtag_daily
+			SET usage_count = GREATEST(usage_count - 1, 0),
+			    updated_at = now()
+			WHERE pubkey = $1 AND activity_date = $2::date AND hashtag = $3
+		`, pubkey, activityDate, hashtag); err != nil {
+			return fmt.Errorf("reverse author_hashtag_daily: %w", err)
+		}
+	}
+	return nil
+}
+
+func loadEventHashtagsTx(ctx context.Context, tx pgx.Tx, eventID string) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT hashtag
+		FROM event_hashtags
+		WHERE event_id = $1
+	`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("load event hashtags for incremental daily: %w", err)
+	}
+	defer rows.Close()
+	hashtags := make([]string, 0)
+	for rows.Next() {
+		var hashtag string
+		if err := rows.Scan(&hashtag); err != nil {
+			return nil, fmt.Errorf("scan hashtag for incremental daily: %w", err)
+		}
+		hashtags = append(hashtags, hashtag)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hashtags, nil
+}
+
+func (h *Handlers) applyIncrementalAuthorMediaDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+) error {
+	if kind != 1 {
+		return nil
+	}
+	hasImage, hasVideo, hasLink, hasArticle, attachmentCount, ok, err := loadNoteDiscoveryMediaFlagsTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorMediaDaily)
+	if err != nil || !claimed {
+		return err
+	}
+	textOnly := !hasImage && !hasVideo && !hasLink && !hasArticle
+	activityDate := time.Unix(createdAt, 0).UTC().Truncate(24 * time.Hour)
+	_, err = tx.Exec(ctx, `
+		INSERT INTO author_media_daily (
+			pubkey,
+			activity_date,
+			total_posts,
+			with_image_count,
+			with_video_count,
+			with_link_count,
+			with_article_count,
+			text_only_count,
+			total_attachment_count,
+			derivation_version
+		)
+		VALUES (
+			$1, $2::date, 1,
+			CASE WHEN $3 THEN 1 ELSE 0 END,
+			CASE WHEN $4 THEN 1 ELSE 0 END,
+			CASE WHEN $5 THEN 1 ELSE 0 END,
+			CASE WHEN $6 THEN 1 ELSE 0 END,
+			CASE WHEN $7 THEN 1 ELSE 0 END,
+			$8,
+			$9
+		)
+		ON CONFLICT (pubkey, activity_date) DO UPDATE
+		SET total_posts = GREATEST(author_media_daily.total_posts + 1, 0),
+		    with_image_count = GREATEST(author_media_daily.with_image_count + EXCLUDED.with_image_count, 0),
+		    with_video_count = GREATEST(author_media_daily.with_video_count + EXCLUDED.with_video_count, 0),
+		    with_link_count = GREATEST(author_media_daily.with_link_count + EXCLUDED.with_link_count, 0),
+		    with_article_count = GREATEST(author_media_daily.with_article_count + EXCLUDED.with_article_count, 0),
+		    text_only_count = GREATEST(author_media_daily.text_only_count + EXCLUDED.text_only_count, 0),
+		    total_attachment_count = GREATEST(author_media_daily.total_attachment_count + EXCLUDED.total_attachment_count, 0),
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+	`, pubkey, activityDate, hasImage, hasVideo, hasLink, hasArticle, textOnly, attachmentCount, AuthorMediaMixStatsVersion)
+	if err != nil {
+		return fmt.Errorf("upsert author_media_daily: %w", err)
+	}
+	return nil
+}
+
+// reverseIncrementalAuthorMediaDailyTx undoes the author_media_daily
+// deltas applyIncrementalAuthorMediaDailyTx previously applied. It reads
+// note_discovery_stats for eventID, so it must run before that row's
+// cascaded delete.
+func (h *Handlers) reverseIncrementalAuthorMediaDailyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+) error {
+	if kind != 1 {
+		return nil
+	}
+	unclaimed, err := unclaimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorMediaDaily)
+	if err != nil || !unclaimed {
+		return err
+	}
+	hasImage, hasVideo, hasLink, hasArticle, attachmentCount, ok, err := loadNoteDiscoveryMediaFlagsTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	textOnly := !hasImage && !hasVideo && !hasLink && !hasArticle
+	activityDate := time.Unix(createdAt, 0).UTC().Truncate(24 * time.Hour)
+	_, err = tx.Exec(ctx, `
+		UPDATE author_media_daily
+		SET total_posts = GREATEST(total_posts - 1, 0),
+		    with_image_count = GREATEST(with_image_count - CASE WHEN $3 THEN 1 ELSE 0 END, 0),
+		    with_video_count = GREATEST(with_video_count - CASE WHEN $4 THEN 1 ELSE 0 END, 0),
+		    with_link_count = GREATEST(with_link_count - CASE WHEN $5 THEN 1 ELSE 0 END, 0),
+		    with_article_count = GREATEST(with_article_count - CASE WHEN $6 THEN 1 ELSE 0 END, 0),
+		    text_only_count = GREATEST(text_only_count - CASE WHEN $7 THEN 1 ELSE 0 END, 0),
+		    total_attachment_count = GREATEST(total_attachment_count - $8, 0),
+		    updated_at = now()
+		WHERE pubkey = $1 AND activity_date = $2::date
+	`, pubkey, activityDate, hasImage, hasVideo, hasLink, hasArticle, textOnly, attachmentCount)
+	if err != nil {
+		return fmt.Errorf("reverse author_media_daily: %w", err)
+	}
+	return nil
+}
+
+func loadNoteDiscoveryMediaFlagsTx(ctx context.Context, tx pgx.Tx, eventID string) (hasImage, hasVideo, hasLink, hasArticle bool, attachmentCount int, ok bool, err error) {
+	err = tx.QueryRow(ctx, `
+		SELECT has_image, has_video, has_link, has_article, attachment_count
+		FROM note_discovery_stats
+		WHERE event_id = $1
+	`, eventID).Scan(&hasImage, &hasVideo, &hasLink, &hasArticle, &attachmentCount)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, false, false, false, 0, false, nil
+		}
+		return false, false, false, false, 0, false, fmt.Errorf("load note_discovery_stats for media daily: %w", err)
+	}
+	return hasImage, hasVideo, hasLink, hasArticle, attachmentCount, true, nil
+}
+
+type hourlyActivityDelta struct {
+	pubkey             string
+	postCount          int64
+	noteCount          int64
+	replyCount         int64
+	engagementReceived int64
+	replyReceived      int64
+	reactionReceived   int64
+	repostReceived     int64
+	zapReceived        int64
+	zapMsatsReceived   int64
+	authoredEventCount int64
+}
+
+// computeHourlyActivityDeltas is the author_hourly_activity counterpart to
+// computeActivityDailyDeltas: a pure (no ledger, no writes) derivation of
+// the per-pubkey deltas one event contributes, shared by apply and
+// reversal.
+//
+// Every event also ticks authored_event_count for its author. That feeds
+// profile_discovery_stats.recent_active_days so the incremental rollup
+// matches the legacy full scan (DISTINCT dates over all authored events,
+// not just kind=1 posts).
+func computeHourlyActivityDeltas(
+	ctx context.Context,
+	tx pgx.Tx,
+	pubkey string,
+	kind int,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) ([]hourlyActivityDelta, error) {
+	deltas := make([]hourlyActivityDelta, 0, 2)
+	authorTick := hourlyActivityDelta{pubkey: pubkey, authoredEventCount: 1}
+
+	switch kind {
+	case 1:
+		authorTick.postCount = 1
+		if isReply {
+			authorTick.replyCount = 1
+		} else {
+			authorTick.noteCount = 1
+		}
+		deltas = append(deltas, authorTick)
+		if isReply && replyTargetEventID != "" {
+			targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, replyTargetEventID)
+			if err != nil {
+				return nil, err
+			}
+			if ok && targetPubkey != "" && targetPubkey != pubkey {
+				deltas = append(deltas, hourlyActivityDelta{
+					pubkey:             targetPubkey,
+					engagementReceived: 1,
+					replyReceived:      1,
+				})
+			}
+		}
+	case 6, 7:
+		deltas = append(deltas, authorTick)
+		targetEventID := firstReferencedEventID(tags)
+		if targetEventID == "" {
+			return deltas, nil
+		}
+		targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, targetEventID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || targetPubkey == "" || targetPubkey == pubkey {
+			return deltas, nil
+		}
+		d := hourlyActivityDelta{pubkey: targetPubkey, engagementReceived: 1}
+		if kind == 7 {
+			d.reactionReceived = 1
+		} else {
+			d.repostReceived = 1
+		}
+		deltas = append(deltas, d)
+	case 9735:
+		deltas = append(deltas, authorTick)
+		sender := zapReceiptSender(pubkey, tags)
+		receiver := firstTagValue(tags, "p")
+		if receiver == "" || receiver == sender {
+			return deltas, nil
+		}
+		deltas = append(deltas, hourlyActivityDelta{
+			pubkey:             receiver,
+			engagementReceived: 1,
+			zapReceived:        1,
+			zapMsatsReceived:   zapReceiptAmountSats(tags) * 1000,
+		})
+	default:
+		deltas = append(deltas, authorTick)
+	}
+	return deltas, nil
+}
+
+func negateHourlyActivityDelta(d hourlyActivityDelta) hourlyActivityDelta {
+	d.postCount = -d.postCount
+	d.noteCount = -d.noteCount
+	d.replyCount = -d.replyCount
+	d.engagementReceived = -d.engagementReceived
+	d.replyReceived = -d.replyReceived
+	d.reactionReceived = -d.reactionReceived
+	d.repostReceived = -d.repostReceived
+	d.zapReceived = -d.zapReceived
+	d.zapMsatsReceived = -d.zapMsatsReceived
+	d.authoredEventCount = -d.authoredEventCount
+	return d
+}
+
+func (h *Handlers) applyIncrementalAuthorHourlyActivityTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) error {
+	deltas, err := computeHourlyActivityDeltas(ctx, tx, pubkey, kind, isReply, replyTargetEventID, tags)
+	if err != nil {
+		return err
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	claimed, err := claimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorHourlyActivity)
+	if err != nil || !claimed {
+		return err
+	}
+	engagedAt := time.Unix(createdAt, 0).UTC()
+	activityDate := engagedAt.Truncate(24 * time.Hour)
+	dow := int16(engagedAt.Weekday()) // Sunday=0 matches EXTRACT(DOW ...)
+	hour := int16(engagedAt.Hour())
+	for _, d := range deltas {
+		if err := upsertAuthorHourlyActivityDeltaTx(ctx, tx, d, activityDate, dow, hour, AuthorActivityWindowsVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reverseIncrementalAuthorHourlyActivityTx undoes the author_hourly_activity
+// deltas applyIncrementalAuthorHourlyActivityTx previously applied.
+func (h *Handlers) reverseIncrementalAuthorHourlyActivityTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) error {
+	unclaimed, err := unclaimStatDeltaTx(ctx, tx, eventID, statDeltaAuthorHourlyActivity)
+	if err != nil || !unclaimed {
+		return err
+	}
+	deltas, err := computeHourlyActivityDeltas(ctx, tx, pubkey, kind, isReply, replyTargetEventID, tags)
+	if err != nil {
+		return err
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+	engagedAt := time.Unix(createdAt, 0).UTC()
+	activityDate := engagedAt.Truncate(24 * time.Hour)
+	dow := int16(engagedAt.Weekday())
+	hour := int16(engagedAt.Hour())
+	for _, d := range deltas {
+		if err := upsertAuthorHourlyActivityDeltaTx(ctx, tx, negateHourlyActivityDelta(d), activityDate, dow, hour, AuthorActivityWindowsVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func upsertAuthorHourlyActivityDeltaTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	d hourlyActivityDelta,
+	activityDate time.Time,
+	dow, hour int16,
+	writeVersion int,
+) error {
+	if d.pubkey == "" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO author_hourly_activity (
+			pubkey,
+			activity_date,
+			day_of_week,
+			hour_of_day,
+			post_count,
+			note_count,
+			reply_count,
+			engagement_received,
+			reply_received,
+			reaction_received,
+			repost_received,
+			zap_received,
+			zap_msats_received,
+			authored_event_count,
+			derivation_version
+		)
+		VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (pubkey, activity_date, day_of_week, hour_of_day) DO UPDATE
+		SET post_count = GREATEST(author_hourly_activity.post_count + EXCLUDED.post_count, 0),
+		    note_count = GREATEST(author_hourly_activity.note_count + EXCLUDED.note_count, 0),
+		    reply_count = GREATEST(author_hourly_activity.reply_count + EXCLUDED.reply_count, 0),
+		    engagement_received = GREATEST(author_hourly_activity.engagement_received + EXCLUDED.engagement_received, 0),
+		    reply_received = GREATEST(author_hourly_activity.reply_received + EXCLUDED.reply_received, 0),
+		    reaction_received = GREATEST(author_hourly_activity.reaction_received + EXCLUDED.reaction_received, 0),
+		    repost_received = GREATEST(author_hourly_activity.repost_received + EXCLUDED.repost_received, 0),
+		    zap_received = GREATEST(author_hourly_activity.zap_received + EXCLUDED.zap_received, 0),
+		    zap_msats_received = GREATEST(author_hourly_activity.zap_msats_received + EXCLUDED.zap_msats_received, 0),
+		    authored_event_count = GREATEST(author_hourly_activity.authored_event_count + EXCLUDED.authored_event_count, 0),
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+	`, d.pubkey, activityDate, dow, hour,
+		d.postCount, d.noteCount, d.replyCount,
+		d.engagementReceived, d.replyReceived, d.reactionReceived, d.repostReceived, d.zapReceived,
+		d.zapMsatsReceived, d.authoredEventCount, writeVersion); err != nil {
+		return fmt.Errorf("upsert author_hourly_activity for %s: %w", d.pubkey, err)
+	}
+	return nil
+}
+
+// applyIncrementalProfileDiscoveryRecentActivityTx maintains
+// profile_discovery_recent_activity with O(1) GREATEST updates for every
+// pubkey whose discovery recency is affected by this event: the author on
+// every kind, plus reply/reaction/repost/zap targets. Replaces the unbounded
+// MAX(created_at) UNION scan in the discovery sweeper.
+//
+// The author bumps on every kind (not just kind=1) because the legacy full
+// scan this replaces takes MAX(created_at) over all of the author's stored
+// events — a profile update or contact-list rewrite counts as activity
+// there, and profile_public_stats.recent_activity_at already uses the same
+// all-kinds rule. Restricting the incremental path to engagement kinds made
+// accounts whose latest event was e.g. kind 0/3 look permanently stale to
+// discovery and produced a steady stream of reconciliation mismatches.
+//
+// Deliberately not ledger-gated: GREATEST against the same created_at is
+// naturally idempotent under at-least-once redelivery, and retention does
+// not roll recent_activity_at back (same choice as profile_public_stats).
+func (h *Handlers) applyIncrementalProfileDiscoveryRecentActivityTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID, pubkey string,
+	kind int,
+	createdAt int64,
+	isReply bool,
+	replyTargetEventID string,
+	tags [][]string,
+) error {
+	_ = eventID
+	targets := make([]string, 0, 2)
+	targets = append(targets, pubkey)
+	switch kind {
+	case 1:
+		if isReply && replyTargetEventID != "" {
+			targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, replyTargetEventID)
+			if err != nil {
+				return err
+			}
+			if ok && targetPubkey != "" {
+				targets = append(targets, targetPubkey)
+			}
+		}
+	case 6, 7:
+		targetEventID := firstReferencedEventID(tags)
+		if targetEventID != "" {
+			targetPubkey, ok, err := lookupEventPubkeyTx(ctx, tx, targetEventID)
+			if err != nil {
+				return err
+			}
+			if ok && targetPubkey != "" {
+				targets = append(targets, targetPubkey)
+			}
+		}
+	case 9735:
+		receiver := firstTagValue(tags, "p")
+		if receiver != "" {
+			targets = append(targets, receiver)
+		}
+	}
+
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO profile_discovery_recent_activity (pubkey, recent_activity_at)
+			VALUES ($1, $2)
+			ON CONFLICT (pubkey) DO UPDATE
+			SET recent_activity_at = GREATEST(
+					profile_discovery_recent_activity.recent_activity_at,
+					EXCLUDED.recent_activity_at
+				),
+			    updated_at = now()
+		`, target, createdAt); err != nil {
+			return fmt.Errorf("upsert profile discovery recent activity for %s: %w", target, err)
+		}
+	}
+	return nil
+}
+
+func lookupEventPubkeyTx(ctx context.Context, tx pgx.Tx, eventID string) (string, bool, error) {
+	var pubkey string
+	err := tx.QueryRow(ctx, `SELECT pubkey FROM events WHERE id = $1`, eventID).Scan(&pubkey)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("lookup event pubkey %s: %w", eventID, err)
+	}
+	return pubkey, true, nil
+}
+
+func firstReferencedEventID(tags [][]string) string {
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "e" {
+			continue
+		}
+		value := strings.TrimSpace(tag[1])
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}

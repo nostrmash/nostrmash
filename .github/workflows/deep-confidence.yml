@@ -1,0 +1,75 @@
+name: deep-confidence
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  advisory:
+    name: Advisory coverage confidence checks
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: nostrmash
+          POSTGRES_PASSWORD: nostrmash
+          POSTGRES_DB: nostrmash
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nostrmash -d nostrmash"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://nostrmash:nostrmash@localhost:5432/nostrmash?sslmode=disable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.11"
+          cache: true
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U nostrmash -d nostrmash && exit 0
+            sleep 1
+          done
+          echo "Postgres did not become healthy in time"
+          exit 1
+
+      - name: Full coverage profile (advisory)
+        id: cover
+        continue-on-error: true
+        run: |
+          mkdir -p .tmp/deep-confidence
+          COVERAGE_PROFILE=.tmp/deep-confidence/coverage.out make cover
+
+      - name: Coverage policy from profile (advisory)
+        id: policy
+        continue-on-error: true
+        run: COVERAGE_PROFILE=.tmp/deep-confidence/coverage.out make coverage-policy
+
+      - name: Summarize advisory status
+        run: |
+          echo "cover_result=${{ steps.cover.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "policy_result=${{ steps.policy.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "This workflow is advisory and does not block pull requests." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload advisory artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deep-confidence-${{ github.run_number }}
+          path: |
+            .tmp/deep-confidence/coverage.out
+          retention-days: 14

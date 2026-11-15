@@ -1,0 +1,99 @@
+package query
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/nostrmash/nostrmash/internal/readmodel"
+)
+
+type isUserFollowingCapability interface {
+	IsUserFollowing(ctx context.Context, followerPubkey string, followedPubkey string) (bool, error)
+}
+
+type mutualFollowsCapability interface {
+	GetMutualFollows(ctx context.Context, leftPubkey string, rightPubkey string, limit int) ([]string, error)
+}
+
+func adaptSocialCapabilities(reader any, caps *serviceCapabilities) {
+	if r, ok := reader.(isUserFollowingCapability); ok {
+		caps.social.userFollowing = r
+	}
+	if r, ok := reader.(mutualFollowsCapability); ok {
+		caps.social.mutualFollows = r
+	}
+}
+
+type userZapsCapability interface {
+	GetUserZaps(ctx context.Context, pubkey string, limit int, sortBySats bool) ([]json.RawMessage, error)
+}
+
+type highlightsByEventIDCapability interface {
+	GetHighlightsByEventID(ctx context.Context, eventID string, limit int) ([]json.RawMessage, error)
+}
+
+type highlightsByATargetCapability interface {
+	GetHighlightsByATarget(ctx context.Context, kind int, pubkey string, identifier string, limit int) ([]json.RawMessage, error)
+}
+
+type eventZapsBySatsCapability interface {
+	GetEventZapsBySats(ctx context.Context, eventID string, limit int) ([]json.RawMessage, error)
+}
+
+type authorSentZapsCapability interface {
+	GetAuthorSentZaps(ctx context.Context, pubkey string, limit int, cursor *readmodel.EventOrderCursor) ([]json.RawMessage, *readmodel.EventOrderCursor, error)
+}
+
+type authorReactionsCapability interface {
+	GetAuthorReactions(ctx context.Context, pubkey string, limit int, cursor *readmodel.EventOrderCursor) ([]json.RawMessage, *readmodel.EventOrderCursor, error)
+}
+
+type authorRecentEventsByKindCapability interface {
+	GetAuthorRecentEventsByKind(ctx context.Context, pubkey string, kind int, limit int) ([]json.RawMessage, error)
+}
+
+type authorRecentEventsPageCapability interface {
+	GetAuthorRecentEventsPage(ctx context.Context, pubkey string, limit int, cursor *readmodel.EventOrderCursor) ([]json.RawMessage, *readmodel.EventOrderCursor, error)
+	GetAuthorRecentEventsByKindPage(ctx context.Context, pubkey string, kind int, limit int, cursor *readmodel.EventOrderCursor) ([]json.RawMessage, *readmodel.EventOrderCursor, error)
+}
+
+func adaptEventCapabilities(reader any, caps *serviceCapabilities) {
+	if r, ok := reader.(userZapsCapability); ok {
+		caps.event.userZaps = r
+	}
+	if r, ok := reader.(highlightsByEventIDCapability); ok {
+		caps.event.highlightsByEventID = r
+	}
+	if r, ok := reader.(highlightsByATargetCapability); ok {
+		caps.event.highlightsByATarget = r
+	}
+	if r, ok := reader.(eventZapsBySatsCapability); ok {
+		caps.event.eventZapsBySats = r
+	}
+	if r, ok := reader.(authorSentZapsCapability); ok {
+		caps.event.authorSentZaps = r
+	}
+	if r, ok := reader.(authorReactionsCapability); ok {
+		caps.event.authorReactions = r
+	}
+	if r, ok := reader.(authorRecentEventsByKindCapability); ok {
+		caps.event.authorRecentEventsByKind = r
+	}
+	if r, ok := reader.(authorRecentEventsPageCapability); ok {
+		caps.event.authorRecentEventsPage = r
+	}
+	if r, ok := reader.(kindExpansionCapability); ok {
+		caps.event.kindExpansion = r
+	}
+}
+
+type kindExpansionCapability interface {
+	GetAuthorMedia(ctx context.Context, pubkey string, limit int) ([]json.RawMessage, error)
+	GetAuthorLive(ctx context.Context, pubkey string, limit int) ([]json.RawMessage, error)
+	GetAuthorPins(ctx context.Context, pubkey string) ([]readmodel.PinItem, error)
+	GetLiveActivities(ctx context.Context, status string, followedBy string, limit int) ([]json.RawMessage, error)
+	GetShortVideos(ctx context.Context, followedBy string, limit int) ([]json.RawMessage, error)
+	GetEventComments(ctx context.Context, eventID string, limit int) ([]json.RawMessage, error)
+	GetEventReports(ctx context.Context, eventID string, limit int) ([]readmodel.ReportTarget, error)
+	GetUserReports(ctx context.Context, pubkey string, limit int) ([]readmodel.ReportTarget, error)
+}

@@ -1,0 +1,20 @@
+{
+  "body": {
+    "events": [
+      {
+        "created_at": 1700000002,
+        "id": "auth_evt_2",
+        "kind": 1,
+        "pubkey": "pubkey_abc"
+      },
+      {
+        "created_at": 1700000001,
+        "id": "auth_evt_1",
+        "kind": 1,
+        "pubkey": "pubkey_abc"
+      }
+    ],
+    "pubkey": "pubkey_abc"
+  },
+  "status": 200
+}

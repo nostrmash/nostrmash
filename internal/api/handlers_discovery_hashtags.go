@@ -1,0 +1,277 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/query"
+)
+
+func (h Handlers) GetTrendingHashtags(w http.ResponseWriter, r *http.Request) {
+	window, windowLabel, err := parseTrendingHashtagWindow(r)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	viewer, ok := h.parseDiscoveryViewer(w, r)
+	if !ok {
+		return
+	}
+	lang, err := parseOptionalDiscoveryLanguage(r)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	limit, err := parseBoundedPositiveInt(r, "limit", 50, 100)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	offset, err := parseBoundedNonNegativeInt(r, "offset", 0, discoveryOffsetCap(viewer))
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	scope := discoveryScopeWithViewer(lang, viewer)
+	cachePolicy := h.rankingCachePolicy("trending_hashtags", map[string]any{
+		"window": windowLabel,
+		"limit":  limit,
+		"offset": offset,
+	}, lang, viewer)
+	if err := h.servePublicCached(r.Context(), w, cachePolicy, func(ctx context.Context) (map[string]any, error) {
+		var topics []query.TrendingHashtag
+		var meta query.PersonalizationMeta
+		var topicsErr error
+		if viewer == "" {
+			topics, topicsErr = h.service.GetTrendingHashtags(ctx, window, scope, limit, offset)
+		} else {
+			topics, meta, topicsErr = h.service.GetPersonalizedTrendingHashtags(ctx, window, scope, limit, offset)
+		}
+		if topicsErr != nil {
+			return nil, topicsErr
+		}
+		hashtags := buildDiscoveryHashtagItems(topics)
+		h.attachHashtagBaselines(ctx, windowLabel, hashtags)
+		payloadResponse := map[string]any{
+			"surface":     "trending",
+			"hashtags":    hashtags,
+			"window":      windowLabel,
+			"consistency": "eventual",
+		}
+		computedAt := time.Now().UTC()
+		addDiscoveryListMeta(payloadResponse, windowLabel, &computedAt, len(hashtags))
+		h.addDiscoveryTrustMetadata(payloadResponse)
+		h.attachDiscoveryLanguage(ctx, payloadResponse, lang)
+		evidence, scores := hashtagBlend(topics)
+		attachPersonalization(payloadResponse, meta)
+		personalizeRankingItems(hashtags, meta, evidence, scores, "followed_authors", "cohort_authors", "authors")
+		return payloadResponse, nil
+	}); err != nil {
+		if query.IsUnsupportedCapability(err) {
+			writeError(r.Context(), w, http.StatusNotImplemented, "feature_unavailable", "trending hashtags are not available on this deployment")
+			return
+		}
+		writeError(r.Context(), w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+}
+
+func (h Handlers) GetHashtagSummary(w http.ResponseWriter, r *http.Request) {
+	rawHashtag := r.PathValue("hashtag")
+	cachePolicy := h.newPublicCachePolicy(publicCacheFamilyDiscovery, "hashtag_summary", map[string]any{
+		"hashtag": normalizeCacheHashtag(rawHashtag),
+	})
+	if err := h.servePublicCached(r.Context(), w, cachePolicy, func(ctx context.Context) (map[string]any, error) {
+		summary, summaryErr := h.service.GetHashtagSummary(ctx, rawHashtag)
+		if summaryErr != nil {
+			return nil, summaryErr
+		}
+		payload := map[string]any{
+			"hashtag":         summary.Hashtag,
+			"latest_event_at": summary.LatestEventAt,
+			"activity": map[string]any{
+				"24h": map[string]any{
+					"event_count":    summary.Activity.Last24h.EventCount,
+					"unique_authors": summary.Activity.Last24h.UniqueAuthors,
+				},
+				"7d": map[string]any{
+					"event_count":    summary.Activity.Last7d.EventCount,
+					"unique_authors": summary.Activity.Last7d.UniqueAuthors,
+				},
+				"30d": map[string]any{
+					"event_count":    summary.Activity.Last30d.EventCount,
+					"unique_authors": summary.Activity.Last30d.UniqueAuthors,
+				},
+				"all": map[string]any{
+					"event_count":    summary.Activity.All.EventCount,
+					"unique_authors": summary.Activity.All.UniqueAuthors,
+				},
+			},
+			"consistency": "eventual",
+		}
+		var interestFollowers int64
+		if h.pool != nil {
+			_ = h.pool.QueryRow(ctx, `SELECT follower_count FROM hashtag_interest_counts WHERE hashtag = $1`, summary.Hashtag).Scan(&interestFollowers)
+		}
+		payload["interest_followers"] = interestFollowers
+		h.addDiscoveryTrustMetadata(payload)
+		return payload, nil
+	}); err != nil {
+		if query.IsNotFound(err) {
+			writeError(r.Context(), w, http.StatusNotFound, "not_found", "hashtag not found")
+			return
+		}
+		if query.IsUnsupportedCapability(err) {
+			writeError(r.Context(), w, http.StatusNotImplemented, "feature_unavailable", "hashtag summary is not available on this deployment")
+			return
+		}
+		if errors.Is(err, query.ErrInvalidHashtag) {
+			writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", "hashtag is invalid")
+			return
+		}
+		writeError(r.Context(), w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+}
+
+func (h Handlers) GetHashtagNotes(w http.ResponseWriter, r *http.Request) {
+	sort, err := parseHashtagNotesSort(r)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	window, err := parseHashtagNotesWindow(r)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	limit, err := parseBoundedPositiveInt(r, "limit", 20, 100)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	offset, err := parseBoundedNonNegativeInt(r, "offset", 0, 5000)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	rawHashtag := r.PathValue("hashtag")
+	// Cursors reuse the opaque offset-encoded search cursor format, scoped to
+	// this hashtag+sort+window so a token cannot be replayed across feeds.
+	scopeHash := searchCursorScopeHash("hashtag_notes", normalizeCacheHashtag(rawHashtag), sort, window)
+	cursor, err := decodeSearchCursor(strings.TrimSpace(r.URL.Query().Get("cursor")), scopeHash)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_cursor", searchCursorErrorMessage(err))
+		return
+	}
+	if cursor != nil {
+		if offset != 0 {
+			writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", "cursor and offset are mutually exclusive")
+			return
+		}
+		offset = cursor.Offset
+	}
+	cachePolicy := h.newPublicCachePolicy(publicCacheFamilyDiscovery, "hashtag_notes", map[string]any{
+		"hashtag": normalizeCacheHashtag(rawHashtag),
+		"sort":    sort,
+		"window":  window,
+		"limit":   limit,
+		"offset":  offset,
+	})
+	if err := h.servePublicCached(r.Context(), w, cachePolicy, func(ctx context.Context) (map[string]any, error) {
+		notes, notesErr := h.service.GetHashtagNotes(ctx, rawHashtag, sort, window, limit, offset)
+		if notesErr != nil {
+			return nil, notesErr
+		}
+		payloadNotes := make([]map[string]any, 0, len(notes))
+		for _, note := range notes {
+			payloadNotes = append(payloadNotes, buildTrendingNoteItem(note))
+		}
+		h.attachTopZaps(ctx, payloadNotes)
+		payload := map[string]any{
+			"hashtag":     rawHashtag,
+			"sort":        sort,
+			"window":      window,
+			"notes":       payloadNotes,
+			"consistency": "eventual",
+		}
+		if len(notes) == limit {
+			nextOffset := offset + len(notes)
+			if nextOffset <= 5000 {
+				nextPayload := searchCursorPayload{QHash: scopeHash, Sort: sort, Offset: nextOffset}
+				if nextCursorValue, encodeErr := encodeSearchCursor(nextPayload); encodeErr == nil && nextCursorValue != "" {
+					payload["next_cursor"] = nextCursorValue
+				}
+			}
+		}
+		h.addDiscoveryTrustMetadata(payload)
+		return payload, nil
+	}); err != nil {
+		if query.IsNotFound(err) {
+			writeError(r.Context(), w, http.StatusNotFound, "not_found", "hashtag not found")
+			return
+		}
+		if query.IsUnsupportedCapability(err) {
+			writeError(r.Context(), w, http.StatusNotImplemented, "feature_unavailable", "hashtag notes are not available on this deployment")
+			return
+		}
+		if errors.Is(err, query.ErrInvalidHashtag) {
+			writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", "hashtag is invalid")
+			return
+		}
+		writeError(r.Context(), w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+}
+
+func (h Handlers) GetRelatedHashtags(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseBoundedPositiveInt(r, "limit", 10, 50)
+	if err != nil {
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	rawHashtag := r.PathValue("hashtag")
+	cachePolicy := h.newPublicCachePolicy(publicCacheFamilyDiscovery, "related_hashtags", map[string]any{
+		"hashtag": normalizeCacheHashtag(rawHashtag),
+		"limit":   limit,
+	})
+	if err := h.servePublicCached(r.Context(), w, cachePolicy, func(ctx context.Context) (map[string]any, error) {
+		related, relatedErr := h.service.GetRelatedHashtags(ctx, rawHashtag, limit)
+		if relatedErr != nil {
+			return nil, relatedErr
+		}
+		items := make([]map[string]any, 0, len(related))
+		for _, row := range related {
+			items = append(items, map[string]any{
+				"hashtag":               row.Hashtag,
+				"co_occurrence_count":   row.CoOccurrenceCount,
+				"co_occurrence_authors": row.CoOccurrenceAuthors,
+			})
+		}
+		payload := map[string]any{
+			"hashtag":     rawHashtag,
+			"related":     items,
+			"consistency": "eventual",
+		}
+		h.addDiscoveryTrustMetadata(payload)
+		return payload, nil
+	}); err != nil {
+		if query.IsNotFound(err) {
+			writeError(r.Context(), w, http.StatusNotFound, "not_found", "hashtag not found")
+			return
+		}
+		if query.IsUnsupportedCapability(err) {
+			writeError(r.Context(), w, http.StatusNotImplemented, "feature_unavailable", "related hashtags are not available on this deployment")
+			return
+		}
+		if errors.Is(err, query.ErrInvalidHashtag) {
+			writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", "hashtag is invalid")
+			return
+		}
+		writeError(r.Context(), w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+}

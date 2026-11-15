@@ -1,0 +1,299 @@
+package query
+
+import "github.com/nostrmash/nostrmash/internal/readmodel"
+
+func networkStatsFromStore(row readmodel.NetworkStats) NetworkStats {
+	return NetworkStats{
+		Events:   row.Events,
+		Profiles: row.Profiles,
+		Relays:   row.Relays,
+	}
+}
+
+func publicDiscoveryNetworkStatsFromStore(row readmodel.PublicDiscoveryNetworkStats) PublicDiscoveryNetworkStats {
+	out := PublicDiscoveryNetworkStats{
+		EventsIngested:    row.EventsIngested,
+		ProjectedProfiles: row.ProjectedProfiles,
+		ComputedAt:        row.ComputedAt,
+		Relays:            row.Relays,
+		RelaySummary: RelaySummaryStats{
+			Total:     row.RelaySummary.Total,
+			Active24h: row.RelaySummary.Active24h,
+			Active7d:  row.RelaySummary.Active7d,
+			EventVolume: WindowedCount{
+				Last24h: row.RelaySummary.EventVolume.Last24h,
+				Last7d:  row.RelaySummary.EventVolume.Last7d,
+			},
+			UniqueAuthors: WindowedCount{
+				Last24h: row.RelaySummary.UniqueAuthors.Last24h,
+				Last7d:  row.RelaySummary.UniqueAuthors.Last7d,
+			},
+		},
+		ActiveAuthors: WindowedCount{
+			Last24h: row.ActiveAuthors.Last24h,
+			Last7d:  row.ActiveAuthors.Last7d,
+			Last30d: row.ActiveAuthors.Last30d,
+		},
+		NoteVolume: WindowedCount{
+			Last24h: row.NoteVolume.Last24h,
+			Last7d:  row.NoteVolume.Last7d,
+			Last30d: row.NoteVolume.Last30d,
+		},
+		TopRelays24h: relayUsagesFromStore(row.TopRelays24h),
+		TopRelays7d:  relayUsagesFromStore(row.TopRelays7d),
+		SectionTimes: PublicStatsSectionTimes{
+			Home24h:      row.SectionTimes.Home24h,
+			Home7d:       row.SectionTimes.Home7d,
+			Languages24h: row.SectionTimes.Languages24h,
+			Languages7d:  row.SectionTimes.Languages7d,
+			Hashtags24h:  row.SectionTimes.Hashtags24h,
+			Hashtags7d:   row.SectionTimes.Hashtags7d,
+			Home30d:      row.SectionTimes.Home30d,
+			Languages30d: row.SectionTimes.Languages30d,
+			Hashtags30d:  row.SectionTimes.Hashtags30d,
+			Relays:       row.SectionTimes.Relays,
+			TopRelays24h: row.SectionTimes.TopRelays24h,
+			TopRelays7d:  row.SectionTimes.TopRelays7d,
+		},
+	}
+	if len(row.TopLanguages24h) > 0 {
+		out.TopLanguages24h = make([]LanguageSummary, 0, len(row.TopLanguages24h))
+		for _, lang := range row.TopLanguages24h {
+			out.TopLanguages24h = append(out.TopLanguages24h, languageSummaryFromStore(lang))
+		}
+	}
+	if len(row.TopLanguages7d) > 0 {
+		out.TopLanguages7d = make([]LanguageSummary, 0, len(row.TopLanguages7d))
+		for _, lang := range row.TopLanguages7d {
+			out.TopLanguages7d = append(out.TopLanguages7d, languageSummaryFromStore(lang))
+		}
+	}
+	if len(row.TopLanguages30d) > 0 {
+		out.TopLanguages30d = make([]LanguageSummary, 0, len(row.TopLanguages30d))
+		for _, lang := range row.TopLanguages30d {
+			out.TopLanguages30d = append(out.TopLanguages30d, languageSummaryFromStore(lang))
+		}
+	}
+	out.TopRelays = relayUsagesFromStore(row.TopRelays)
+	if row.TopHashtags == nil {
+		return out
+	}
+	topHashtags := &TrendingHashtagWindows{
+		Last24h: make([]TrendingHashtag, 0, len(row.TopHashtags.Last24h)),
+		Last7d:  make([]TrendingHashtag, 0, len(row.TopHashtags.Last7d)),
+		Last30d: make([]TrendingHashtag, 0, len(row.TopHashtags.Last30d)),
+	}
+	for _, hashtag := range row.TopHashtags.Last24h {
+		topHashtags.Last24h = append(topHashtags.Last24h, trendingHashtagFromStore(hashtag))
+	}
+	for _, hashtag := range row.TopHashtags.Last7d {
+		topHashtags.Last7d = append(topHashtags.Last7d, trendingHashtagFromStore(hashtag))
+	}
+	for _, hashtag := range row.TopHashtags.Last30d {
+		topHashtags.Last30d = append(topHashtags.Last30d, trendingHashtagFromStore(hashtag))
+	}
+	out.TopHashtags = topHashtags
+	return out
+}
+
+func discoveryStatsSeriesFromStore(row readmodel.DiscoveryStatsSeries) DiscoveryStatsSeries {
+	out := DiscoveryStatsSeries{
+		Metric:     row.Metric,
+		Window:     row.Window,
+		ComputedAt: row.ComputedAt,
+		Points:     make([]DiscoveryStatsSeriesPoint, 0, len(row.Points)),
+	}
+	for _, point := range row.Points {
+		out.Points = append(out.Points, DiscoveryStatsSeriesPoint{T: point.T, V: point.V})
+	}
+	return out
+}
+
+func curatedRecommendedReadFromStore(row readmodel.CuratedRecommendedRead) CuratedRecommendedRead {
+	return CuratedRecommendedRead{
+		EventID: row.EventID,
+		Title:   row.Title,
+		URL:     row.URL,
+		Rank:    row.Rank,
+	}
+}
+
+func curatedReadsTopicFromStore(row readmodel.CuratedReadsTopic) CuratedReadsTopic {
+	return CuratedReadsTopic{
+		Topic: row.Topic,
+		Rank:  row.Rank,
+	}
+}
+
+func curatedFeaturedAuthorFromStore(row readmodel.CuratedFeaturedAuthor) CuratedFeaturedAuthor {
+	return CuratedFeaturedAuthor{
+		Pubkey: row.Pubkey,
+		Rank:   row.Rank,
+	}
+}
+
+func relayUsagesFromStore(rows []readmodel.RelayUsageSummary) []RelayUsageSummary {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]RelayUsageSummary, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, relayUsageFromStore(row))
+	}
+	return out
+}
+
+func trendingHashtagFromStore(row readmodel.TrendingHashtag) TrendingHashtag {
+	return TrendingHashtag{
+		Hashtag:       row.Hashtag,
+		EventCount:    row.EventCount,
+		UniqueAuthors: row.UniqueAuthors,
+	}
+}
+
+func hashtagSummaryFromStore(row readmodel.HashtagSummary) HashtagSummary {
+	return HashtagSummary{
+		Hashtag:       row.Hashtag,
+		LatestEventAt: row.LatestEventAt,
+		Activity: HashtagActivityStats{
+			Last24h: hashtagActivityFromStore(row.Activity.Last24h),
+			Last7d:  hashtagActivityFromStore(row.Activity.Last7d),
+			Last30d: hashtagActivityFromStore(row.Activity.Last30d),
+			All:     hashtagActivityFromStore(row.Activity.All),
+		},
+	}
+}
+
+func hashtagActivityFromStore(row readmodel.HashtagActivity) HashtagActivity {
+	return HashtagActivity{
+		EventCount:    row.EventCount,
+		UniqueAuthors: row.UniqueAuthors,
+	}
+}
+
+func relatedHashtagFromStore(row readmodel.RelatedHashtag) RelatedHashtag {
+	return RelatedHashtag{
+		Hashtag:             row.Hashtag,
+		CoOccurrenceCount:   row.CoOccurrenceCount,
+		CoOccurrenceAuthors: row.CoOccurrenceAuthors,
+	}
+}
+
+func eventDomainLinkFromStore(row readmodel.EventDomainLinkProjection) EventDomainLink {
+	return EventDomainLink{
+		EventID: row.EventID,
+		URL:     row.URL,
+		Domain:  row.Domain,
+	}
+}
+
+func domainStatFromStore(row readmodel.DomainStatProjection) DomainStat {
+	return DomainStat{
+		Domain:        row.Domain,
+		LinkCount:     row.LinkCount,
+		NoteCount:     row.NoteCount,
+		UniqueAuthors: row.UniqueAuthors,
+	}
+}
+
+func domainActivityFromStore(row readmodel.DomainActivityProjection) DomainActivity {
+	return DomainActivity{
+		LinkCount:     row.LinkCount,
+		NoteCount:     row.NoteCount,
+		UniqueAuthors: row.UniqueAuthors,
+	}
+}
+
+func domainSummaryFromStore(row readmodel.DomainSummaryProjection) DomainSummary {
+	out := DomainSummary{
+		Domain:        row.Domain,
+		LatestEventAt: row.LatestEventAt,
+		Activity: DomainActivityStats{
+			Last24h: domainActivityFromStore(row.Activity.Last24h),
+			Last7d:  domainActivityFromStore(row.Activity.Last7d),
+			Last30d: domainActivityFromStore(row.Activity.Last30d),
+			All:     domainActivityFromStore(row.Activity.All),
+		},
+		RecentNotes: make([]TrendingNote, 0, len(row.RecentNotes)),
+		TopNotes:    make([]TrendingNote, 0, len(row.TopNotes)),
+	}
+	for _, note := range row.RecentNotes {
+		out.RecentNotes = append(out.RecentNotes, trendingNoteFromStore(note))
+	}
+	for _, note := range row.TopNotes {
+		out.TopNotes = append(out.TopNotes, trendingNoteFromStore(note))
+	}
+	return out
+}
+
+func trendingNoteFromStore(row readmodel.TrendingNote) TrendingNote {
+	return TrendingNote{
+		EventID:       row.EventID,
+		AuthorPubkey:  row.AuthorPubkey,
+		CreatedAt:     row.CreatedAt,
+		Content:       row.Content,
+		Kind:          row.Kind,
+		Language:      row.Language,
+		ReplyCount:    row.ReplyCount,
+		RepostCount:   row.RepostCount,
+		ReactionCount: row.ReactionCount,
+		ZapCount:      row.ZapCount,
+		ZapMSats:      row.ZapMSats,
+		BookmarkCount: row.BookmarkCount,
+		Score:         row.Score,
+	}
+}
+
+func hotConversationFromStore(row readmodel.HotConversation) HotConversation {
+	return HotConversation{
+		RootEventID:      row.RootEventID,
+		AuthorPubkey:     row.AuthorPubkey,
+		CreatedAt:        row.CreatedAt,
+		Content:          row.Content,
+		ReplyCount:       row.ReplyCount,
+		RepostCount:      row.RepostCount,
+		ReactionCount:    row.ReactionCount,
+		ZapCount:         row.ZapCount,
+		ZapMSats:         row.ZapMSats,
+		ParticipantCount: row.ParticipantCount,
+		LastActivityAt:   row.LastActivityAt,
+		Replies24h:       row.Replies24h,
+		Replies7d:        row.Replies7d,
+		Replies30d:       row.Replies30d,
+		VelocityScore:    row.VelocityScore,
+		Consistency:      row.Consistency,
+	}
+}
+
+func trendingProfileFromStore(row readmodel.TrendingProfile) TrendingProfile {
+	return TrendingProfile{
+		Pubkey:                   row.Pubkey,
+		Score:                    row.Score,
+		RecentPostCount:          row.RecentPostCount,
+		RecentReplyCount:         row.RecentReplyCount,
+		RecentEngagementReceived: row.RecentEngagementReceived,
+		RecentNewFollowers:       row.RecentNewFollowers,
+		RecentZapVolumeMSats:     row.RecentZapVolumeMSats,
+		RecentActiveDays:         row.RecentActiveDays,
+		RecentActivityAt:         row.RecentActivityAt,
+		FollowerCount:            row.FollowerCount,
+		TrustedFollowerCount:     row.TrustedFollowerCount,
+		ScoredEngagementReceived: row.ScoredEngagementReceived,
+		ScoredNewFollowers:       row.ScoredNewFollowers,
+		SupporterCount:           row.SupporterCount,
+		RawSats:                  row.RawSats,
+		CappedSats:               row.CappedSats,
+	}
+}
+
+func relatedProfileFromStore(row readmodel.RelatedProfile) RelatedProfile {
+	return RelatedProfile{
+		Pubkey:               row.Pubkey,
+		TopicOverlap:         row.TopicOverlap,
+		ReplyAdjacency:       row.ReplyAdjacency,
+		InteractionAdjacency: row.InteractionAdjacency,
+		QuoteRepostAdjacency: row.QuoteRepostAdjacency,
+		Reasons:              row.Reasons,
+		Score:                row.Score,
+	}
+}

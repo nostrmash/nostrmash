@@ -1,0 +1,228 @@
+# Contributing
+
+Use this page as the contributor entrypoint. It is the shortest path from local boot to safe PR, and it tells you which deeper docs to open next based on the kind of change you are making.
+
+## Start here
+
+| If your change touches... | Read this first | Then use |
+| --- | --- | --- |
+| architecture or ownership boundaries | `docs/architecture.md` | `docs/architecture/orchestration-surfaces.md` |
+| config or operator behavior | `docs/configuration.md` | `docs/operations.md` |
+| API or compatibility behavior | `docs/api.md` | `docs/testing.md`, `docs/compatibility.md` |
+| performance-sensitive paths | `docs/performance.md` | `docs/testing.md` |
+| schema or rollout posture | `docs/migrations.md` | `RELEASE.md`, `VERSIONING.md` |
+| release and policy work | `RELEASE.md` | `SECURITY.md`, `VERSIONING.md` |
+
+## Local start
+
+Go toolchain policy:
+
+- Minimum supported version: Go `1.26` (`go.mod` `go` directive)
+- Recommended local toolchain: Go `1.26.10` (`go.mod` `toolchain go1.26.10`)
+- CI and Docker builders pin Go `1.26.10` for reproducible checks
+
+If your local Go supports toolchain auto-selection, the `toolchain` directive helps keep local behavior aligned with CI patch-level behavior while preserving a clear minimum-version policy.
+
+Use either full containers or host `go run` workflow:
+
+```bash
+docker compose up --build
+```
+
+or:
+
+```bash
+cp .env.example .env
+set -a && source .env && set +a
+go run ./cmd/api
+go run ./cmd/ingestor
+go run ./cmd/worker
+```
+
+If you are working on trust or relay-suggestion behavior locally, also run:
+
+```bash
+go run ./cmd/trust_worker
+```
+
+Local binary build output convention:
+
+- `make build` writes service binaries to `./bin/` (`bin/api`, `bin/ingestor`, `bin/worker`, `bin/trust_worker`).
+- Keep generated binaries and coverage artifacts out of the repository root.
+
+For details and replay mode, see `docs/development.md`.
+
+## Adding an ingest kind or a derivation
+
+Live ingest only stores the built-in `default_v1` kind set. A new kind has to be added in every place that list is repeated, or it is dropped, ungated, or retained forever:
+
+- `defaultFilterGroupKinds` in `internal/config/config.go`, the validation error string, and `testRelayConfig` in `internal/config/config_test.go`
+- `gateKindLabel` plus `isAuthorGatedKind`, `isEngagementKind`, or a dedicated branch in `internal/ingestor/live/gate.go`
+- `untrustedPurgeKinds` when the kind is author-gated, and `supersededReplaceableKinds` when an older replaceable version should be deleted
+- `INSERT` into `untrusted_purge_kind_cursor` in the migration that introduces the kind
+- `nostr.IndexedNoteKindsSQL` only when the kind is note-like content
+- the engagement retention SQL when the raw row should age out with kinds 6/7/9735
+- `docs/architecture/trust-bounded-ingest.md` and the ingestor env description
+
+A new projection needs a name and version in `internal/derivation/derivation.go`, a row in `RegisteredDerivations`, a step in `DeriveEventBundle` when it runs per event, and a `projectionDefinition` in `rebuilds_definitions.go`. Backfills over existing rows use a cursor loop, not one unbounded migration statement. Production statement timeout is 15 seconds.
+
+## Before opening a PR
+
+Run this baseline sequence for reproducible CI parity (pinned Go toolchain in Docker):
+
+```bash
+make verify-docker
+```
+
+`make verify-docker` runs the same blocking gates as CI inside a pinned Go `1.26.10` container, with an isolated Postgres sidecar for integration-backed checks.
+
+If your host already matches the pinned toolchain and you want faster local loops, use:
+
+```bash
+make verify-local
+```
+
+Blocking race policy now runs `go test -race ./...`.
+
+Local verification commands (explicit):
+
+```bash
+# Build
+make build
+
+# Test
+make test
+
+# Lint
+make lint
+
+# Integration-backed parity path (requires Postgres)
+export TEST_DATABASE_URL=postgres://nostrmash:nostrmash@localhost:5432/nostrmash?sslmode=disable
+make ci
+```
+
+If formatting/import checks fail:
+
+```bash
+make format
+```
+
+If your change is focused and not all checks are needed initially, use targeted guidance in `docs/testing.md` and finish with `make ci` before PR review.
+
+### Example workflow: shipping an API change safely
+
+If you add or change an API behavior, a safe path usually looks like this:
+
+1. Boot locally with `docker compose up --build` or your normal `go run` workflow.
+2. Make the change and update `docs/api.md` plus `docs/openapi.yaml` in the same branch.
+3. Run the relevant handler or compatibility tests first for fast feedback.
+4. Run `make contract-drift` to ensure route and OpenAPI ownership still line up.
+5. Finish with `make ci` before opening the PR.
+6. If the change affects operators, also update `docs/operations.md` and call that out in the PR description.
+
+## Architecture change expectations
+
+- Keep ingest truth durable first; do not move product-shaping logic into canonical storage paths.
+- Keep read orchestration in `internal/query` and data access in `internal/store`.
+- Keep compatibility behavior isolated at transport boundaries (`internal/api_primal`).
+- If you introduce or change a projection, keep rebuild behavior explicit and testable.
+
+If your change affects boundaries or orchestration ownership, update `docs/architecture.md` and `docs/architecture/orchestration-surfaces.md`.
+
+## Change-type playbook
+
+Use this as a safe default for what to update and validate:
+
+- **API or compatibility behavior**
+  - update contracts/docs: `docs/api.md`, `docs/openapi.yaml`, `docs/compatibility.md`
+  - run checks: `make contract-drift`, relevant tests in `docs/testing.md`
+- **Schema, rebuild, or queue/store semantics**
+  - update safety notes: `docs/migrations.md`, `RELEASE.md` rollback notes
+  - run checks: `make test`, `make test-race-policy`, `make coverage-policy`
+- **Config/env or operator behavior**
+  - update docs: `docs/configuration.md`, `docs/operations.md`
+  - validate: local boot + `/health` + `/ready` + affected admin endpoints
+- **Perf-sensitive paths**
+  - update evidence notes as needed: `docs/performance.md`
+  - run benchmarks/load tests relevant to touched hot paths
+
+## Documentation expectations
+
+When behavior or operator workflows change, update docs in the same PR:
+
+- API/contract behavior: `docs/api.md` and `docs/openapi.yaml` (plus `make contract-drift`)
+- runtime/incident behavior: `docs/operations.md`
+- testing/perf workflows: `docs/testing.md`, `docs/performance.md`
+- contributor/release/security policy changes: `CONTRIBUTING.md`, `RELEASE.md`, `SECURITY.md`, `VERSIONING.md`
+
+For migration/compatibility behavior changes, also update:
+
+- `docs/migrations.md`
+- `docs/compatibility.md`
+
+## Formatting, imports, and docs style
+
+Formatting and import ordering are blocking CI checks:
+
+```bash
+make fmt-check
+make imports-check
+```
+
+To fix formatting and imports locally:
+
+```bash
+make format
+```
+
+This applies:
+
+- `gofmt -w .`
+- `goimports -w .` (via `go run golang.org/x/tools/cmd/goimports@latest`)
+
+Documentation changes should follow the same style system as the rest of the repo:
+
+- use sentence case for headings
+- keep intros short and purposeful
+- prefer tables for comparisons and routing decisions
+- use numbered lists for workflows and walkthroughs
+- use mermaid only when a diagram truly reduces cognitive load
+- avoid long undifferentiated bullet walls and oversized related-doc footers
+
+Docs assets should also follow one visual system:
+
+- use the NostrMash docs palette consistently: blue for durable/core flow, teal or green for trust and self-host posture, violet for compatibility boundaries, slate neutrals for support structure
+- keep diagram labels in sentence case with human-readable words, not compact internal-style identifiers
+- prefer rounded cards, soft borders, and light backgrounds over dense wire-diagram aesthetics
+- treat compatibility as a boundary color, not the dominant page color
+- keep diagrams editorial: highlight the system decision or relationship, not every implementation detail
+- when using Mermaid, start from the same branded init/theme block already used in the core docs pages
+- when creating SVG assets, match the README assets' typography, corner radius, and color rhythm unless a page has a strong reason to diverge
+
+When in doubt, write the shortest version that still helps a contributor choose, decide, or act.
+
+## CI gates
+
+CI blocks on:
+
+- `make fmt-check`
+- `make imports-check`
+- `make lint`
+- `go mod verify`
+- `make vulncheck`
+- `make cover`
+- `make coverage-policy`
+- `make test-race-policy`
+- `make contract-drift`
+- `make rules-check`
+- `make configdoc-check`
+- `make build`
+
+Detailed rationale and local variants (fuzz, benchmarks, load tests) are in `docs/testing.md`.
+
+For higher-cost confidence checks beyond blocking CI, use the advisory `Deep Confidence` workflow. It is intentionally non-blocking for normal PR flow.
+
+## Useful optional checks
+
+- Targeted fuzzing and benchmark commands: `docs/testing.md`
+- Load/perf snapshots and regression checks: `docs/performance.md`

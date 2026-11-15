@@ -1,0 +1,10 @@
+{
+  "body": {
+    "error": {
+      "code": "invalid_request",
+      "message": "event id is required",
+      "request_id": "req-event-400"
+    }
+  },
+  "status": 400
+}

@@ -1,0 +1,565 @@
+package read
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/metrics"
+)
+
+func (s *Read) GetTrendingProfiles(ctx context.Context, window time.Duration, lang string, limit int, offset int) ([]TrendingProfile, error) {
+	return s.getProfileDiscoveryRows(ctx, window, lang, limit, offset, false)
+}
+
+func (s *Read) GetRisingProfiles(ctx context.Context, window time.Duration, lang string, limit int, offset int) ([]TrendingProfile, error) {
+	return s.getProfileDiscoveryRows(ctx, window, lang, limit, offset, true)
+}
+
+// relatedProfilesQueryTimeout bounds the heavy multi-CTE related-profiles
+// query so a saturated Postgres cannot hold an HTTP request for tens of
+// seconds. Callers should degrade (e.g. trending fallback) on timeout.
+const relatedProfilesQueryTimeout = 3 * time.Second
+
+// relatedProfilesProjectionMaxAge is how long a materialized related_profiles
+// batch stays authoritative before we recompute the multi-CTE query.
+const relatedProfilesProjectionMaxAge = 24 * time.Hour
+
+// GetRelatedProfiles returns bounded related-profile candidates for one focal pubkey.
+func (s *Read) GetRelatedProfiles(ctx context.Context, pubkey string, limit int) (_ []RelatedProfile, err error) {
+	started := time.Now()
+	defer func() {
+		metrics.ObserveDBOperation("get_related_profiles", dbResultFromErr(err), time.Since(started))
+	}()
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	pubkey = strings.TrimSpace(pubkey)
+	if pubkey == "" {
+		return nil, fmt.Errorf("pubkey is required")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM profiles_latest WHERE pubkey = $1)
+			OR EXISTS(SELECT 1 FROM events WHERE pubkey = $1)
+	`, pubkey).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("check focal profile exists: %w", err)
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	if cached, cacheErr := s.loadRelatedProfilesProjection(ctx, pubkey, limit); cacheErr == nil && cached != nil {
+		return cached, nil
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, relatedProfilesQueryTimeout)
+	defer cancel()
+	out, err := s.computeRelatedProfiles(queryCtx, pubkey, limit)
+	if err != nil {
+		return nil, err
+	}
+	// Best-effort materialization; read path must not fail if the write races.
+	storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = s.storeRelatedProfilesProjection(storeCtx, pubkey, out)
+	storeCancel()
+	return out, nil
+}
+
+func (s *Read) loadRelatedProfilesProjection(ctx context.Context, pubkey string, limit int) ([]RelatedProfile, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			related_pubkey,
+			topic_overlap,
+			reply_adjacency,
+			interaction_adjacency,
+			quote_repost_adjacency,
+			reasons,
+			score
+		FROM related_profiles
+		WHERE focal_pubkey = $1
+		  AND updated_at >= now() - make_interval(secs => $3::int)
+		ORDER BY score DESC, related_pubkey ASC
+		LIMIT $2
+	`, pubkey, limit, int(relatedProfilesProjectionMaxAge.Seconds()))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RelatedProfile, 0, limit)
+	for rows.Next() {
+		var row RelatedProfile
+		if err := rows.Scan(
+			&row.Pubkey,
+			&row.TopicOverlap,
+			&row.ReplyAdjacency,
+			&row.InteractionAdjacency,
+			&row.QuoteRepostAdjacency,
+			&row.Reasons,
+			&row.Score,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func (s *Read) storeRelatedProfilesProjection(ctx context.Context, pubkey string, rows []RelatedProfile) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM related_profiles WHERE focal_pubkey = $1`, pubkey); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO related_profiles (
+				focal_pubkey, related_pubkey,
+				topic_overlap, reply_adjacency, interaction_adjacency, quote_repost_adjacency,
+				reasons, score, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+		`, pubkey, row.Pubkey, row.TopicOverlap, row.ReplyAdjacency, row.InteractionAdjacency, row.QuoteRepostAdjacency, row.Reasons, row.Score); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Read) computeRelatedProfiles(ctx context.Context, pubkey string, limit int) ([]RelatedProfile, error) {
+	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour).Unix()
+	rows, err := s.pool.Query(ctx, `
+		WITH focal_notes AS (
+			SELECT e.id
+			FROM events e
+			WHERE e.pubkey = $1
+			  AND e.kind = 1
+			  AND e.created_at >= $3
+			ORDER BY e.created_at DESC, e.id DESC
+			LIMIT 200
+		),
+		focal_hashtags AS (
+			SELECT eh.hashtag
+			FROM event_hashtags eh
+			JOIN focal_notes fn ON fn.id = eh.event_id
+			WHERE eh.hashtag !~ '^[0-9]+$'
+			GROUP BY eh.hashtag
+			ORDER BY COUNT(*) DESC, eh.hashtag ASC
+			LIMIT 30
+		),
+		topic_candidates AS (
+			-- event_hashtags already stores the author and timestamp
+			-- (migration 000023). Joining events here only to re-read those
+			-- columns turned every shared hashtag into a primary-key lookup.
+			SELECT
+				eh.author_pubkey AS pubkey,
+				COUNT(*)::bigint AS topic_overlap,
+				LEAST(80, COUNT(*) * 6)::bigint AS score
+			FROM focal_hashtags fh
+			JOIN event_hashtags eh ON eh.hashtag = fh.hashtag
+			WHERE eh.author_pubkey <> $1
+			  AND eh.created_at >= $3
+			GROUP BY eh.author_pubkey
+			ORDER BY topic_overlap DESC, eh.author_pubkey ASC
+			LIMIT 150
+		),
+		reply_inbound AS (
+			-- reply_count_contributions is the same parent edge as
+			-- thread_edges (reply, else root) with the replier and the
+			-- parent author denormalized (migration 000082). The previous
+			-- form joined thread_edges to events twice per reply — about
+			-- 1.4s and most of the 3s query budget for an active author,
+			-- so the request degraded to a trending-profiles fallback.
+			-- Rows with a NULL pubkey are replies whose endpoint event was
+			-- never stored; the old INNER JOIN dropped those too.
+			SELECT
+				rcc.source_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM reply_count_contributions rcc
+			WHERE rcc.target_pubkey = $1
+			  AND rcc.source_pubkey IS NOT NULL
+			  AND rcc.source_pubkey <> $1
+			  AND rcc.source_created_at >= $3
+			GROUP BY rcc.source_pubkey
+		),
+		reply_outbound AS (
+			SELECT
+				rcc.target_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM reply_count_contributions rcc
+			WHERE rcc.source_pubkey = $1
+			  AND rcc.target_pubkey IS NOT NULL
+			  AND rcc.target_pubkey <> $1
+			  AND rcc.source_created_at >= $3
+			GROUP BY rcc.target_pubkey
+		),
+		reply_candidates AS (
+			SELECT
+				pubkey,
+				SUM(count_value)::bigint AS reply_adjacency,
+				LEAST(90, SUM(count_value) * 10)::bigint AS score
+			FROM (
+				SELECT * FROM reply_inbound
+				UNION ALL
+				SELECT * FROM reply_outbound
+			) merged
+			GROUP BY pubkey
+			ORDER BY reply_adjacency DESC, pubkey ASC
+			LIMIT 150
+		),
+		reaction_inbound AS (
+			SELECT
+				re.reactor_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM reaction_events re
+			WHERE re.target_pubkey = $1
+			  AND re.reactor_pubkey <> $1
+			  AND re.created_at >= $3
+			GROUP BY re.reactor_pubkey
+		),
+		reaction_outbound AS (
+			SELECT
+				re.target_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM reaction_events re
+			WHERE re.reactor_pubkey = $1
+			  AND re.target_pubkey IS NOT NULL
+			  AND re.target_pubkey <> $1
+			  AND re.created_at >= $3
+			GROUP BY re.target_pubkey
+		),
+		interaction_candidates AS (
+			SELECT
+				pubkey,
+				SUM(count_value)::bigint AS interaction_adjacency,
+				LEAST(70, SUM(count_value) * 8)::bigint AS score
+			FROM (
+				SELECT * FROM reaction_inbound
+				UNION ALL
+				SELECT * FROM reaction_outbound
+			) merged
+			GROUP BY pubkey
+			ORDER BY interaction_adjacency DESC, pubkey ASC
+			LIMIT 150
+		),
+		repost_inbound AS (
+			SELECT
+				re.reposter_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM repost_events re
+			WHERE re.target_pubkey = $1
+			  AND re.reposter_pubkey <> $1
+			  AND re.created_at >= $3
+			GROUP BY re.reposter_pubkey
+		),
+		repost_outbound AS (
+			SELECT
+				re.target_pubkey AS pubkey,
+				COUNT(*)::bigint AS count_value
+			FROM repost_events re
+			WHERE re.reposter_pubkey = $1
+			  AND re.target_pubkey IS NOT NULL
+			  AND re.target_pubkey <> $1
+			  AND re.created_at >= $3
+			GROUP BY re.target_pubkey
+		),
+		quote_repost_candidates AS (
+			SELECT
+				pubkey,
+				SUM(count_value)::bigint AS quote_repost_adjacency,
+				LEAST(100, SUM(count_value) * 12)::bigint AS score
+			FROM (
+				SELECT * FROM repost_inbound
+				UNION ALL
+				SELECT * FROM repost_outbound
+			) merged
+			GROUP BY pubkey
+			ORDER BY quote_repost_adjacency DESC, pubkey ASC
+			LIMIT 150
+		),
+		unioned AS (
+			SELECT
+				tc.pubkey,
+				tc.topic_overlap,
+				0::bigint AS reply_adjacency,
+				0::bigint AS interaction_adjacency,
+				0::bigint AS quote_repost_adjacency,
+				'topic_overlap'::text AS reason,
+				tc.score
+			FROM topic_candidates tc
+			UNION ALL
+			SELECT
+				rc.pubkey,
+				0::bigint,
+				rc.reply_adjacency,
+				0::bigint,
+				0::bigint,
+				'reply_adjacency'::text,
+				rc.score
+			FROM reply_candidates rc
+			UNION ALL
+			SELECT
+				ic.pubkey,
+				0::bigint,
+				0::bigint,
+				ic.interaction_adjacency,
+				0::bigint,
+				'interaction_adjacency'::text,
+				ic.score
+			FROM interaction_candidates ic
+			UNION ALL
+			SELECT
+				qc.pubkey,
+				0::bigint,
+				0::bigint,
+				0::bigint,
+				qc.quote_repost_adjacency,
+				'quote_repost_adjacency'::text,
+				qc.score
+			FROM quote_repost_candidates qc
+		),
+		ranked AS (
+			SELECT
+				u.pubkey,
+				MAX(u.topic_overlap)::bigint AS topic_overlap,
+				MAX(u.reply_adjacency)::bigint AS reply_adjacency,
+				MAX(u.interaction_adjacency)::bigint AS interaction_adjacency,
+				MAX(u.quote_repost_adjacency)::bigint AS quote_repost_adjacency,
+				ARRAY_AGG(DISTINCT u.reason ORDER BY u.reason) AS reasons,
+				(SUM(u.score) + COUNT(*))::bigint AS rank_score
+			FROM unioned u
+			WHERE (
+				EXISTS (
+					SELECT 1
+					FROM profiles_latest pl
+					WHERE pl.pubkey = u.pubkey
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM events metadata
+					WHERE metadata.pubkey = u.pubkey
+					  AND metadata.kind = 0
+				)
+			)
+			-- Web-of-Trust gate: co-occurrence counts (shared hashtags,
+			-- replies, reactions, reposts) are free to farm, so once the
+			-- trust graph is populated only candidates inside it may be
+			-- recommended. Fail-safe open when trust_graph_snapshot is
+			-- empty (trust worker not deployed / mid-rebuild), matching
+			-- authorOutsideTrustGraph in internal/derivation/trust_gate.go.
+			AND (
+				NOT EXISTS (SELECT 1 FROM trust_graph_snapshot)
+				OR EXISTS (
+					SELECT 1
+					FROM trust_graph_snapshot tg
+					WHERE tg.pubkey = u.pubkey
+				)
+			)
+			GROUP BY u.pubkey
+			ORDER BY rank_score DESC, u.pubkey ASC
+			LIMIT $2
+		)
+		SELECT
+			r.pubkey,
+			r.topic_overlap,
+			r.reply_adjacency,
+			r.interaction_adjacency,
+			r.quote_repost_adjacency,
+			r.reasons,
+			r.rank_score
+		FROM ranked r
+		ORDER BY
+			r.rank_score DESC,
+			r.quote_repost_adjacency DESC,
+			r.reply_adjacency DESC,
+			r.topic_overlap DESC,
+			r.interaction_adjacency DESC,
+			r.pubkey ASC
+	`, pubkey, limit, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("get related profiles: %w", err)
+	}
+	defer rows.Close()
+	out := make([]RelatedProfile, 0, limit)
+	for rows.Next() {
+		var row RelatedProfile
+		if err := rows.Scan(
+			&row.Pubkey,
+			&row.TopicOverlap,
+			&row.ReplyAdjacency,
+			&row.InteractionAdjacency,
+			&row.QuoteRepostAdjacency,
+			&row.Reasons,
+			&row.Score,
+		); err != nil {
+			return nil, fmt.Errorf("scan related profile row: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read related profile rows: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Read) getProfileDiscoveryRows(
+	ctx context.Context,
+	window time.Duration,
+	lang string,
+	limit int,
+	offset int,
+	rising bool,
+) (_ []TrendingProfile, err error) {
+	started := time.Now()
+	op := "get_trending_profiles"
+	if rising {
+		op = "get_rising_profiles"
+	}
+	defer func() {
+		metrics.ObserveDBOperation(op, dbResultFromErr(err), time.Since(started))
+	}()
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	scoreColumn, windowDuration, err := resolveTrendingWindow(window)
+	if err != nil {
+		return nil, err
+	}
+	if rising {
+		switch scoreColumn {
+		case "score_24h":
+			scoreColumn = "rising_score_24h"
+		case "score_30d":
+			scoreColumn = "rising_score_30d"
+		case "score_7d":
+			scoreColumn = "rising_score_7d"
+		}
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > discoveryReadLimit {
+		limit = discoveryReadLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	minCreatedAt := time.Now().UTC().Add(-windowDuration).Unix()
+	scoredEngagementCol, scoredFollowersCol := profileScoredInputColumns(scoreColumn)
+	// Rising can be follower growth with no new note. Trending is a rate
+	// over root notes in the window, so a row with no such note is not servable
+	// even when a previous score is still stored.
+	rootNoteClause := ""
+	if !rising {
+		rootNoteClause = profileRootNoteExistsSQL("profile_discovery_stats.pubkey")
+	}
+	langClause := ""
+	args := []any{minCreatedAt, limit, offset}
+	if lang != "" {
+		langClause = fmt.Sprintf("AND profile_discovery_stats.%s = $4", profileLanguageColumn(scoreColumn))
+		args = append(args, lang)
+	}
+	query := fmt.Sprintf(`
+		SELECT
+			pubkey,
+			%s AS score,
+			recent_post_count,
+			recent_reply_count,
+			recent_engagement_received,
+			COALESCE((
+				SELECT COUNT(*)
+				FROM follower_gain_events fge
+				WHERE fge.followed_pubkey = profile_discovery_stats.pubkey
+				  AND fge.gained_at >= $1
+			), 0)::bigint AS recent_new_followers,
+			recent_zap_volume_msats,
+			recent_active_days,
+			recent_activity_at,
+			COALESCE((
+				SELECT pps.follower_count
+				FROM profile_public_stats pps
+				WHERE pps.pubkey = profile_discovery_stats.pubkey
+			), 0)::bigint AS follower_count,
+			%s AS scored_engagement_received,
+			%s AS scored_new_followers
+		FROM profile_discovery_stats
+		WHERE recent_activity_at IS NOT NULL
+		  AND recent_activity_at >= $1
+		  AND %s > 0
+		  AND (
+			EXISTS (
+				SELECT 1
+				FROM profiles_latest pl
+				WHERE pl.pubkey = profile_discovery_stats.pubkey
+			)
+			OR EXISTS (
+				SELECT 1
+				FROM events metadata
+				WHERE metadata.pubkey = profile_discovery_stats.pubkey
+				  AND metadata.kind = 0
+			)
+		  )
+		  %s
+		  %s
+		ORDER BY score DESC, recent_engagement_received DESC, recent_activity_at DESC, pubkey ASC
+		LIMIT $2 OFFSET $3
+	`, scoreColumn, scoredEngagementCol, scoredFollowersCol, scoreColumn, rootNoteClause, langClause)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get profile discovery rows: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TrendingProfile, 0, limit)
+	for rows.Next() {
+		var row TrendingProfile
+		var scoredEngagement, scoredFollowers sql.NullFloat64
+		if err := rows.Scan(
+			&row.Pubkey,
+			&row.Score,
+			&row.RecentPostCount,
+			&row.RecentReplyCount,
+			&row.RecentEngagementReceived,
+			&row.RecentNewFollowers,
+			&row.RecentZapVolumeMSats,
+			&row.RecentActiveDays,
+			&row.RecentActivityAt,
+			&row.FollowerCount,
+			&scoredEngagement,
+			&scoredFollowers,
+		); err != nil {
+			return nil, fmt.Errorf("scan profile discovery row: %w", err)
+		}
+		row.ScoredEngagementReceived = nullFloat64Ptr(scoredEngagement)
+		row.ScoredNewFollowers = nullFloat64Ptr(scoredFollowers)
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read profile discovery rows: %w", err)
+	}
+	return out, nil
+}
+
+func nullFloat64Ptr(v sql.NullFloat64) *float64 {
+	if !v.Valid {
+		return nil
+	}
+	value := v.Float64
+	return &value
+}

@@ -1,0 +1,10 @@
+{
+  "body": {
+    "error": {
+      "code": "not_found",
+      "message": "profile not found",
+      "request_id": "req-profile-404"
+    }
+  },
+  "status": 404
+}

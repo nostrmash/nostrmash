@@ -1,0 +1,264 @@
+package derivation
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+)
+
+func (h *Handlers) upsertAuthorTopicWindowTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	pubkey string,
+	windowDays int,
+	cutoff int64,
+	version int,
+) error {
+	// Rewrite only hashtags whose counts changed, and delete hashtags that
+	// fell out of the window. A delete-all plus insert rewrote every row on
+	// every sweeper pass (about 44k buffers and 200ms per call in production).
+	if h.incrementalWindowedRollups {
+		var hasDaily bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM author_hashtag_daily
+				WHERE pubkey = $1
+				  AND activity_date >= to_timestamp($2)::date
+			)
+		`, pubkey, cutoff).Scan(&hasDaily); err != nil {
+			return fmt.Errorf("check author_hashtag_daily for %s: %w", pubkey, err)
+		}
+		if hasDaily {
+			if _, err := tx.Exec(ctx, `
+				WITH agg AS (
+					SELECT
+						d.hashtag,
+						SUM(d.usage_count)::bigint AS usage_count,
+						COUNT(*) FILTER (WHERE d.usage_count > 0)::int AS active_days
+					FROM author_hashtag_daily d
+					WHERE d.pubkey = $1
+					  AND d.activity_date >= to_timestamp($4)::date
+					  AND d.hashtag !~ '^[0-9]+$'
+					GROUP BY d.hashtag
+				),
+				upserted AS (
+					INSERT INTO author_topic_stats (
+						pubkey,
+						window_days,
+						hashtag,
+						usage_count,
+						active_days,
+						derivation_version
+					)
+					SELECT $1, $2, hashtag, usage_count, active_days, $3
+					FROM agg
+					ON CONFLICT (pubkey, window_days, hashtag) DO UPDATE
+					SET usage_count = EXCLUDED.usage_count,
+					    active_days = EXCLUDED.active_days,
+					    derivation_version = EXCLUDED.derivation_version,
+					    updated_at = now()
+					WHERE author_topic_stats.usage_count IS DISTINCT FROM EXCLUDED.usage_count
+					   OR author_topic_stats.active_days IS DISTINCT FROM EXCLUDED.active_days
+					   OR author_topic_stats.derivation_version IS DISTINCT FROM EXCLUDED.derivation_version
+					RETURNING hashtag
+				)
+				DELETE FROM author_topic_stats t
+				WHERE t.pubkey = $1
+				  AND t.window_days = $2
+				  AND NOT EXISTS (SELECT 1 FROM agg a WHERE a.hashtag = t.hashtag)
+			`, pubkey, windowDays, version, cutoff); err != nil {
+				return fmt.Errorf("upsert author topic stats from daily for %s window=%dd: %w", pubkey, windowDays, err)
+			}
+			return nil
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		WITH agg AS (
+			SELECT
+				eh.hashtag,
+				COUNT(*)::bigint AS usage_count,
+				COUNT(DISTINCT to_timestamp(eh.created_at)::date)::int AS active_days
+			FROM event_hashtags eh
+			WHERE eh.author_pubkey = $1
+			  AND eh.created_at >= $4
+			  AND eh.created_at <= $5
+			  AND eh.hashtag !~ '^[0-9]+$'
+			GROUP BY eh.hashtag
+		),
+		upserted AS (
+			INSERT INTO author_topic_stats (
+				pubkey,
+				window_days,
+				hashtag,
+				usage_count,
+				active_days,
+				derivation_version
+			)
+			SELECT $1, $2, hashtag, usage_count, active_days, $3
+			FROM agg
+			ON CONFLICT (pubkey, window_days, hashtag) DO UPDATE
+			SET usage_count = EXCLUDED.usage_count,
+			    active_days = EXCLUDED.active_days,
+			    derivation_version = EXCLUDED.derivation_version,
+			    updated_at = now()
+			WHERE author_topic_stats.usage_count IS DISTINCT FROM EXCLUDED.usage_count
+			   OR author_topic_stats.active_days IS DISTINCT FROM EXCLUDED.active_days
+			   OR author_topic_stats.derivation_version IS DISTINCT FROM EXCLUDED.derivation_version
+			RETURNING hashtag
+		)
+		DELETE FROM author_topic_stats t
+		WHERE t.pubkey = $1
+		  AND t.window_days = $2
+		  AND NOT EXISTS (SELECT 1 FROM agg a WHERE a.hashtag = t.hashtag)
+	`, pubkey, windowDays, version, cutoff, maxSaneUnixCreatedAt); err != nil {
+		return fmt.Errorf("upsert author topic stats for %s window=%dd: %w", pubkey, windowDays, err)
+	}
+	return nil
+}
+
+func (h *Handlers) upsertAuthorMediaMixWindowTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	pubkey string,
+	windowDays int,
+	cutoff int64,
+	version int,
+) error {
+	if h.incrementalWindowedRollups {
+		var hasDaily bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM author_media_daily
+				WHERE pubkey = $1
+				  AND activity_date >= to_timestamp($2)::date
+			)
+		`, pubkey, cutoff).Scan(&hasDaily); err != nil {
+			return fmt.Errorf("check author_media_daily for %s: %w", pubkey, err)
+		}
+		if hasDaily {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO author_media_mix_stats (
+					pubkey,
+					window_days,
+					total_posts,
+					with_image_count,
+					with_video_count,
+					with_link_count,
+					with_article_count,
+					text_only_count,
+					total_attachment_count,
+					derivation_version
+				)
+				SELECT
+					$1,
+					$3,
+					COALESCE(SUM(total_posts), 0)::bigint,
+					COALESCE(SUM(with_image_count), 0)::bigint,
+					COALESCE(SUM(with_video_count), 0)::bigint,
+					COALESCE(SUM(with_link_count), 0)::bigint,
+					COALESCE(SUM(with_article_count), 0)::bigint,
+					COALESCE(SUM(text_only_count), 0)::bigint,
+					COALESCE(SUM(total_attachment_count), 0)::bigint,
+					$4
+				FROM author_media_daily
+				WHERE pubkey = $1
+				  AND activity_date >= to_timestamp($2)::date
+				ON CONFLICT (pubkey, window_days) DO UPDATE
+				SET total_posts = EXCLUDED.total_posts,
+				    with_image_count = EXCLUDED.with_image_count,
+				    with_video_count = EXCLUDED.with_video_count,
+				    with_link_count = EXCLUDED.with_link_count,
+				    with_article_count = EXCLUDED.with_article_count,
+				    text_only_count = EXCLUDED.text_only_count,
+				    total_attachment_count = EXCLUDED.total_attachment_count,
+				    derivation_version = EXCLUDED.derivation_version,
+				    updated_at = now()
+				WHERE author_media_mix_stats.total_posts IS DISTINCT FROM EXCLUDED.total_posts
+				   OR author_media_mix_stats.with_image_count IS DISTINCT FROM EXCLUDED.with_image_count
+				   OR author_media_mix_stats.with_video_count IS DISTINCT FROM EXCLUDED.with_video_count
+				   OR author_media_mix_stats.with_link_count IS DISTINCT FROM EXCLUDED.with_link_count
+				   OR author_media_mix_stats.with_article_count IS DISTINCT FROM EXCLUDED.with_article_count
+				   OR author_media_mix_stats.text_only_count IS DISTINCT FROM EXCLUDED.text_only_count
+				   OR author_media_mix_stats.total_attachment_count IS DISTINCT FROM EXCLUDED.total_attachment_count
+				   OR author_media_mix_stats.derivation_version IS DISTINCT FROM EXCLUDED.derivation_version
+			`, pubkey, cutoff, windowDays, version)
+			if err != nil {
+				return fmt.Errorf("upsert author media mix stats from daily for %s window=%dd: %w", pubkey, windowDays, err)
+			}
+			return nil
+		}
+	}
+
+	_, err := tx.Exec(ctx, `
+		WITH media_events AS (
+			SELECT
+				nds.has_image,
+				nds.has_video,
+				nds.has_link,
+				nds.has_article,
+				nds.attachment_count
+			FROM note_discovery_stats nds
+			WHERE nds.author_pubkey = $1
+			  AND nds.created_at >= $2
+		),
+		classified AS (
+			SELECT
+				has_image,
+				has_video,
+				has_link,
+				has_article,
+				attachment_count
+			FROM media_events
+		)
+		INSERT INTO author_media_mix_stats (
+			pubkey,
+			window_days,
+			total_posts,
+			with_image_count,
+			with_video_count,
+			with_link_count,
+			with_article_count,
+			text_only_count,
+			total_attachment_count,
+			derivation_version
+		)
+		SELECT
+			$1,
+			$3,
+			COUNT(*)::bigint,
+			COUNT(*) FILTER (WHERE has_image)::bigint,
+			COUNT(*) FILTER (WHERE has_video)::bigint,
+			COUNT(*) FILTER (WHERE has_link)::bigint,
+			COUNT(*) FILTER (WHERE has_article)::bigint,
+			COUNT(*) FILTER (WHERE NOT has_image AND NOT has_video AND NOT has_link AND NOT has_article)::bigint,
+			COALESCE(SUM(attachment_count), 0)::bigint,
+			$4
+		FROM classified
+		ON CONFLICT (pubkey, window_days) DO UPDATE
+		SET total_posts = EXCLUDED.total_posts,
+		    with_image_count = EXCLUDED.with_image_count,
+		    with_video_count = EXCLUDED.with_video_count,
+		    with_link_count = EXCLUDED.with_link_count,
+		    with_article_count = EXCLUDED.with_article_count,
+		    text_only_count = EXCLUDED.text_only_count,
+		    total_attachment_count = EXCLUDED.total_attachment_count,
+		    derivation_version = EXCLUDED.derivation_version,
+		    updated_at = now()
+		WHERE author_media_mix_stats.total_posts IS DISTINCT FROM EXCLUDED.total_posts
+		   OR author_media_mix_stats.with_image_count IS DISTINCT FROM EXCLUDED.with_image_count
+		   OR author_media_mix_stats.with_video_count IS DISTINCT FROM EXCLUDED.with_video_count
+		   OR author_media_mix_stats.with_link_count IS DISTINCT FROM EXCLUDED.with_link_count
+		   OR author_media_mix_stats.with_article_count IS DISTINCT FROM EXCLUDED.with_article_count
+		   OR author_media_mix_stats.text_only_count IS DISTINCT FROM EXCLUDED.text_only_count
+		   OR author_media_mix_stats.total_attachment_count IS DISTINCT FROM EXCLUDED.total_attachment_count
+		   OR author_media_mix_stats.derivation_version IS DISTINCT FROM EXCLUDED.derivation_version
+	`, pubkey, cutoff, windowDays, version)
+	if err != nil {
+		return fmt.Errorf("upsert author media mix stats for %s window=%dd: %w", pubkey, windowDays, err)
+	}
+	return nil
+}

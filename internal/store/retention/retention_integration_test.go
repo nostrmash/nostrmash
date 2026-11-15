@@ -1,0 +1,484 @@
+package retention_test
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nostrmash/nostrmash/internal/store/retention"
+	"github.com/nostrmash/nostrmash/internal/testutil/dbtest"
+	"github.com/nostrmash/nostrmash/internal/testutil/derivationbootstrap"
+)
+
+func setupRetention(t *testing.T) (context.Context, *pgxpool.Pool, *retention.Retention) {
+	t.Helper()
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "retention"), "retention")
+	derivationbootstrap.MustMigrate(t, ctx, pool, "test-v1")
+	return ctx, pool, retention.New(pool)
+}
+
+func insertEvent(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id, pubkey string, kind int, createdAt int64, firstSeenAt time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO events (id, pubkey, created_at, kind, sig, content, raw_json, first_seen_at)
+		VALUES ($1, $2, $3, $4, 'sig', '', '{}'::jsonb, $5)
+	`, id, pubkey, createdAt, kind, firstSeenAt.UTC()); err != nil {
+		t.Fatalf("insert event %s: %v", id, err)
+	}
+}
+
+func remainingEventIDs(t *testing.T, ctx context.Context, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT id FROM events ORDER BY id ASC`)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan id: %v", err)
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func TestPurgeUntrustedAuthorEvents_DefersUntilCreatedAtAges(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	// first_seen is already past the horizon; created_at is not. The kind
+	// cursor moves past the row, and a later tick has to promote the
+	// deferred entry instead of scanning that first_seen again.
+	createdUnix := ref.Add(-1 * time.Hour).Unix()
+	oldSeen := ref.Add(-30 * 24 * time.Hour)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('trusted_pub', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+	insertEvent(t, ctx, pool, "u_future_created", "untrusted_pub", 1, createdUnix, oldSeen)
+
+	deleted, err := s.PurgeUntrustedAuthorEvents(ctx, ref.Add(-2*time.Hour), ref.Add(-9*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("purge before created_at horizon: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("event inside the created_at horizon must stay, deleted %d", deleted)
+	}
+	var deferred int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM untrusted_purge_deferred WHERE event_id = 'u_future_created'`).Scan(&deferred); err != nil {
+		t.Fatalf("count deferred: %v", err)
+	}
+	if deferred != 1 {
+		t.Fatalf("expected the event to be deferred, got %d", deferred)
+	}
+
+	deleted, err = s.PurgeUntrustedAuthorEvents(ctx, ref, ref.Add(-7*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("purge after created_at horizon: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected deferred event to be purged once eligible, got %d", deleted)
+	}
+}
+
+func TestPurgeUntrustedAuthorEvents_PicksUpAuthorDroppedFromTrust(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	oldUnix := ref.Add(-30 * 24 * time.Hour).Unix()
+	oldSeen := ref.Add(-30 * 24 * time.Hour)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('was_trusted', 1, false), ('still_trusted', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+	insertEvent(t, ctx, pool, "was_trusted_note", "was_trusted", 1, oldUnix, oldSeen)
+
+	deleted, err := s.PurgeUntrustedAuthorEvents(ctx, ref, ref.Add(-7*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("purge while trusted: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("trusted author must be kept, deleted %d", deleted)
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM trust_graph_snapshot WHERE pubkey = 'was_trusted'`); err != nil {
+		t.Fatalf("drop author from trust: %v", err)
+	}
+	deleted, err = s.PurgeUntrustedAuthorEvents(ctx, ref, ref.Add(-7*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("purge after drop: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected the dropped author's event to be purged, got %d", deleted)
+	}
+	got := remainingEventIDs(t, ctx, pool)
+	if len(got) != 0 {
+		t.Fatalf("expected no events left, got %v", got)
+	}
+}
+
+func TestPurgeUntrustedAuthorEvents_SeesLateHistoricalInsert(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('trusted_pub', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+	insertEvent(t, ctx, pool, "u_early", "untrusted_pub", 1, ref.Add(-40*24*time.Hour).Unix(), ref.Add(-40*24*time.Hour))
+	deleted, err := s.PurgeUntrustedAuthorEvents(ctx, ref, ref.Add(-7*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("first purge: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected the early event to be purged, got %d", deleted)
+	}
+
+	// Inserted after the cursor passed its created_at, but with a later
+	// first_seen that is already past the horizon. The first_seen cursor
+	// must still find it.
+	insertEvent(t, ctx, pool, "u_backfilled", "untrusted_pub", 1, ref.Add(-50*24*time.Hour).Unix(), ref.Add(-2*time.Hour))
+	deleted, err = s.PurgeUntrustedAuthorEvents(ctx, ref, ref.Add(-7*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("second purge: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected the late historical insert to be purged, got %d", deleted)
+	}
+}
+
+func TestPurgeUntrustedAuthorEvents(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	olderThan := ref
+	deadGraceBefore := ref.Add(-7 * 24 * time.Hour)
+	oldUnix := ref.Add(-30 * 24 * time.Hour).Unix()
+	oldSeen := ref.Add(-30 * 24 * time.Hour)
+
+	insertEvent(t, ctx, pool, "u_failsafe", "untrusted_pub", 1, oldUnix, oldSeen)
+	deleted, err := s.PurgeUntrustedAuthorEvents(ctx, olderThan, deadGraceBefore, 100)
+	if err != nil {
+		t.Fatalf("purge with empty snapshot: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("empty trust graph must delete nothing, got %d", deleted)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('trusted_pub', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+
+	insertEvent(t, ctx, pool, "u_old_note", "untrusted_pub", 1, oldUnix, oldSeen)
+	insertEvent(t, ctx, pool, "u_old_deletion", "untrusted_pub", 5, oldUnix, oldSeen)
+	insertEvent(t, ctx, pool, "k_trusted_note", "trusted_pub", 1, oldUnix, oldSeen)
+	insertEvent(t, ctx, pool, "k_open_kind", "untrusted_pub", 0, oldUnix, oldSeen)
+	// Untrusted reply to a local note must be retained (target-exists ingest).
+	insertEvent(t, ctx, pool, "u_old_reply", "untrusted_pub", 1, oldUnix, oldSeen)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO thread_edges (
+			child_event_id, child_created_at, parent_event_id, root_event_id,
+			parent_missing, root_missing, derivation_version
+		)
+		VALUES ('u_old_reply', $1, 'k_trusted_note', 'k_trusted_note', false, false, 1)
+	`, oldUnix); err != nil {
+		t.Fatalf("insert thread edge for untrusted reply: %v", err)
+	}
+
+	deleted, err = s.PurgeUntrustedAuthorEvents(ctx, olderThan, deadGraceBefore, 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("expected 3 deletions, got %d", deleted)
+	}
+
+	got := remainingEventIDs(t, ctx, pool)
+	want := []string{"k_open_kind", "k_trusted_note", "u_old_reply"}
+	if !sameStrings(got, want) {
+		t.Fatalf("remaining mismatch: got %v want %v", got, want)
+	}
+}
+
+func insertEventURL(t *testing.T, ctx context.Context, pool *pgxpool.Pool, eventID, pubkey, url string, createdAt int64) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO event_urls (event_id, author_pubkey, created_at, url, domain, canonical_domain, derivation_version)
+		VALUES ($1, $2, $3, $4, $4, $4, 1)
+	`, eventID, pubkey, createdAt, url); err != nil {
+		t.Fatalf("insert event url %s/%s: %v", eventID, url, err)
+	}
+}
+
+func insertEventHashtag(t *testing.T, ctx context.Context, pool *pgxpool.Pool, eventID, pubkey, hashtag string, createdAt int64) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO event_hashtags (event_id, author_pubkey, created_at, hashtag, derivation_version)
+		VALUES ($1, $2, $3, $4, 1)
+	`, eventID, pubkey, createdAt, hashtag); err != nil {
+		t.Fatalf("insert event hashtag %s/%s: %v", eventID, hashtag, err)
+	}
+}
+
+func remainingEventURLDomains(t *testing.T, ctx context.Context, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT domain FROM event_urls ORDER BY domain ASC`)
+	if err != nil {
+		t.Fatalf("query event_urls: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			t.Fatalf("scan domain: %v", err)
+		}
+		out = append(out, domain)
+	}
+	return out
+}
+
+func remainingEventHashtagValues(t *testing.T, ctx context.Context, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT hashtag FROM event_hashtags ORDER BY hashtag ASC`)
+	if err != nil {
+		t.Fatalf("query event_hashtags: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var hashtag string
+		if err := rows.Scan(&hashtag); err != nil {
+			t.Fatalf("scan hashtag: %v", err)
+		}
+		out = append(out, hashtag)
+	}
+	return out
+}
+
+// TestPurgeUntrustedAuthorEventURLs verifies the retroactive complement to
+// the write-time trust gate in internal/derivation/projection_urls.go:
+// event_urls rows from authors outside trust_graph_snapshot get purged, with
+// the same empty-graph fail-safe as PurgeUntrustedAuthorEvents.
+func TestPurgeUntrustedAuthorEventURLs(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC).Unix()
+
+	insertEvent(t, ctx, pool, "evt_url_failsafe", "untrusted_pub", 1, ref, time.Unix(ref, 0))
+	insertEventURL(t, ctx, pool, "evt_url_failsafe", "untrusted_pub", "untrusted.example", ref)
+
+	deleted, err := s.PurgeUntrustedAuthorEventURLs(ctx, 100)
+	if err != nil {
+		t.Fatalf("purge with empty snapshot: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("empty trust graph must delete nothing, got %d", deleted)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('trusted_pub', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+
+	insertEvent(t, ctx, pool, "evt_url_trusted", "trusted_pub", 1, ref, time.Unix(ref, 0))
+	insertEventURL(t, ctx, pool, "evt_url_trusted", "trusted_pub", "trusted.example", ref)
+
+	deleted, err = s.PurgeUntrustedAuthorEventURLs(ctx, 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	// evt_url_failsafe's row is now eligible too, since the graph is
+	// non-empty and untrusted_pub was never added to it.
+	if deleted != 1 {
+		t.Fatalf("expected 1 deletion, got %d", deleted)
+	}
+
+	if got, want := remainingEventURLDomains(t, ctx, pool), []string{"trusted.example"}; !sameStrings(got, want) {
+		t.Fatalf("remaining URLs mismatch: got %v want %v", got, want)
+	}
+}
+
+// TestPurgeUntrustedAuthorEventHashtags is the event_hashtags counterpart to
+// TestPurgeUntrustedAuthorEventURLs.
+func TestPurgeUntrustedAuthorEventHashtags(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC).Unix()
+
+	insertEvent(t, ctx, pool, "evt_hashtag_failsafe", "untrusted_pub", 1, ref, time.Unix(ref, 0))
+	insertEventHashtag(t, ctx, pool, "evt_hashtag_failsafe", "untrusted_pub", "untrustedtag", ref)
+
+	deleted, err := s.PurgeUntrustedAuthorEventHashtags(ctx, 100)
+	if err != nil {
+		t.Fatalf("purge with empty snapshot: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("empty trust graph must delete nothing, got %d", deleted)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed)
+		VALUES ('trusted_pub', 1, false)
+	`); err != nil {
+		t.Fatalf("insert trust snapshot: %v", err)
+	}
+
+	insertEvent(t, ctx, pool, "evt_hashtag_trusted", "trusted_pub", 1, ref, time.Unix(ref, 0))
+	insertEventHashtag(t, ctx, pool, "evt_hashtag_trusted", "trusted_pub", "trustedtag", ref)
+
+	deleted, err = s.PurgeUntrustedAuthorEventHashtags(ctx, 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 deletion, got %d", deleted)
+	}
+
+	if got, want := remainingEventHashtagValues(t, ctx, pool), []string{"trustedtag"}; !sameStrings(got, want) {
+		t.Fatalf("remaining hashtags mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestPruneAuthorRecentEvents(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	olderThan := ref.Add(-90 * 24 * time.Hour)
+
+	for i := 0; i < 5; i++ {
+		createdAt := ref.Add(-time.Duration(i) * time.Hour).Unix()
+		id := fmt.Sprintf("a_%d", i)
+		insertEvent(t, ctx, pool, id, "author_a", 1, createdAt, ref)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO author_recent_events (author_pubkey, event_id, created_at, derivation_version)
+			VALUES ('author_a', $1, $2, 1)
+		`, id, createdAt); err != nil {
+			t.Fatalf("insert author recent %s: %v", id, err)
+		}
+	}
+
+	deleted, err := s.PruneAuthorRecentEvents(ctx, olderThan, 3, 10, 100)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 cap deletions, got %d", deleted)
+	}
+}
+
+func TestPurgeStaleEventRelays(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	seenBefore := ref.Add(-180 * 24 * time.Hour)
+	ancient := seenBefore.Add(-24 * time.Hour)
+	recent := ref
+
+	insertEvent(t, ctx, pool, "e_multi", "pub", 1, ref.Unix(), ref)
+	for _, row := range []struct {
+		relay string
+		seen  time.Time
+	}{
+		{"wss://first", ancient.Add(-time.Hour)},
+		{"wss://dup_old", ancient},
+		{"wss://dup_recent", recent},
+	} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO event_relays (event_id, relay_url, seen_at, pubkey)
+			VALUES ('e_multi', $1, $2, 'pub')
+		`, row.relay, row.seen.UTC()); err != nil {
+			t.Fatalf("insert event relay: %v", err)
+		}
+	}
+
+	deleted, err := s.PurgeStaleEventRelays(ctx, seenBefore, 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 deletion, got %d", deleted)
+	}
+}
+
+func TestPruneFilteredEventTags(t *testing.T) {
+	ctx, pool, s := setupRetention(t)
+	ref := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	insertEvent(t, ctx, pool, "note1", "alice", 1, ref.Unix(), ref)
+	insertEvent(t, ctx, pool, "clist", "alice", 3, ref.Unix(), ref)
+	insertEvent(t, ctx, pool, "rlist", "alice", 10002, ref.Unix(), ref)
+
+	insertTag := func(eventID, tagName string, tagIndex, valueIndex int, value string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO event_tags (event_id, tag_name, tag_index, value_index, value)
+			VALUES ($1, $2, $3, $4, $5)
+		`, eventID, tagName, tagIndex, valueIndex, value); err != nil {
+			t.Fatalf("insert tag: %v", err)
+		}
+	}
+	insertTag("note1", "p", 0, 0, "bob")        // keep
+	insertTag("note1", "client", 1, 0, "damus") // junk
+	insertTag("clist", "p", 0, 0, "bob")        // kind-3 p drop
+	insertTag("clist", "d", 1, 0, "slot")       // keep
+	insertTag("rlist", "r", 0, 0, "wss://a")    // kind-10002 r drop
+	insertTag("rlist", "p", 1, 0, "hint")       // keep
+
+	deleted, err := s.PruneFilteredEventTags(ctx, 100)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("expected 3 deletions (client + kind3 p + kind10002 r), got %d", deleted)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT event_id, tag_name FROM event_tags ORDER BY event_id, tag_name
+	`)
+	if err != nil {
+		t.Fatalf("query remaining tags: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var eventID, tagName string
+		if err := rows.Scan(&eventID, &tagName); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, eventID+":"+tagName)
+	}
+	want := []string{"clist:d", "note1:p", "rlist:p"}
+	if !sameStrings(got, want) {
+		t.Fatalf("remaining tags = %v, want %v", got, want)
+	}
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}

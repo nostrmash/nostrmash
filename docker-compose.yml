@@ -1,0 +1,116 @@
+# Development only. Do not run this file on a public server.
+#
+# Postgres, Redis, Meilisearch, and the API are bound to 127.0.0.1.
+# Containers on this network still use the service names.
+# The users, passwords, and MEILI_MASTER_KEY below are development defaults.
+# Production deploys use docker-compose.coolify.yml and real secrets.
+services:
+  postgres:
+    image: postgres:18-alpine
+    # LZ4 TOAST compression for new writes (faster decompression than pglz on
+    # the hot raw_json read path); pairs with migration 000055.
+    command: ["postgres", "-c", "default_toast_compression=lz4"]
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: nostrmash
+      POSTGRES_PASSWORD: nostrmash
+      POSTGRES_DB: nostrmash
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nostrmash -d nostrmash"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.56.0
+    ports:
+      - "127.0.0.1:7700:7700"
+    environment:
+      MEILI_ENV: development
+      MEILI_MASTER_KEY: nostrmash-dev-key
+      # Opens a database written by an older Meilisearch. No-op once current.
+      MEILI_UPGRADE_DB: "true"
+    volumes:
+      - meili_data:/meili_data
+
+  api:
+    build: .
+    image: nostrmash:dev
+    command: ["/app/api"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DATABASE_URL: postgres://nostrmash:nostrmash@postgres:5432/nostrmash?sslmode=disable
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: info
+      ENVIRONMENT: development
+      APP_VERSION: dev
+      MEILI_ENABLED: "true"
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: nostrmash-dev-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ingestor:
+    image: nostrmash:dev
+    build: .
+    command: ["/app/ingestor"]
+    environment:
+      DATABASE_URL: postgres://nostrmash:nostrmash@postgres:5432/nostrmash?sslmode=disable
+      LOG_LEVEL: info
+      ENVIRONMENT: development
+      INGESTOR_MODE: live
+      INGESTOR_FILTER_GROUP: default_v1
+      INGESTOR_RELAY_URLS: wss://relay.primal.net,wss://relay.damus.io,wss://nos.lol
+      INGESTOR_RELAY_ALLOWLIST: wss://relay.primal.net,wss://relay.damus.io,wss://nos.lol
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    image: nostrmash:dev
+    build: .
+    command: ["/app/worker"]
+    environment:
+      DATABASE_URL: postgres://nostrmash:nostrmash@postgres:5432/nostrmash?sslmode=disable
+      LOG_LEVEL: info
+      ENVIRONMENT: development
+      # Storage governor budget (50 GiB). With this set, the worker escalates
+      # through warn -> aggressive retention drain -> disable hydration ->
+      # pause candidate ingest as the database approaches the budget. Unset
+      # (0) the governor only observes and the disk is unprotected.
+      STORAGE_PRESSURE_CAPACITY_BYTES: "53687091200"
+      MEILI_ENABLED: "true"
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: nostrmash-dev-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  trust_worker:
+    image: nostrmash:dev
+    build: .
+    command: ["/app/trust_worker"]
+    environment:
+      DATABASE_URL: postgres://nostrmash:nostrmash@postgres:5432/nostrmash?sslmode=disable
+      TRUST_WORKER_CONCURRENCY: "2"
+      TRUST_WORKER_CLAIM_BATCH_SIZE: "5"
+      TRUST_ENABLE_SCORE_COMPUTE: "true"
+      TRUST_ENABLE_REDIS_SYNC: "false"
+      LOG_LEVEL: info
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  meili_data:

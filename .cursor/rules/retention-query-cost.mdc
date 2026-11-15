@@ -1,0 +1,47 @@
+---
+description: Retention/background purge queries must stay batch-bounded as tables grow
+globs: internal/store/retention/**/*.{go,sql},internal/jobs/*retention*.go,migrations/*retention*.sql
+alwaysApply: false
+---
+
+# Retention query cost rules
+
+Retention and background purge SQL must stay cheap as tables grow. We have
+already paid for the opposite failure mode twice (`event_tags` junk prune and
+`PurgeStaleEventRelays`): batch latency scaled with **total table size**, not
+backlog size, and catchup stretched into weeks of IO contention.
+
+## Hard rules
+
+1. **Cost must be bounded by the candidate/batch set**, not by total table size.
+2. **Do not** use a correlated `EXISTS` / self-join against the same large table
+   to decide "is this the first/keeper row for this group?" on every batch.
+   Stamp keeper identity at write time (column + trigger) or drive deletes from
+   a narrow keyset/partial index of deletable rows only.
+3. **Do not** run unbounded `GROUP BY` / `HAVING count(*)` over a full large
+   table inside a per-tick sweep. Bound the scan to a recent-touch window,
+   a dirty set, or enforce the cap at insert time.
+4. Prefer partial indexes that match the delete predicate
+   (e.g. `WHERE NOT is_first_seen`) so steady-state empty catchup is an cheap
+   index probe, not a heap walk.
+5. When adding a new retention op, wire `metrics.ObserveDBOperation` (already
+   required by existing wrappers). Alerts already watch
+   `nostrmash:retention:batch_duration_p95_seconds:6h`.
+6. If a candidate set can only be found via a join against another large/wide
+   table (e.g. `events`, which carries `raw_json`) and there is no cheap
+   covering/partial index for it — confirm this with `EXPLAIN` before
+   assuming one exists; a driving-side row count that looks small can still
+   force an expensive heap-fetch or seq-scan-sized plan (see
+   `PruneFilteredEventTagsKindScoped` and its comment for a worked example
+   where neither join order was cheap). When the underlying condition is one
+   that write-time filtering already prevents from recurring (no *new*
+   violating rows can ever be created), the correct fix is usually to run
+   that check on a much longer interval, not to chase a perfect O(1) query.
+   Split it out from any cheap, frequently-safe checks in the same job so
+   the two don't share a run cadence.
+
+## Before merging
+
+- Sketch the EXPLAIN you expect at 10× current row counts.
+- Confirm a zero-backlog tick does not scan/sort/hash-aggregate the whole table.
+- Add or extend a store test that covers keeper vs deletable semantics.

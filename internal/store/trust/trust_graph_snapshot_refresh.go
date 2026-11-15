@@ -1,0 +1,198 @@
+package trust
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// trustHeavyStatementTimeout covers BFS snapshot rebuild + trusted-discovery
+// projection refresh. Those statements scan follower_edges / large candidate
+// tables and legitimately exceed the production 15s API guardrail.
+const trustHeavyStatementTimeout = 30 * time.Minute
+
+// PrepareHeavyTx raises the statement timeout and work_mem for one
+// transaction that scans the trust graph or rewrites a discovery projection.
+func PrepareHeavyTx(ctx context.Context, tx pgx.Tx) error {
+	return setTrustHeavyStatementTimeout(ctx, tx)
+}
+
+func setTrustHeavyStatementTimeout(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf(
+		"SET LOCAL statement_timeout = %d",
+		trustHeavyStatementTimeout.Milliseconds(),
+	))
+	if err != nil {
+		return fmt.Errorf("set trust statement_timeout: %w", err)
+	}
+	// The projection anti-join hashes ~5M event ids. The 64MB session
+	// work_mem spilled more than a terabyte of temp files doing that delete.
+	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '512MB'`); err != nil {
+		return fmt.Errorf("set trust work_mem: %w", err)
+	}
+	return nil
+}
+
+type TrustGraphSnapshotRefreshResult struct {
+	RowsUpserted int
+	SourceRunID  *int64
+}
+
+func (s *Trust) RefreshTrustGraphSnapshot(ctx context.Context, maxHops int) (TrustGraphSnapshotRefreshResult, error) {
+	if s == nil || s.pool == nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("store is not initialized")
+	}
+	if maxHops <= 0 {
+		maxHops = 3
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("begin trust graph snapshot refresh: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setTrustHeavyStatementTimeout(ctx, tx); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, err
+	}
+
+	var sourceRunID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM trust_runs
+		WHERE status = 'succeeded'
+		ORDER BY finished_at DESC NULLS LAST, id DESC
+		LIMIT 1
+	`).Scan(&sourceRunID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("select latest succeeded trust run: %w", err)
+		}
+		sourceRunID = nil
+	}
+
+	// DELETE, not TRUNCATE: TRUNCATE takes an AccessExclusiveLock that is held
+	// until commit, blocking every trust_graph_snapshot reader (ingest gate,
+	// discovery queries) for the whole rebuild. DELETE takes only a row lock;
+	// under MVCC concurrent readers keep seeing the previous snapshot until
+	// this transaction commits. The table is small enough (one row per
+	// reachable pubkey) that the vacuum churn is negligible.
+	if _, err := tx.Exec(ctx, `DELETE FROM trust_graph_snapshot`); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("clear trust graph snapshot: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		WITH RECURSIVE reachable(pubkey, hops) AS (
+			SELECT pubkey, 0::integer AS hops
+			FROM trust_seeds
+			WHERE is_active = true
+			UNION
+			SELECT fe.followed_pubkey, reachable.hops + 1
+			FROM reachable
+			INNER JOIN follower_edges fe ON fe.follower_pubkey = reachable.pubkey
+			WHERE reachable.hops < $1
+		),
+		agg AS (
+			SELECT
+				pubkey,
+				MIN(hops)::integer AS min_hops,
+				BOOL_OR(hops = 0) AS is_seed
+			FROM reachable
+			GROUP BY pubkey
+		)
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed, source_run_id, refreshed_at)
+		SELECT pubkey, min_hops, is_seed, $2, now()
+		FROM agg
+	`, maxHops, sourceRunID)
+	if err != nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("rebuild trust graph snapshot: %w", err)
+	}
+	rowsUpserted := int(tag.RowsAffected())
+
+	// Accounts with a large trusted audience often sit outside the seed hop
+	// limit, and the ingest gate plus the untrusted-author purge both key off
+	// this table. Hop 1 passes every legal gate max-hops setting. The floor
+	// reads trusted_follower_count from the previous recount, so a pubkey
+	// that just crossed it is injected on the next refresh. A worse existing
+	// hop is improved; a better one (a seed, or someone already closer) is kept.
+	largeTag, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO trust_graph_snapshot (pubkey, min_hops, is_seed, source_run_id, refreshed_at)
+		SELECT btrim(p.pubkey), 1, false, $1, now()
+		FROM profile_public_stats p
+		WHERE %s
+		  AND btrim(p.pubkey) <> ''
+		ON CONFLICT (pubkey) DO UPDATE
+		SET min_hops = LEAST(trust_graph_snapshot.min_hops, EXCLUDED.min_hops),
+		    refreshed_at = now()
+		WHERE trust_graph_snapshot.min_hops > EXCLUDED.min_hops
+	`, largeAccountFollowerPredicate()), sourceRunID)
+	if err != nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("merge large accounts into trust graph snapshot: %w", err)
+	}
+	rowsUpserted += int(largeTag.RowsAffected())
+
+	// Keep hop+score denormalization atomic with the snapshot rebuild so
+	// GetTrustStates readers never observe a new hop set without matching
+	// trust_pubkeys_latest rows.
+	if err := RefreshTrustPubkeysLatestTx(ctx, tx); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, fmt.Errorf("commit trust graph snapshot refresh: %w", err)
+	}
+
+	// Recount after commit. A pubkey that just entered the graph may follow
+	// many accounts, and folding that scan into the snapshot transaction
+	// would hold the trust_pubkeys_latest rebuild lock for the whole pass.
+	// The snapshot is already live if this fails; the next loop retries.
+	result := TrustGraphSnapshotRefreshResult{
+		RowsUpserted: rowsUpserted,
+		SourceRunID:  sourceRunID,
+	}
+	if err := RecountTrustedFollowerCounts(ctx, s.pool, s.trustedFollowerPolicy(maxHops)); err != nil {
+		return result, fmt.Errorf("recount trusted followers after snapshot commit: %w", err)
+	}
+
+	// The discovery projections refresh in their own transactions, after the
+	// snapshot has committed. They bulk-delete and upsert candidate tables
+	// that can take a long time on large datasets; folding them into the
+	// snapshot transaction meant one multi-hour transaction whose locks
+	// blocked the retention pipeline (observed in production). If a
+	// projection refresh fails, the snapshot is already live and the next
+	// loop iteration retries the projections.
+	if err := s.runProjectionRefresh(ctx, "trusted note discovery", refreshTrustedNoteDiscoveryProjectionTx); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, err
+	}
+	if err := s.runProjectionRefresh(ctx, "trusted profile discovery", refreshTrustedProfileDiscoveryProjectionTx); err != nil {
+		return TrustGraphSnapshotRefreshResult{}, err
+	}
+
+	return result, nil
+}
+
+// runProjectionRefresh wraps one trusted-discovery projection rebuild in its
+// own transaction so its runtime and locks never extend the snapshot rebuild
+// transaction.
+func (s *Trust) runProjectionRefresh(
+	ctx context.Context,
+	name string,
+	refresh func(context.Context, pgx.Tx, int) error,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin %s projection refresh: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setTrustHeavyStatementTimeout(ctx, tx); err != nil {
+		return err
+	}
+	if err := refresh(ctx, tx, 1); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit %s projection refresh: %w", name, err)
+	}
+	return nil
+}

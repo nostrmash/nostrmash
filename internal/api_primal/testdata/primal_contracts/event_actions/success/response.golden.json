@@ -1,0 +1,10 @@
+{
+  "body": {
+    "consistency": "eventual",
+    "event_id": "evt_123",
+    "reaction_count": 3,
+    "reply_count": 2,
+    "repost_count": 1
+  },
+  "status": 200
+}

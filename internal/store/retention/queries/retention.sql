@@ -1,0 +1,546 @@
+-- Static retention sweeps for the retention bounded context. Every statement
+-- is a bounded DELETE/UPDATE that returns the number of affected rows
+-- (:execrows). The hand-written wrappers in internal/store/retention own
+-- validation, metrics, and transaction shape; these are pure SQL plumbing.
+
+-- name: PurgeExpiredEngagementEvents :execrows
+WITH candidates AS (
+    SELECT e.id
+    FROM events e
+    WHERE e.kind IN (6, 7, 1018, 1059, 1311, 9321, 9735)
+      AND e.created_at < @created_before_unix::bigint
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jobs j
+        WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
+          AND (
+            j.status IN ('pending', 'running')
+            OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+          )
+      )
+    ORDER BY e.created_at ASC, e.id ASC
+    LIMIT @row_limit
+)
+DELETE FROM events e
+USING candidates c
+WHERE e.id = c.id;
+
+-- name: SelectExpiredGiftWrapCandidates :many
+-- Kind 1059 gift wraps age out on first_seen_at, not the author-claimed
+-- created_at, and on a shorter horizon than other engagement. The scan
+-- uses idx_events_kind_first_seen. The jobs predicate matches
+-- SelectExpiredEngagementEventCandidates.
+SELECT e.id
+FROM events e
+WHERE e.kind = 1059
+  AND e.first_seen_at < @seen_before
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jobs j
+    WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
+      AND (
+        j.status IN ('pending', 'running')
+        OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+      )
+  )
+ORDER BY e.first_seen_at ASC, e.id ASC
+LIMIT @row_limit;
+
+-- name: SelectExpiredEngagementEventCandidates :many
+-- Read-only counterpart to PurgeExpiredEngagementEvents' candidates CTE,
+-- used by the Go wrapper to reverse incremental author-stat deltas for each
+-- candidate before deleting it (see internal/store/retention/events_retention.go).
+SELECT e.id
+FROM events e
+WHERE e.kind IN (6, 7, 1018, 1059, 1311, 9321, 9735)
+  AND e.created_at < @created_before_unix::bigint
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jobs j
+    WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
+      AND (
+        j.status IN ('pending', 'running')
+        OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+      )
+  )
+ORDER BY e.created_at ASC, e.id ASC
+LIMIT @row_limit;
+
+-- name: PurgeSupersededReplaceableEvents :execrows
+-- Candidates are stamped into replaceable_event_purge when a newer version
+-- displaces the current winner, and when a losing version is derived. Cost follows the queued
+-- backlog, not the size of events. The queue has no foreign key, so this
+-- statement removes both the event and its queue row. gone drops ids whose
+-- event was deleted by something else.
+WITH gone AS (
+    SELECT p.event_id
+    FROM replaceable_event_purge p
+    WHERE NOT EXISTS (
+        SELECT 1 FROM events e WHERE e.id = p.event_id
+    )
+    LIMIT @row_limit
+),
+removed_gone AS (
+    DELETE FROM replaceable_event_purge p
+    USING gone g
+    WHERE p.event_id = g.event_id
+),
+candidates AS (
+    SELECT p.event_id
+    FROM replaceable_event_purge p
+    JOIN events e ON e.id = p.event_id
+    WHERE e.kind = ANY(@kinds::int[])
+      AND e.first_seen_at < @superseded_before
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jobs j
+        WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
+          AND (
+            j.status IN ('pending', 'running')
+            OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+          )
+      )
+    ORDER BY p.created_at ASC, p.event_id ASC
+    LIMIT @row_limit
+),
+deleted_events AS (
+    DELETE FROM events e
+    USING candidates c
+    WHERE e.id = c.event_id
+)
+DELETE FROM replaceable_event_purge p
+USING candidates c
+WHERE p.event_id = c.event_id;
+
+-- name: PurgeProcessedDeletionEvents :execrows
+WITH candidates AS (
+    SELECT e.id
+    FROM events e
+    WHERE e.kind = 5
+      AND e.created_at < @created_before_unix::bigint
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jobs j
+        WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
+          AND (
+            j.status IN ('pending', 'running')
+            OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+          )
+      )
+    ORDER BY e.created_at ASC, e.id ASC
+    LIMIT @row_limit
+)
+DELETE FROM events e
+USING candidates c
+WHERE e.id = c.id;
+
+-- name: PurgeOrphanDeletionLedger :one
+-- Purges one keyset window of deletion_events tombstones whose target event
+-- is not stored. Every consumer of the ledger (the DM parity read filters and
+-- the DM-unread derivation) anti-joins it against stored events, so a
+-- tombstone whose target is absent does nothing today; its only residual
+-- value is suppressing a deleted event that arrives *later* via fallback or
+-- backfill, which the created_at horizon (cutoff) bounds. Tombstones whose
+-- target IS stored are keepers and survive regardless of age.
+--
+-- Cost is bounded by the scan window (rule: retention-query-cost): the scan
+-- is one idx_deletion_events_created_at range read of at most row_limit rows,
+-- plus one events-PK probe per scanned row. The composite (created_at,
+-- event_id) keyset cursor is exact — the caller resumes strictly after the
+-- last scanned row, so keepers are never rescanned within a run and rows
+-- sharing a created_at second are never skipped. Each run restarts the
+-- cursor from (0, '').
+WITH scan AS (
+    SELECT d.event_id, d.target_event_id, d.created_at
+    FROM deletion_events d
+    WHERE (d.created_at, d.event_id) > (@cursor_unix::bigint, @cursor_event_id::text)
+      AND d.created_at < @created_before_unix::bigint
+    ORDER BY d.created_at ASC, d.event_id ASC
+    LIMIT @row_limit
+), victims AS (
+    DELETE FROM deletion_events d
+    USING scan s
+    WHERE d.event_id = s.event_id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM events e
+        WHERE e.id = s.target_event_id
+      )
+    RETURNING d.event_id
+)
+SELECT
+    (SELECT count(*) FROM scan)::bigint AS scanned,
+    (SELECT count(*) FROM victims)::bigint AS deleted,
+    (SELECT COALESCE(max(created_at), 0) FROM scan)::bigint AS last_created_at,
+    (SELECT COALESCE(
+        (SELECT s.event_id FROM scan s ORDER BY s.created_at DESC, s.event_id DESC LIMIT 1),
+        ''
+    ))::text AS last_event_id;
+
+-- name: PurgeUntrustedAuthorEvents :execrows
+-- Deletes a bounded batch from the candidate index maintained by
+-- syncUntrustedPurgeCandidates. Do not point this back at events: the
+-- events anti-join scales with table size (see migration 000089). The Go
+-- wrapper is the supported caller — it reverses incremental stats and
+-- drops the candidate rows in the same transaction.
+WITH candidates AS (
+    SELECT c.event_id AS id
+    FROM untrusted_purge_candidates c
+    WHERE c.created_at < @created_before_unix::bigint
+      AND c.first_seen_at < @first_seen_before
+      AND EXISTS (SELECT 1 FROM trust_graph_snapshot)
+      AND NOT EXISTS (
+        SELECT 1 FROM trust_graph_snapshot s
+        WHERE s.pubkey = c.pubkey
+      )
+      -- Kind-1 replies accepted via target-exists ingest are kept so conversation
+      -- totals are not rolled back by untrusted-author retention. Root notes from
+      -- untrusted authors remain purgeable.
+      AND NOT (
+        c.kind = 1
+        AND EXISTS (
+          SELECT 1 FROM thread_edges te WHERE te.child_event_id = c.event_id
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jobs j
+        WHERE j.idempotency_key = 'derive_event_bundle:' || c.event_id
+          AND (
+            j.status IN ('pending', 'running')
+            OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+          )
+      )
+    ORDER BY c.created_at ASC, c.event_id ASC
+    LIMIT @row_limit
+)
+DELETE FROM events e
+USING candidates c
+WHERE e.id = c.id;
+
+-- name: SelectUntrustedAuthorEventCandidates :many
+-- Read-only counterpart to PurgeUntrustedAuthorEvents' candidates CTE, used
+-- by the Go wrapper to reverse incremental author-stat deltas for each
+-- candidate before deleting it (see
+-- internal/store/retention/events_retention_untrusted.go). Reads the
+-- candidate index, not events.
+SELECT c.event_id
+FROM untrusted_purge_candidates c
+WHERE c.created_at < @created_before_unix::bigint
+  AND c.first_seen_at < @first_seen_before
+  AND EXISTS (SELECT 1 FROM trust_graph_snapshot)
+  AND NOT EXISTS (
+    SELECT 1 FROM trust_graph_snapshot s
+    WHERE s.pubkey = c.pubkey
+  )
+  AND NOT (
+    c.kind = 1
+    AND EXISTS (
+      SELECT 1 FROM thread_edges te WHERE te.child_event_id = c.event_id
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jobs j
+    WHERE j.idempotency_key = 'derive_event_bundle:' || c.event_id
+      AND (
+        j.status IN ('pending', 'running')
+        OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
+      )
+  )
+ORDER BY c.created_at ASC, c.event_id ASC
+LIMIT @row_limit;
+
+-- name: DeleteEventsByID :execrows
+-- Deletes an explicit, already-decided set of event ids. Used after
+-- SelectExpiredEngagementEventCandidates / SelectUntrustedAuthorEventCandidates
+-- so the same candidate set that had its incremental stats reversed is the
+-- exact set deleted (no re-evaluating the candidate predicate a second time
+-- against a possibly-changed table state).
+DELETE FROM events
+WHERE id = ANY(@ids::text[]);
+
+-- name: PurgeUntrustedAuthorEventURLs :execrows
+WITH candidates AS (
+    SELECT u.event_id, u.url
+    FROM event_urls u
+    WHERE EXISTS (SELECT 1 FROM trust_graph_snapshot)
+      AND NOT EXISTS (
+        SELECT 1 FROM trust_graph_snapshot s
+        WHERE s.pubkey = u.author_pubkey
+      )
+    ORDER BY u.created_at ASC, u.event_id ASC, u.url ASC
+    LIMIT @row_limit
+)
+DELETE FROM event_urls u
+USING candidates c
+WHERE u.event_id = c.event_id
+  AND u.url = c.url;
+
+-- name: PurgeUntrustedAuthorEventHashtags :execrows
+WITH candidates AS (
+    SELECT h.event_id, h.hashtag
+    FROM event_hashtags h
+    WHERE EXISTS (SELECT 1 FROM trust_graph_snapshot)
+      AND NOT EXISTS (
+        SELECT 1 FROM trust_graph_snapshot s
+        WHERE s.pubkey = h.author_pubkey
+      )
+    ORDER BY h.created_at ASC, h.event_id ASC, h.hashtag ASC
+    LIMIT @row_limit
+)
+DELETE FROM event_hashtags h
+USING candidates c
+WHERE h.event_id = c.event_id
+  AND h.hashtag = c.hashtag;
+
+-- name: PurgeStaleEventRelays :execrows
+-- Deletes duplicate provenance older than seen_before. The earliest-seen
+-- row per event (is_first_seen, maintained by triggers in migration 000070)
+-- is never deleted. Served by idx_event_relays_purge_nonfirst_seen_at so
+-- cost tracks deletable backlog, not total table size.
+WITH candidates AS (
+    SELECT er.event_id, er.relay_url
+    FROM event_relays er
+    WHERE er.seen_at < @seen_before
+      AND NOT er.is_first_seen
+    ORDER BY er.seen_at ASC, er.event_id ASC, er.relay_url ASC
+    LIMIT @row_limit
+)
+DELETE FROM event_relays er
+USING candidates c
+WHERE er.event_id = c.event_id
+  AND er.relay_url = c.relay_url;
+
+-- name: PruneAuthorRecentEventsByAge :execrows
+WITH candidates AS (
+    SELECT author_pubkey, event_id
+    FROM author_recent_events
+    WHERE created_at < @created_before_unix::bigint
+    LIMIT @delete_batch_limit
+)
+DELETE FROM author_recent_events a
+USING candidates c
+WHERE a.author_pubkey = c.author_pubkey
+  AND a.event_id = c.event_id;
+
+-- name: PruneAuthorRecentEventsByCap :execrows
+-- Only authors touched recently can newly exceed the per-author cap; the age
+-- pass already drains cold rows. Bounding the offender scan to projected_at
+-- (idx_author_recent_events_projected_at) keeps per-tick cost proportional to
+-- recent write volume instead of total table size.
+WITH touched AS (
+    SELECT t.author_pubkey
+    FROM (
+        SELECT DISTINCT ON (a.author_pubkey) a.author_pubkey, a.projected_at
+        FROM author_recent_events a
+        WHERE a.projected_at >= @touched_since
+        ORDER BY a.author_pubkey, a.projected_at DESC
+    ) t
+    ORDER BY t.projected_at DESC
+    LIMIT @author_scan_limit
+),
+offenders AS (
+    SELECT t.author_pubkey
+    FROM touched t
+    WHERE (
+        SELECT count(*)::bigint
+        FROM author_recent_events a
+        WHERE a.author_pubkey = t.author_pubkey
+    ) > @per_author_cap::bigint
+    LIMIT @author_batch_limit
+),
+victims AS (
+    SELECT r.author_pubkey, r.event_id
+    FROM offenders o
+    CROSS JOIN LATERAL (
+        SELECT a.author_pubkey, a.event_id
+        FROM author_recent_events a
+        WHERE a.author_pubkey = o.author_pubkey
+        ORDER BY a.created_at DESC, a.event_id DESC
+        OFFSET @per_author_cap::bigint
+    ) r
+    LIMIT @delete_batch_limit
+)
+DELETE FROM author_recent_events a
+USING victims v
+WHERE a.author_pubkey = v.author_pubkey
+  AND a.event_id = v.event_id;
+
+-- name: GroomSearchDocumentsTrim :execrows
+WITH candidates AS (
+    SELECT cand.entity_type, cand.entity_id
+    FROM search_documents cand
+    WHERE cand.entity_type = 'note'
+      AND cand.freshness < @freshness_before
+      AND length(cand.body) > @max_body_chars
+    LIMIT @row_limit
+)
+UPDATE search_documents sd
+SET body = left(sd.body, @max_body_chars),
+    updated_at = now()
+FROM candidates c
+WHERE sd.entity_type = c.entity_type
+  AND sd.entity_id = c.entity_id;
+
+-- name: GroomSearchDocumentsPrune :execrows
+WITH candidates AS (
+    SELECT entity_type, entity_id
+    FROM search_documents sd
+    WHERE sd.entity_type = 'note'
+      AND NOT EXISTS (
+        SELECT 1 FROM events e WHERE e.id = sd.entity_id
+      )
+    LIMIT @row_limit
+)
+DELETE FROM search_documents sd
+USING candidates c
+WHERE sd.entity_type = c.entity_type
+  AND sd.entity_id = c.entity_id;
+
+-- name: PurgeStaleTrustedNoteDiscoveryCandidates :execrows
+WITH candidates AS (
+    SELECT cand.event_id
+    FROM trusted_note_discovery_candidates cand
+    WHERE (cand.min_hops IS NOT NULL AND cand.projected_at < @trusted_before)
+       OR (cand.min_hops IS NULL AND cand.projected_at < @untrusted_before)
+    LIMIT @row_limit
+)
+DELETE FROM trusted_note_discovery_candidates t
+USING candidates c
+WHERE t.event_id = c.event_id;
+
+-- name: PurgeStaleTrustedProfileDiscoveryCandidates :execrows
+WITH candidates AS (
+    SELECT cand.pubkey
+    FROM trusted_profile_discovery_candidates cand
+    WHERE (cand.min_hops IS NOT NULL AND cand.projected_at < @trusted_before)
+       OR (cand.min_hops IS NULL AND cand.projected_at < @untrusted_before)
+    LIMIT @row_limit
+)
+DELETE FROM trusted_profile_discovery_candidates t
+USING candidates c
+WHERE t.pubkey = c.pubkey;
+
+-- name: PruneOrphanedAppliedStatDeltas :execrows
+-- Deletes applied_stat_deltas ledger rows whose source event no longer
+-- exists in events. This is the only condition under which a ledger row is
+-- guaranteed to serve no further purpose: as long as the event exists,
+-- projection_incremental_stats.go's unclaimStatDeltaTx path may still need
+-- the row to gate a future decrement (see reverseAndDeleteTx in retention.go,
+-- which atomically reverses deltas and deletes the event together, itself
+-- deleting the ledger rows it unclaims). Once the event row is gone — via
+-- that reversal-aware path, or via a purge that never touched incremental
+-- stats (PurgeSupersededReplaceableEvents, PurgeProcessedDeletionEvents) —
+-- any ledger row still referencing that event_id is a pure orphan.
+--
+-- applied_before is a conservative grace buffer on top of the orphan check
+-- (not itself a correctness requirement) that keeps freshly-inserted rows
+-- out of the scan and bounds it via idx_applied_stat_deltas_applied_at.
+WITH candidates AS (
+    SELECT d.event_id, d.projection
+    FROM applied_stat_deltas d
+    WHERE d.applied_at < @applied_before
+      AND NOT EXISTS (
+        SELECT 1 FROM events e WHERE e.id = d.event_id
+      )
+    LIMIT @row_limit
+)
+DELETE FROM applied_stat_deltas d
+USING candidates c
+WHERE d.event_id = c.event_id
+  AND d.projection = c.projection;
+
+-- name: PurgeIdleAccountStates :execrows
+WITH candidates AS (
+    SELECT a.pubkey
+    FROM account_states a
+    WHERE a.state IN ('unknown', 'observed')
+      AND a.manual_override IS NULL
+      AND a.last_observed_at < CASE
+        WHEN EXISTS (
+            SELECT 1 FROM trust_graph_snapshot s WHERE s.pubkey = a.pubkey
+        ) THEN @trusted_before::timestamptz
+        ELSE @untrusted_before::timestamptz
+      END
+    LIMIT @row_limit
+)
+DELETE FROM account_states a
+USING candidates c
+WHERE a.pubkey = c.pubkey;
+
+-- name: PruneExpiredFollowerGainEvents :execrows
+-- Deletes follower_gain_events rows older than the retention horizon.
+-- Nothing reads gains past the widest (30d) discovery window, so any row
+-- whose insert time has aged past that plus a grace buffer is garbage.
+-- Pruning keys off created_at (the insert time, served by
+-- idx_follower_gain_events_created_at) rather than the event-supplied
+-- gained_at, which a hostile contact list could post-date to dodge an
+-- age-based prune forever. Cost is bounded by the batch: one index range
+-- read of at most row_limit rows.
+WITH candidates AS (
+    SELECT g.followed_pubkey, g.follower_pubkey
+    FROM follower_gain_events g
+    WHERE g.created_at < @created_before
+    LIMIT @row_limit
+)
+DELETE FROM follower_gain_events f
+USING candidates c
+WHERE f.followed_pubkey = c.followed_pubkey
+  AND f.follower_pubkey = c.follower_pubkey;
+
+-- name: PruneFilteredEventTagsDisallowedNames :execrows
+-- Drop event_tags rows whose tag_name is outside the ingest allowlist
+-- (internal/eventtags.ShouldPersist). ingest already refuses to write
+-- these, so idx_event_tags_disallowed_tag_name only ever holds legacy
+-- rows written before that filter existed; once drained the index stays
+-- empty and this query costs an index probe, not a table scan.
+--
+-- The literal list below must exactly match both
+-- internal/eventtags.AllowedTagNames and the partial index predicate in
+-- migrations/000071_event_tags_disallowed_name_index.sql — see
+-- TestAllowedTagNamesMatchesDisallowedNameQuery. A parameterized array
+-- (@allowed_tag_names) can't be used here: Postgres can only prove a
+-- partial index satisfies a NOT IN predicate when the literal list is
+-- identical at plan time, not behind a bind parameter.
+WITH candidates AS (
+    SELECT et.event_id, et.tag_index, et.value_index
+    FROM event_tags et
+    WHERE et.tag_name NOT IN (
+        'a', 'd', 'e', 'ends', 'g', 'group', 'image', 'imeta', 'm', 'p', 'r',
+        'series', 'starts', 'status', 'summary', 't', 'thumb', 'title', 'u', 'url', 'video', 'word'
+    )
+    LIMIT @row_limit
+)
+DELETE FROM event_tags et
+USING candidates c
+WHERE et.event_id = c.event_id
+  AND et.tag_index = c.tag_index
+  AND et.value_index = c.value_index;
+
+-- name: PruneFilteredEventTagsKindScoped :execrows
+-- Drop event_tags rows the ingest allowlist excludes by (kind, tag_name):
+-- kind-3 contact-list p-tags and kind-10002 relay-list r-tags (see
+-- internal/eventtags.ShouldPersist). events.raw_json remains the source
+-- of truth; this only shrinks the derived join index.
+--
+-- Cost is bounded by how many kind-3/kind-10002 events exist, not by
+-- event_tags size — but that is still millions of rows with no cheap
+-- covering index (events carries raw_json, so both a seq scan and an
+-- index+heap-fetch scan of the driving side are expensive; see the
+-- investigation in the PR that introduced this comment). Keep this on an
+-- infrequent run cadence (WORKER_RETENTION_EVENT_TAGS_RUN_INTERVAL); it is
+-- NOT cheap on an empty tick the way the disallowed-names query above is.
+WITH candidates AS (
+    SELECT et.event_id, et.tag_index, et.value_index
+    FROM event_tags et
+    INNER JOIN events e ON e.id = et.event_id
+    WHERE (et.tag_name = 'p' AND e.kind = 3)
+       OR (et.tag_name = 'r' AND e.kind = 10002)
+    LIMIT @row_limit
+)
+DELETE FROM event_tags et
+USING candidates c
+WHERE et.event_id = c.event_id
+  AND et.tag_index = c.tag_index
+  AND et.value_index = c.value_index;

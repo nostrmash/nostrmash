@@ -1,0 +1,635 @@
+package relaylookup
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"github.com/nostrmash/nostrmash/internal/logging"
+	"github.com/nostrmash/nostrmash/internal/nostr"
+	"github.com/nostrmash/nostrmash/internal/store"
+)
+
+type Client struct {
+	mu            sync.RWMutex
+	eventRelays   []string
+	profileRelays []string
+	timeout       time.Duration
+	maxFanout     int
+	log           *slog.Logger
+
+	// dialCooldownUntil tracks relays whose last dial failed. A dead
+	// relay otherwise pins every lookup to the full per-relay timeout,
+	// because collectFromRelays waits for all fanout goroutines:
+	// production ran for days with the directory relay unreachable and
+	// every profile fallback stuck at the timeout ceiling. Relays in
+	// cooldown are skipped (freeing their fanout slot for a healthy
+	// relay) and re-probed after the cooldown expires.
+	cooldownMu        sync.Mutex
+	dialCooldownUntil map[string]time.Time
+	now               func() time.Time
+}
+
+// dialFailureCooldown is how long a relay is skipped after a failed
+// dial. Long enough to keep the timeout tax off the hot path, short
+// enough that a recovered relay rejoins quickly.
+const dialFailureCooldown = 60 * time.Second
+
+// Config configures a split event/profile fallback client.
+type Config struct {
+	EventURLs   []string
+	ProfileURLs []string
+	Timeout     time.Duration
+	MaxFanout   int
+}
+
+func NewClient(relays []string, timeout time.Duration, maxFanout int) *Client {
+	return NewSplitClient(Config{
+		EventURLs:   relays,
+		ProfileURLs: relays,
+		Timeout:     timeout,
+		MaxFanout:   maxFanout,
+	})
+}
+
+func NewSplitClient(cfg Config) *Client {
+	eventRelays := WithoutDirectoryRelays(normalizeRelays(cfg.EventURLs))
+	profileRelays := normalizeRelays(cfg.ProfileURLs)
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	maxFanout := cfg.MaxFanout
+	if maxFanout <= 0 {
+		maxFanout = max(len(eventRelays), len(profileRelays))
+	}
+	return &Client{
+		eventRelays:       eventRelays,
+		profileRelays:     profileRelays,
+		timeout:           timeout,
+		maxFanout:         maxFanout,
+		log:               logging.New("relaylookup"),
+		dialCooldownUntil: make(map[string]time.Time),
+		now:               time.Now,
+	}
+}
+
+// withoutCooledDownRelays drops relays whose last dial failed within the
+// cooldown window. If every candidate is cooling down, the original list
+// is returned so lookups degrade to trying (and re-probing) dead relays
+// rather than silently skipping fallback entirely.
+func (c *Client) withoutCooledDownRelays(relays []string) []string {
+	if len(relays) == 0 {
+		return relays
+	}
+	now := c.now()
+	c.cooldownMu.Lock()
+	defer c.cooldownMu.Unlock()
+	out := make([]string, 0, len(relays))
+	for _, relay := range relays {
+		if until, ok := c.dialCooldownUntil[relay]; ok && now.Before(until) {
+			continue
+		}
+		out = append(out, relay)
+	}
+	if len(out) == 0 {
+		return relays
+	}
+	return out
+}
+
+func (c *Client) markDialFailure(relay string) {
+	c.cooldownMu.Lock()
+	c.dialCooldownUntil[relay] = c.now().Add(dialFailureCooldown)
+	c.cooldownMu.Unlock()
+}
+
+func (c *Client) markDialSuccess(relay string) {
+	c.cooldownMu.Lock()
+	delete(c.dialCooldownUntil, relay)
+	c.cooldownMu.Unlock()
+}
+
+func (c *Client) Enabled() bool {
+	if c == nil || c.maxFanout <= 0 {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.eventRelays) > 0 || len(c.profileRelays) > 0
+}
+
+func (c *Client) EventRelays() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]string(nil), c.eventRelays...)
+}
+
+func (c *Client) ProfileRelays() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]string(nil), c.profileRelays...)
+}
+
+// profileLookupRelays returns the relays used for profile fallback:
+// directory relays first, padded with general event relays. General
+// relays also carry kind-0 metadata, so padding keeps profile fallback
+// alive when the directory relays are unreachable — production ran with
+// the default single-directory list (purplepag.es) and every profile
+// fallback returned relay_exhausted for days while that relay was down.
+// collectFromRelays caps the list at maxFanout, so directory relays
+// keep priority and padding only consumes leftover fanout slots.
+func (c *Client) profileLookupRelays() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.profileRelays)+len(c.eventRelays))
+	seen := make(map[string]struct{}, cap(out))
+	for _, relay := range c.profileRelays {
+		if _, exists := seen[relay]; exists {
+			continue
+		}
+		seen[relay] = struct{}{}
+		out = append(out, relay)
+	}
+	for _, relay := range c.eventRelays {
+		if _, exists := seen[relay]; exists {
+			continue
+		}
+		seen[relay] = struct{}{}
+		out = append(out, relay)
+	}
+	return out
+}
+
+// SetEventRelays replaces the event-lookup relay list. Directory relays are dropped.
+func (c *Client) SetEventRelays(relays []string) {
+	if c == nil {
+		return
+	}
+	normalized := WithoutDirectoryRelays(normalizeRelays(relays))
+	c.mu.Lock()
+	c.eventRelays = normalized
+	c.mu.Unlock()
+}
+
+func (c *Client) FetchEventsByIDs(ctx context.Context, ids []string) (map[string]json.RawMessage, error) {
+	if !c.Enabled() {
+		return map[string]json.RawMessage{}, nil
+	}
+	normalizedIDs := normalizeStrings(ids)
+	if len(normalizedIDs) == 0 {
+		return map[string]json.RawMessage{}, nil
+	}
+
+	events, err := c.collectFromRelays(ctx, c.EventRelays(), map[string]any{
+		"ids": normalizedIDs,
+	}, len(normalizedIDs))
+	if err != nil {
+		return nil, err
+	}
+	requestedSet := make(map[string]struct{}, len(normalizedIDs))
+	for _, id := range normalizedIDs {
+		requestedSet[id] = struct{}{}
+	}
+	return filterRequestedValidatedEvents(events, requestedSet, c.log), nil
+}
+
+// FetchEventsByAuthor fetches recent events authored by one pubkey from the
+// configured event relays. Results are validated, filtered to the requested
+// author and kinds, and deduplicated by event id. Used by the query-layer
+// thin-profile fallback when the local store has too few events for an author.
+func (c *Client) FetchEventsByAuthor(ctx context.Context, pubkey string, kinds []int, limit int) ([]json.RawMessage, error) {
+	return c.fetchEventsByAuthorRelays(ctx, pubkey, kinds, limit, nil, c.maxFanout, false)
+}
+
+// FetchEventsByAuthorOnRelays is FetchEventsByAuthor plus extra relays, used
+// for an author's write relays that are not in the fallback set. Every dialed
+// relay keeps its own page. Callers sort by created_at and trim, so a newer
+// event that only a write relay returned is not dropped because the base
+// relays filled the page first.
+func (c *Client) FetchEventsByAuthorOnRelays(ctx context.Context, pubkey string, kinds []int, limit int, extra []string) ([]json.RawMessage, error) {
+	if len(extra) == 0 {
+		return c.FetchEventsByAuthor(ctx, pubkey, kinds, limit)
+	}
+	base := c.EventRelays()
+	if c.maxFanout > 0 && c.maxFanout < len(base) {
+		base = append([]string{}, base[:c.maxFanout]...)
+	}
+	relays := mergeRelayURLs(base, extra)
+	return c.fetchEventsByAuthorRelays(ctx, pubkey, kinds, limit, relays, len(relays), true)
+}
+
+func mergeRelayURLs(base, extra []string) []string {
+	out := append([]string{}, base...)
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	for _, relayURL := range base {
+		seen[relayURL] = struct{}{}
+	}
+	for _, relayURL := range extra {
+		relayURL = strings.TrimSpace(relayURL)
+		if relayURL == "" {
+			continue
+		}
+		if _, dup := seen[relayURL]; dup {
+			continue
+		}
+		seen[relayURL] = struct{}{}
+		out = append(out, relayURL)
+	}
+	return out
+}
+
+func (c *Client) fetchEventsByAuthorRelays(ctx context.Context, pubkey string, kinds []int, limit int, relays []string, fanout int, keepEveryRelayPage bool) ([]json.RawMessage, error) {
+	if !c.Enabled() {
+		return []json.RawMessage{}, nil
+	}
+	pubkey = strings.TrimSpace(pubkey)
+	if pubkey == "" {
+		return []json.RawMessage{}, nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if relays == nil {
+		relays = c.EventRelays()
+	}
+
+	filter := map[string]any{
+		"authors": []string{pubkey},
+		"limit":   limit,
+	}
+	normalizedKinds := make([]int, 0, len(kinds))
+	for _, kind := range kinds {
+		if kind >= 0 {
+			normalizedKinds = append(normalizedKinds, kind)
+		}
+	}
+	if len(normalizedKinds) > 0 {
+		filter["kinds"] = normalizedKinds
+	}
+	// Each relay is asked for one page. When write relays are added, keep every
+	// relay's page. Stopping after the first full base page would cancel a
+	// slower write relay, and trimming in arrival order would drop its newer
+	// events before the caller sorts by created_at.
+	resultCap := limit
+	if keepEveryRelayPage && len(relays) > 0 {
+		resultCap = limit * len(relays)
+	}
+
+	events, err := c.collectFromRelaysFanout(ctx, relays, filter, resultCap, fanout)
+	if err != nil {
+		return nil, err
+	}
+
+	allowedKinds := make(map[int]struct{}, len(normalizedKinds))
+	for _, kind := range normalizedKinds {
+		allowedKinds[kind] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(events))
+	out := make([]json.RawMessage, 0, len(events))
+	for _, raw := range events {
+		evt, validatedRaw, validateErr := validateFetchedEvent(raw)
+		if validateErr != nil {
+			c.log.Debug("fallback_author_event_validation_failed", "error", validateErr)
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(evt.Pubkey), pubkey) {
+			continue
+		}
+		if len(allowedKinds) > 0 {
+			if _, ok := allowedKinds[evt.Kind]; !ok {
+				continue
+			}
+		}
+		if _, exists := seen[evt.ID]; exists {
+			continue
+		}
+		seen[evt.ID] = struct{}{}
+		out = append(out, validatedRaw)
+		if len(out) >= resultCap {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) FetchProfilesByPubkeys(ctx context.Context, pubkeys []string) (map[string]store.ProfileProjection, error) {
+	if !c.Enabled() {
+		return map[string]store.ProfileProjection{}, nil
+	}
+	normalizedPubkeys := normalizeStrings(pubkeys)
+	if len(normalizedPubkeys) == 0 {
+		return map[string]store.ProfileProjection{}, nil
+	}
+
+	events, err := c.collectFromRelays(ctx, c.profileLookupRelays(), map[string]any{
+		"kinds":   []int{0},
+		"authors": normalizedPubkeys,
+		"limit":   len(normalizedPubkeys) * 2,
+	}, len(normalizedPubkeys)*2)
+	if err != nil {
+		return nil, err
+	}
+	requestedSet := make(map[string]struct{}, len(normalizedPubkeys))
+	for _, pubkey := range normalizedPubkeys {
+		requestedSet[pubkey] = struct{}{}
+	}
+
+	winners := make(map[string]store.ProfileProjection, len(normalizedPubkeys))
+	for _, raw := range events {
+		evt, validatedRaw, validateErr := validateFetchedEvent(raw)
+		if validateErr != nil {
+			c.log.Debug("fallback_profile_validation_failed", "error", validateErr)
+			continue
+		}
+		pubkey := strings.TrimSpace(evt.Pubkey)
+		if evt.Kind != 0 || pubkey == "" {
+			continue
+		}
+		if _, requested := requestedSet[pubkey]; !requested {
+			continue
+		}
+		winner, exists := winners[pubkey]
+		if exists {
+			if evt.CreatedAt < winner.MetadataCreatedAt {
+				continue
+			}
+			if evt.CreatedAt == winner.MetadataCreatedAt && evt.ID <= winner.MetadataEventID {
+				continue
+			}
+		}
+
+		profileJSON := json.RawMessage(`{}`)
+		if strings.TrimSpace(evt.Content) != "" {
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(evt.Content), &obj); err == nil {
+				if encoded, encErr := json.Marshal(obj); encErr == nil {
+					profileJSON = encoded
+				}
+			}
+		}
+
+		winners[pubkey] = store.ProfileProjection{
+			Pubkey:            pubkey,
+			MetadataEventID:   strings.TrimSpace(evt.ID),
+			MetadataCreatedAt: evt.CreatedAt,
+			ProfileJSON:       profileJSON,
+		}
+		_ = validatedRaw // explicitly validated; use event fields and normalized profile body
+	}
+	return winners, nil
+}
+
+func (c *Client) collectFromRelays(ctx context.Context, relays []string, filter map[string]any, maxEvents int) ([]json.RawMessage, error) {
+	return c.collectFromRelaysFanout(ctx, relays, filter, maxEvents, c.maxFanout)
+}
+
+func (c *Client) collectFromRelaysFanout(ctx context.Context, relays []string, filter map[string]any, maxEvents int, fanout int) ([]json.RawMessage, error) {
+	relays = c.withoutCooledDownRelays(relays)
+	if fanout > 0 && fanout < len(relays) {
+		relays = relays[:fanout]
+	}
+	if len(relays) == 0 {
+		return []json.RawMessage{}, nil
+	}
+
+	type relayResult struct {
+		events []json.RawMessage
+		err    error
+	}
+	results := make(chan relayResult, len(relays))
+	relayCtx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+	var wg sync.WaitGroup
+	for _, relayURL := range relays {
+		wg.Add(1)
+		go func(relayURL string) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					results <- relayResult{err: fmt.Errorf("relay query panicked (%s): %v", relayURL, r)}
+				}
+			}()
+			relayCallCtx, cancel := context.WithTimeout(relayCtx, c.timeout)
+			defer cancel()
+			events, err := queryRelay(relayCallCtx, relayURL, filter, maxEvents)
+			var dialErr *relayDialError
+			switch {
+			case errors.As(err, &dialErr):
+				// Don't penalize a relay when our own deadline expired
+				// mid-dial because another relay already satisfied the
+				// lookup and collectFromRelays canceled the group.
+				if relayCtx.Err() == nil {
+					c.markDialFailure(relayURL)
+				}
+			case err == nil:
+				c.markDialSuccess(relayURL)
+			}
+			results <- relayResult{events: events, err: err}
+		}(relayURL)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	out := make([]json.RawMessage, 0)
+	successes := 0
+	for result := range results {
+		if result.err != nil {
+			c.log.Debug("fallback_relay_query_failed", "error", result.err)
+			continue
+		}
+		successes++
+		out = append(out, result.events...)
+		if maxEvents > 0 && len(out) >= maxEvents {
+			cancelAll()
+		}
+	}
+	if successes == 0 {
+		return nil, fmt.Errorf("all fallback relay queries failed")
+	}
+	return out, nil
+}
+
+// relayDialError marks a failure to establish the websocket connection
+// (DNS, TCP, TLS, or upgrade), as opposed to protocol errors on an
+// established connection. Dial failures feed the per-relay cooldown.
+type relayDialError struct {
+	relayURL string
+	err      error
+}
+
+func (e *relayDialError) Error() string {
+	return fmt.Sprintf("dial relay %s: %v", e.relayURL, e.err)
+}
+
+func (e *relayDialError) Unwrap() error { return e.err }
+
+func queryRelay(ctx context.Context, relayURL string, filter map[string]any, maxEvents int) ([]json.RawMessage, error) {
+	dialer := websocket.Dialer{}
+	conn, resp, err := dialer.DialContext(ctx, relayURL, nil)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return nil, &relayDialError{relayURL: relayURL, err: err}
+	}
+	defer conn.Close()
+
+	// Force-close the connection when the context is cancelled so that
+	// a blocking ReadMessage unblocks immediately instead of waiting
+	// for the deadline.
+	closeCh := make(chan struct{})
+	defer close(closeCh)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-closeCh:
+		}
+	}()
+
+	subID := fmt.Sprintf("nm-fallback-%d", time.Now().UnixNano())
+	req := []any{"REQ", subID, filter}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal fallback REQ: %w", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, rawReq); err != nil {
+		return nil, fmt.Errorf("write fallback REQ: %w", err)
+	}
+
+	// Set a single read deadline for the entire read phase. gorilla/websocket
+	// treats any read error (including timeouts) as fatal — calling ReadMessage
+	// again after an error panics.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(deadline)
+	}
+
+	out := make([]json.RawMessage, 0, 8)
+	for {
+		_, frame, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		var envelope []json.RawMessage
+		if err := json.Unmarshal(frame, &envelope); err != nil || len(envelope) == 0 {
+			continue
+		}
+		var envelopeType string
+		if err := json.Unmarshal(envelope[0], &envelopeType); err != nil {
+			continue
+		}
+		switch envelopeType {
+		case "EOSE":
+			goto done
+		case "EVENT":
+			if len(envelope) >= 3 {
+				rawEvent := json.RawMessage(strings.TrimSpace(string(envelope[2])))
+				if len(rawEvent) > 0 {
+					out = append(out, rawEvent)
+				}
+				if maxEvents > 0 && len(out) >= maxEvents {
+					goto done
+				}
+			}
+		}
+	}
+done:
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`["CLOSE","%s"]`, subID)))
+	return out, nil
+}
+
+func validateFetchedEvent(raw json.RawMessage) (*nostr.Event, json.RawMessage, error) {
+	result := nostr.ParseAndValidate(raw, nostr.Options{})
+	if !result.Valid() {
+		if result.Err != nil {
+			return nil, nil, fmt.Errorf("event validation failed: %s", result.Err.Error())
+		}
+		return nil, nil, fmt.Errorf("event validation failed")
+	}
+	return result.Event, result.RawJSON, nil
+}
+
+func filterRequestedValidatedEvents(
+	events []json.RawMessage,
+	requestedSet map[string]struct{},
+	log *slog.Logger,
+) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(requestedSet))
+	for _, raw := range events {
+		evt, validatedRaw, validateErr := validateFetchedEvent(raw)
+		if validateErr != nil {
+			if log != nil {
+				log.Debug("fallback_event_validation_failed", "error", validateErr)
+			}
+			continue
+		}
+		if _, requested := requestedSet[evt.ID]; !requested {
+			continue
+		}
+		if _, exists := out[evt.ID]; exists {
+			continue
+		}
+		out[evt.ID] = validatedRaw
+		if len(out) >= len(requestedSet) {
+			break
+		}
+	}
+	return out
+}
+
+func normalizeRelays(relays []string) []string {
+	out := make([]string, 0, len(relays))
+	seen := make(map[string]struct{}, len(relays))
+	for _, relay := range relays {
+		relay = strings.TrimSpace(relay)
+		if relay == "" {
+			continue
+		}
+		if _, ok := seen[relay]; ok {
+			continue
+		}
+		seen[relay] = struct{}{}
+		out = append(out, relay)
+	}
+	return out
+}
+
+func normalizeStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}

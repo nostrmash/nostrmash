@@ -1,0 +1,288 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/derivation"
+	"github.com/nostrmash/nostrmash/internal/model"
+)
+
+func TestGetTrendingNotes_WindowsAndOrdering(t *testing.T) {
+	ctx := context.Background()
+	dbURL := testDatabaseURL(t)
+	pool := setupSchemaPool(t, ctx, dbURL)
+	mustMigrateAndSeedDerivations(t, ctx, pool, "test-v1")
+
+	pgStore := NewPostgresStore(pool)
+	handlers := derivation.NewHandlers(pool)
+	now := time.Now().UTC()
+
+	events := []model.Event{
+		newDiscoveryEvent("meta_a", "author_a", now.Add(-5*time.Hour), 0, nil, `{"name":"Author A"}`),
+		newDiscoveryEvent("meta_b", "author_b", now.Add(-5*time.Hour), 0, nil, `{"name":"Author B"}`),
+		newDiscoveryEvent("meta_c", "author_c", now.Add(-50*time.Hour), 0, nil, `{"name":"Author C"}`),
+		newDiscoveryEvent("note_a", "author_a", now.Add(-2*time.Hour), 1, nil, "note a"),
+		newDiscoveryEvent("note_b", "author_b", now.Add(-3*time.Hour), 1, nil, "note b"),
+		newDiscoveryEvent("note_c", "author_c", now.Add(-40*time.Hour), 1, nil, "note c"),
+		newDiscoveryEvent("react_a1", "reactor_1", now.Add(-90*time.Minute), 7, [][]string{{"e", "note_a"}}, "+"),
+		newDiscoveryEvent("react_a2", "reactor_2", now.Add(-80*time.Minute), 7, [][]string{{"e", "note_a"}}, "+"),
+		newDiscoveryEvent("reply_a1", "replier_1", now.Add(-70*time.Minute), 1, [][]string{{"e", "note_a", "", "reply"}}, "reply"),
+		newDiscoveryEvent("react_b1", "reactor_3", now.Add(-30*time.Minute), 7, [][]string{{"e", "note_b"}}, "+"),
+		newDiscoveryEvent("reply_c1", "replier_2", now.Add(-20*time.Hour), 1, [][]string{{"e", "note_c", "", "reply"}}, "I have been following this thread for a while now."),
+		newDiscoveryEvent("reply_c2", "replier_3", now.Add(-10*time.Hour), 1, [][]string{{"e", "note_c", "", "reply"}}, "The longer version of this argument is more convincing."),
+		newDiscoveryEvent("react_c1", "reactor_4", now.Add(-8*time.Hour), 7, [][]string{{"e", "note_c"}}, "+"),
+	}
+	for _, event := range events {
+		tags := extractDiscoveryTagsForStoreTest(t, event.RawJSON)
+		if err := pgStore.InsertCanonicalEvent(ctx, event, tags, "wss://relay.one", event.FirstSeenAt); err != nil {
+			t.Fatalf("insert event %s: %v", event.ID, err)
+		}
+		if err := handlers.DeriveEventBundle(ctx, event.ID); err != nil {
+			t.Fatalf("derive event bundle %s: %v", event.ID, err)
+		}
+	}
+
+	last24h, err := pgStore.GetTrendingNotes(ctx, 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTrendingNotes 24h: %v", err)
+	}
+	if len(last24h) != 2 {
+		t.Fatalf("unexpected 24h note count: got=%d want=2", len(last24h))
+	}
+	if last24h[0].EventID != "note_a" {
+		t.Fatalf("expected note_a to rank above note_b in 24h window, got %#v", last24h[0])
+	}
+	if last24h[1].EventID != "note_b" {
+		t.Fatalf("expected note_b second in 24h window, got %#v", last24h[1])
+	}
+
+	last7d, err := pgStore.GetTrendingNotes(ctx, 7*24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTrendingNotes 7d: %v", err)
+	}
+	if len(last7d) != 3 {
+		t.Fatalf("unexpected 7d note count: got=%d want=3", len(last7d))
+	}
+	if last7d[0].EventID != "note_c" {
+		t.Fatalf("expected older but highly engaged note_c to rank first in 7d window, got %#v", last7d[0])
+	}
+}
+
+func TestGetTrendingLongForm_RanksArticlesInsideTheWindow(t *testing.T) {
+	ctx := context.Background()
+	dbURL := testDatabaseURL(t)
+	pool := setupSchemaPool(t, ctx, dbURL)
+	mustMigrateAndSeedDerivations(t, ctx, pool, "test-v1")
+
+	pgStore := NewPostgresStore(pool)
+	handlers := derivation.NewHandlers(pool)
+	now := time.Now().UTC()
+
+	events := []model.Event{
+		newDiscoveryEvent("meta_article_a", "article_author_a", now.Add(-5*time.Hour), 0, nil, `{"name":"Author A"}`),
+		newDiscoveryEvent("meta_article_b", "article_author_b", now.Add(-5*time.Hour), 0, nil, `{"name":"Author B"}`),
+		newDiscoveryEvent("article_a", "article_author_a", now.Add(-2*time.Hour), 30023, nil, "article a"),
+		newDiscoveryEvent("article_b", "article_author_b", now.Add(-40*time.Hour), 30023, nil, "article b"),
+		newDiscoveryEvent("loud_note", "article_author_a", now.Add(-1*time.Hour), 1, nil, "not an article"),
+		newDiscoveryEvent("article_react_a1", "article_reactor_1", now.Add(-90*time.Minute), 7, [][]string{{"e", "article_a"}}, "+"),
+		newDiscoveryEvent("article_react_a2", "article_reactor_2", now.Add(-80*time.Minute), 7, [][]string{{"e", "article_a"}}, "+"),
+		newDiscoveryEvent("article_react_b1", "article_reactor_3", now.Add(-30*time.Hour), 7, [][]string{{"e", "article_b"}}, "+"),
+		newDiscoveryEvent("note_react_1", "article_reactor_4", now.Add(-30*time.Minute), 7, [][]string{{"e", "loud_note"}}, "+"),
+		newDiscoveryEvent("note_react_2", "article_reactor_5", now.Add(-20*time.Minute), 7, [][]string{{"e", "loud_note"}}, "+"),
+		newDiscoveryEvent("note_react_3", "article_reactor_6", now.Add(-10*time.Minute), 7, [][]string{{"e", "loud_note"}}, "+"),
+		newDiscoveryEvent("unresolved_article", "unresolved_article_author", now.Add(-30*time.Minute), 30023, nil, "unresolved article"),
+		newDiscoveryEvent("unresolved_article_react", "article_reactor_7", now.Add(-20*time.Minute), 7, [][]string{{"e", "unresolved_article"}}, "+"),
+	}
+	for _, event := range events {
+		tags := extractDiscoveryTagsForStoreTest(t, event.RawJSON)
+		if err := pgStore.InsertCanonicalEvent(ctx, event, tags, "wss://relay.one", event.FirstSeenAt); err != nil {
+			t.Fatalf("insert event %s: %v", event.ID, err)
+		}
+		if err := handlers.DeriveEventBundle(ctx, event.ID); err != nil {
+			t.Fatalf("derive event bundle %s: %v", event.ID, err)
+		}
+	}
+
+	last24h, err := pgStore.GetTrendingLongForm(ctx, 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTrendingLongForm 24h: %v", err)
+	}
+	if len(last24h) != 1 || last24h[0].EventID != "article_a" {
+		t.Fatalf("expected only the recent resolved article, got %#v", last24h)
+	}
+
+	last7d, err := pgStore.GetTrendingLongForm(ctx, 7*24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTrendingLongForm 7d: %v", err)
+	}
+	if len(last7d) != 2 {
+		t.Fatalf("unexpected 7d article count: got=%d want=2 (%#v)", len(last7d), last7d)
+	}
+	if last7d[0].EventID != "article_a" || last7d[1].EventID != "article_b" {
+		t.Fatalf("expected article_a then article_b in the 7d window, got %#v", last7d)
+	}
+}
+
+func TestGetTrendingNotes_ExcludesNotesFromAuthorsWithoutLocalMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbURL := testDatabaseURL(t)
+	pool := setupSchemaPool(t, ctx, dbURL)
+	mustMigrateAndSeedDerivations(t, ctx, pool, "test-v1")
+
+	pgStore := NewPostgresStore(pool)
+	handlers := derivation.NewHandlers(pool)
+	now := time.Now().UTC()
+
+	events := []model.Event{
+		newDiscoveryEvent("meta_resolved", "resolved_author", now.Add(-4*time.Hour), 0, nil, `{"name":"Resolved"}`),
+		newDiscoveryEvent("resolved_note", "resolved_author", now.Add(-2*time.Hour), 1, nil, "resolved note"),
+		newDiscoveryEvent("resolved_react_1", "resolved_reactor_1", now.Add(-90*time.Minute), 7, [][]string{{"e", "resolved_note"}}, "+"),
+		newDiscoveryEvent("resolved_react_2", "resolved_reactor_2", now.Add(-80*time.Minute), 7, [][]string{{"e", "resolved_note"}}, "+"),
+		newDiscoveryEvent("unresolved_note", "unresolved_author", now.Add(-70*time.Minute), 1, nil, "unresolved note"),
+		newDiscoveryEvent("unresolved_react_1", "unresolved_reactor_1", now.Add(-60*time.Minute), 7, [][]string{{"e", "unresolved_note"}}, "+"),
+		newDiscoveryEvent("unresolved_react_2", "unresolved_reactor_2", now.Add(-50*time.Minute), 7, [][]string{{"e", "unresolved_note"}}, "+"),
+		newDiscoveryEvent("unresolved_react_3", "unresolved_reactor_3", now.Add(-40*time.Minute), 7, [][]string{{"e", "unresolved_note"}}, "+"),
+	}
+	for _, event := range events {
+		tags := extractDiscoveryTagsForStoreTest(t, event.RawJSON)
+		if err := pgStore.InsertCanonicalEvent(ctx, event, tags, "wss://relay.one", event.FirstSeenAt); err != nil {
+			t.Fatalf("insert event %s: %v", event.ID, err)
+		}
+		if err := handlers.DeriveEventBundle(ctx, event.ID); err != nil {
+			t.Fatalf("derive event bundle %s: %v", event.ID, err)
+		}
+	}
+
+	notes, err := pgStore.GetTrendingNotes(ctx, 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTrendingNotes: %v", err)
+	}
+	if len(notes) != 1 {
+		t.Fatalf("expected only notes from resolved authors, got %d notes: %#v", len(notes), notes)
+	}
+	if notes[0].EventID != "resolved_note" {
+		t.Fatalf("expected resolved_note only, got %#v", notes)
+	}
+}
+
+func TestGetTrendingMedia_RanksEachFormatApart(t *testing.T) {
+	ctx := context.Background()
+	dbURL := testDatabaseURL(t)
+	pool := setupSchemaPool(t, ctx, dbURL)
+	mustMigrateAndSeedDerivations(t, ctx, pool, "test-v1")
+
+	pgStore := NewPostgresStore(pool)
+	handlers := derivation.NewHandlers(pool)
+	now := time.Now().UTC()
+
+	events := []model.Event{
+		newDiscoveryEvent("meta_media", "media_author", now.Add(-5*time.Hour), 0, nil, `{"name":"Media"}`),
+		newDiscoveryEvent("picture_a", "media_author", now.Add(-2*time.Hour), 20, nil, "picture"),
+		newDiscoveryEvent("video_a", "media_author", now.Add(-2*time.Hour), 21, nil, "video"),
+		newDiscoveryEvent("video_addr", "media_author", now.Add(-90*time.Minute), 34235, [][]string{{"d", "clip"}}, "addressable video"),
+		newDiscoveryEvent("short_a", "media_author", now.Add(-2*time.Hour), 22, nil, "short"),
+		newDiscoveryEvent("loud_note", "media_author", now.Add(-1*time.Hour), 1, nil, "not media"),
+		newDiscoveryEvent("picture_react_1", "media_reactor_1", now.Add(-80*time.Minute), 7, [][]string{{"e", "picture_a"}}, "+"),
+		newDiscoveryEvent("picture_react_2", "media_reactor_2", now.Add(-70*time.Minute), 7, [][]string{{"e", "picture_a"}}, "+"),
+		newDiscoveryEvent("video_react_1", "media_reactor_3", now.Add(-60*time.Minute), 7, [][]string{{"e", "video_a"}}, "+"),
+		newDiscoveryEvent("video_react_2", "media_reactor_4", now.Add(-50*time.Minute), 7, [][]string{{"e", "video_a"}}, "+"),
+		newDiscoveryEvent("addr_react_1", "media_reactor_5", now.Add(-40*time.Minute), 7, [][]string{{"e", "video_addr"}}, "+"),
+		newDiscoveryEvent("short_react_1", "media_reactor_6", now.Add(-30*time.Minute), 7, [][]string{{"e", "short_a"}}, "+"),
+		newDiscoveryEvent("short_react_2", "media_reactor_7", now.Add(-20*time.Minute), 7, [][]string{{"e", "short_a"}}, "+"),
+		newDiscoveryEvent("short_react_3", "media_reactor_8", now.Add(-10*time.Minute), 7, [][]string{{"e", "short_a"}}, "+"),
+		newDiscoveryEvent("note_react_1", "media_reactor_9", now.Add(-9*time.Minute), 7, [][]string{{"e", "loud_note"}}, "+"),
+	}
+	for _, event := range events {
+		tags := extractDiscoveryTagsForStoreTest(t, event.RawJSON)
+		if err := pgStore.InsertCanonicalEvent(ctx, event, tags, "wss://relay.one", event.FirstSeenAt); err != nil {
+			t.Fatalf("insert event %s: %v", event.ID, err)
+		}
+		if err := handlers.DeriveEventBundle(ctx, event.ID); err != nil {
+			t.Fatalf("derive event bundle %s: %v", event.ID, err)
+		}
+	}
+
+	pictures, err := pgStore.GetTrendingMedia(ctx, "pictures", 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("pictures: %v", err)
+	}
+	if len(pictures) != 1 || pictures[0].EventID != "picture_a" || pictures[0].Kind != 20 {
+		t.Fatalf("pictures ranking = %#v", pictures)
+	}
+
+	videos, err := pgStore.GetTrendingMedia(ctx, "videos", 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("videos: %v", err)
+	}
+	if len(videos) != 2 || videos[0].EventID != "video_a" || videos[1].EventID != "video_addr" {
+		t.Fatalf("videos ranking = %#v", videos)
+	}
+	if videos[0].Kind != 21 || videos[1].Kind != 34235 {
+		t.Fatalf("video kinds = %#v", videos)
+	}
+
+	shorts, err := pgStore.GetTrendingMedia(ctx, "shorts", 24*time.Hour, "", 10, 0)
+	if err != nil {
+		t.Fatalf("shorts: %v", err)
+	}
+	if len(shorts) != 1 || shorts[0].EventID != "short_a" || shorts[0].Kind != 22 {
+		t.Fatalf("shorts ranking = %#v", shorts)
+	}
+}
+
+func newDiscoveryEvent(id, pubkey string, ts time.Time, kind int, tags [][]string, content string) model.Event {
+	createdAt := ts.Unix()
+	raw, _ := json.Marshal(map[string]any{
+		"id":         id,
+		"pubkey":     pubkey,
+		"created_at": createdAt,
+		"kind":       kind,
+		"tags":       tags,
+		"content":    content,
+		"sig":        "sig_" + id,
+	})
+	return model.Event{
+		ID:          id,
+		Pubkey:      pubkey,
+		CreatedAt:   createdAt,
+		Kind:        kind,
+		Sig:         "sig_" + id,
+		Content:     content,
+		RawJSON:     raw,
+		FirstSeenAt: ts,
+		InsertedAt:  ts,
+	}
+}
+
+func extractDiscoveryTagsForStoreTest(t *testing.T, raw json.RawMessage) [][]string {
+	t.Helper()
+	var payload struct {
+		Tags [][]string `json:"tags"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode tags from raw event: %v", err)
+	}
+	return payload.Tags
+}
+
+// drainPendingProfileStatsForStoreTest synchronously runs the
+// profile-stats sweeper until the dirty queue is empty so store-package
+// tests can assert on profile_public_stats / profile_discovery_stats
+// rows immediately after their DeriveEventBundle fan-out (in production
+// these projections run out-of-band on a background sweeper).
+func drainPendingProfileStatsForStoreTest(t *testing.T, ctx context.Context, handlers *derivation.Handlers) {
+	t.Helper()
+	for safety := 0; safety < 64; safety++ {
+		processed, err := handlers.DrainPendingProfileStatsBatch(ctx, 64)
+		if err != nil {
+			t.Fatalf("drain pending profile stats: %v", err)
+		}
+		if processed == 0 {
+			return
+		}
+	}
+	t.Fatalf("drain pending profile stats did not converge after 64 batches")
+}

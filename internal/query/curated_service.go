@@ -1,0 +1,344 @@
+package query
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+func (s Service) GetNetworkStats(ctx context.Context) (NetworkStats, error) {
+	if r := s.capabilities.curated.networkStats; r != nil {
+		row, err := r.GetNetworkStats(ctx)
+		if err != nil {
+			return NetworkStats{}, err
+		}
+		return networkStatsFromStore(row), nil
+	}
+	return NetworkStats{}, unsupportedCapabilityError("network stats")
+}
+
+func (s Service) GetPublicDiscoveryNetworkStats(ctx context.Context, hashtagLimit int, scope DiscoveryScope) (PublicDiscoveryNetworkStats, error) {
+	if r := s.capabilities.curated.publicNetworkStats; r != nil {
+		row, err := r.GetPublicDiscoveryNetworkStats(ctx, hashtagLimit, scope.Lang())
+		if err != nil {
+			return PublicDiscoveryNetworkStats{}, err
+		}
+		return publicDiscoveryNetworkStatsFromStore(row), nil
+	}
+	return PublicDiscoveryNetworkStats{}, unsupportedCapabilityError("public discovery network stats")
+}
+
+func (s Service) GetDiscoveryStatsSeries(ctx context.Context, metric, window string) (DiscoveryStatsSeries, error) {
+	var duration time.Duration
+	switch window {
+	case "24h":
+		duration = 24 * time.Hour
+	case "7d":
+		duration = 7 * 24 * time.Hour
+	case "30d":
+		duration = 30 * 24 * time.Hour
+	default:
+		return DiscoveryStatsSeries{}, fmt.Errorf("unsupported stats window %q", window)
+	}
+	switch metric {
+	case "note_volume", "active_authors", "relay_events", "zap_count_24h", "sats_24h", "new_authors_24h", "nip17_dm_count_24h", "bridged_share_bps", "group_messages_24h", "poll_votes_24h", "live_chat_24h", "reports_24h", "deletions_24h", "labels_24h", "census_events_24h":
+	default:
+		return DiscoveryStatsSeries{}, fmt.Errorf("unsupported stats metric %q", metric)
+	}
+	if r := s.capabilities.curated.statsSeries; r != nil {
+		row, err := r.GetDiscoveryStatsSeries(ctx, metric, duration)
+		if err != nil {
+			return DiscoveryStatsSeries{}, err
+		}
+		row.Window = window
+		return discoveryStatsSeriesFromStore(row), nil
+	}
+	return DiscoveryStatsSeries{}, unsupportedCapabilityError("discovery stats series")
+}
+
+func (s Service) GetCuratedValues(ctx context.Context, tableName string, valueColumn string, limit int) ([]string, error) {
+	if r := s.capabilities.curated.values; r != nil {
+		return r.GetCuratedValues(ctx, tableName, valueColumn, limit)
+	}
+	return nil, unsupportedCapabilityError("curated values")
+}
+
+func (s Service) GetCuratedRecommendedReads(ctx context.Context, limit int) ([]CuratedRecommendedRead, error) {
+	if r := s.capabilities.curated.recommendedReads; r != nil {
+		rows, err := r.GetCuratedRecommendedReads(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, curatedRecommendedReadFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("curated recommended reads")
+}
+
+func (s Service) GetCuratedReadsTopics(ctx context.Context, limit int) ([]CuratedReadsTopic, error) {
+	if r := s.capabilities.curated.readsTopics; r != nil {
+		rows, err := r.GetCuratedReadsTopics(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, curatedReadsTopicFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("curated reads topics")
+}
+
+func (s Service) GetCuratedFeaturedAuthors(ctx context.Context, limit int) ([]CuratedFeaturedAuthor, error) {
+	if r := s.capabilities.curated.featuredAuthors; r != nil {
+		rows, err := r.GetCuratedFeaturedAuthors(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, curatedFeaturedAuthorFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("curated featured authors")
+}
+
+func (s Service) GetTrendingHashtags(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingHashtag, error) {
+	// 24h, 7d, and 30d are the windows the overview and the topics tab
+	// request. Serve the same trust-filtered snapshot the homepage uses.
+	// The trust-aware fallback counts hashtags inside a small sample of
+	// trending notes, which ranks a different set (and reports sample-sized
+	// event counts) than the overview.
+	if isFixedDiscoveryWindow(window) {
+		if r := s.capabilities.curated.homeTrendingHashtags; r != nil {
+			rows, err := r.GetHomeTrendingHashtags(ctx, window, scope.Lang(), limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			return mapSlice(rows, trendingHashtagFromStore), nil
+		}
+	}
+	if r := s.capabilities.curated.trendingHashtags; r != nil {
+		if s.discoveryTrustMode == trustModeOpen {
+			rows, err := r.GetTrendingHashtags(ctx, window, scope.Lang(), limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			return mapSlice(rows, trendingHashtagFromStore), nil
+		}
+		return s.getTrendingHashtagsTrustAware(ctx, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("trending hashtags")
+}
+
+func (s Service) GetHashtagSummary(ctx context.Context, hashtag string) (HashtagSummary, error) {
+	normalized, err := normalizeHashtagToken(hashtag)
+	if err != nil {
+		return HashtagSummary{}, err
+	}
+	if r := s.capabilities.curated.hashtagSummary; r != nil {
+		row, err := r.GetHashtagSummary(ctx, normalized)
+		if err != nil {
+			return HashtagSummary{}, err
+		}
+		return hashtagSummaryFromStore(row), nil
+	}
+	return HashtagSummary{}, unsupportedCapabilityError("hashtag summary")
+}
+
+func (s Service) GetHashtagNotes(
+	ctx context.Context,
+	hashtag string,
+	sort string,
+	window string,
+	limit int,
+	offset int,
+) ([]TrendingNote, error) {
+	normalized, err := normalizeHashtagToken(hashtag)
+	if err != nil {
+		return nil, err
+	}
+	if r := s.capabilities.curated.hashtagNotes; r != nil {
+		rows, err := r.GetHashtagNotes(ctx, normalized, sort, window, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, trendingNoteFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("hashtag notes")
+}
+
+func (s Service) GetRelatedHashtags(ctx context.Context, hashtag string, limit int) ([]RelatedHashtag, error) {
+	normalized, err := normalizeHashtagToken(hashtag)
+	if err != nil {
+		return nil, err
+	}
+	if r := s.capabilities.curated.relatedHashtags; r != nil {
+		rows, err := r.GetRelatedHashtags(ctx, normalized, limit)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, relatedHashtagFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("related hashtags")
+}
+
+func normalizeHashtagToken(value string) (string, error) {
+	normalized := normalizeHashtagForLookup(value)
+	if normalized == "" {
+		return "", fmt.Errorf("hashtag is invalid: %w", ErrInvalidHashtag)
+	}
+	return normalized, nil
+}
+
+func (s Service) GetTrendingNotes(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingNote, error) {
+	if r := s.capabilities.curated.trendingNotes; r != nil {
+		if s.discoveryTrustMode == trustModeOpen {
+			rows, err := r.GetTrendingNotes(ctx, window, scope.Lang(), limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			return mapSlice(rows, trendingNoteFromStore), nil
+		}
+		return s.getTrendingNotesTrustAware(ctx, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("trending notes")
+}
+
+func (s Service) GetTrendingMedia(ctx context.Context, format string, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingNote, error) {
+	if r := s.capabilities.curated.trendingMedia; r != nil {
+		if s.discoveryTrustMode == trustModeOpen {
+			rows, err := r.GetTrendingMedia(ctx, format, window, scope.Lang(), limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			return mapSlice(rows, trendingNoteFromStore), nil
+		}
+		return s.getTrendingMediaTrustAware(ctx, format, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("trending media")
+}
+
+func (s Service) GetTrendingLongForm(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingNote, error) {
+	if r := s.capabilities.curated.trendingLongForm; r != nil {
+		if s.discoveryTrustMode == trustModeOpen {
+			rows, err := r.GetTrendingLongForm(ctx, window, scope.Lang(), limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			return mapSlice(rows, trendingNoteFromStore), nil
+		}
+		return s.getTrendingLongFormTrustAware(ctx, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("trending long-form")
+}
+
+func (s Service) GetBookmarkedNotes(ctx context.Context, scope DiscoveryScope, limit int, offset int) ([]TrendingNote, error) {
+	if r := s.capabilities.curated.bookmarkedNotes; r != nil {
+		rows, err := r.GetBookmarkedNotes(ctx, scope.Lang(), limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, trendingNoteFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("bookmarked notes")
+}
+
+func (s Service) GetMostZappedNotes(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingNote, error) {
+	if r := s.capabilities.curated.mostZappedNotes; r != nil {
+		rows, err := r.GetMostZappedNotes(ctx, window, scope.Lang(), limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, trendingNoteFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("most zapped notes")
+}
+
+func (s Service) GetMostFollowedProfiles(ctx context.Context, limit int, offset int) ([]TrendingProfile, error) {
+	if r := s.capabilities.curated.mostFollowedProfiles; r != nil {
+		rows, err := r.GetMostFollowedProfiles(ctx, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, trendingProfileFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("most followed profiles")
+}
+
+func (s Service) GetMostSupportedProfiles(ctx context.Context, window time.Duration, limit int, offset int) ([]TrendingProfile, error) {
+	if r := s.capabilities.curated.mostSupportedProfiles; r != nil {
+		rows, err := r.GetMostSupportedProfiles(ctx, window, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, trendingProfileFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("most supported profiles")
+}
+
+func (s Service) GetHotConversations(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]HotConversation, error) {
+	if r := s.capabilities.curated.hotConversations; r != nil {
+		rows, err := r.GetHotConversations(ctx, window, scope.Lang(), limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, hotConversationFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("hot conversations")
+}
+
+func (s Service) GetTrendingProfiles(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingProfile, error) {
+	if r := s.capabilities.curated.trendingProfiles; r != nil {
+		fetch := queryTrendingProfilesFetch(r.GetTrendingProfiles)
+		if s.discoveryTrustMode == trustModeOpen {
+			return fetch(ctx, window, scope.Lang(), limit, offset)
+		}
+		return s.getTrendingProfilesTrustAware(ctx, fetch, false, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("trending profiles")
+}
+
+func (s Service) GetRisingProfiles(ctx context.Context, window time.Duration, scope DiscoveryScope, limit int, offset int) ([]TrendingProfile, error) {
+	if r := s.capabilities.curated.risingProfiles; r != nil {
+		fetch := queryTrendingProfilesFetch(r.GetRisingProfiles)
+		if s.discoveryTrustMode == trustModeOpen {
+			return fetch(ctx, window, scope.Lang(), limit, offset)
+		}
+		return s.getTrendingProfilesTrustAware(ctx, fetch, true, window, scope.Lang(), limit, offset)
+	}
+	return nil, unsupportedCapabilityError("rising profiles")
+}
+
+func (s Service) GetRelatedProfiles(ctx context.Context, pubkey string, limit int) ([]RelatedProfile, error) {
+	normalized := CanonicalizePubkey(pubkey)
+	if normalized == "" {
+		normalized = strings.TrimSpace(pubkey)
+	}
+	if normalized == "" {
+		return nil, fmt.Errorf("pubkey is required")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if r := s.capabilities.curated.relatedProfiles; r != nil {
+		rows, err := r.GetRelatedProfiles(ctx, normalized, limit)
+		if err != nil {
+			return nil, err
+		}
+		return mapSlice(rows, relatedProfileFromStore), nil
+	}
+	return nil, unsupportedCapabilityError("related profiles")
+}
+
+func (s Service) GetCreatorPaidTiers(ctx context.Context, pubkey string) ([]json.RawMessage, error) {
+	if r := s.capabilities.curated.creatorPaidTiers; r != nil {
+		return r.GetCreatorPaidTiers(ctx, pubkey)
+	}
+	return nil, unsupportedCapabilityError("creator paid tiers")
+}
+
+func (s Service) GetPubkeyByLNAddress(ctx context.Context, lnAddress string) (string, error) {
+	if r := s.capabilities.curated.pubkeyByLNAddress; r != nil {
+		return r.GetPubkeyByLNAddress(ctx, lnAddress)
+	}
+	return "", unsupportedCapabilityError("pubkey lookup by lightning address")
+}

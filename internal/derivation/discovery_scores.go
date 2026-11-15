@@ -1,0 +1,428 @@
+package derivation
+
+import (
+	"math"
+	"time"
+)
+
+// cheapEngagementUnlockPerSubstantive is how many reaction-points one
+// substantive replier or zapper fully unlocks. One reaction is one point.
+// A copied-phrase pile is omitted from that replier budget before it gets
+// here. When that pile is most of the repliers, only the reply-derived
+// part of the budget is scaled by the share of repliers outside the pile.
+// Zaps are not. A single reply still counts as a replier.
+const cheapEngagementUnlockPerSubstantive = 4.0
+
+// cheapEngagementFloor is the fraction of surplus reactions that still count
+// once they exceed what replies and zaps explain. Zero would hide a note
+// people liked and nobody answered; 1 lets a reaction farm buy the top slot.
+const cheapEngagementFloor = 0.12
+
+// repostPointsPerPerson is the reach of one distinct reposter inside the
+// allowance. Reposts do not spend the reaction budget.
+const repostPointsPerPerson = 2.0
+
+// repostSurplusFloor is the fraction of a full repost that still counts past
+// the allowance of one reposter per share-scaled substantive replier and per
+// zapper. 0.10 keeps a 51-repost, 71-reaction, one-zap farm under nine real
+// replies, and a surplus repost (0.20) still beats a surplus reaction (0.12).
+// There is no constant free allowance: a fixed handful would not halve when
+// every trust weight is halved.
+const repostSurplusFloor = 0.10
+
+// weekRecencyGravity makes a note at the end of the 7-day window keep 85%
+// of a fresh note's score: 1/(1+3/17) = 0.85. The 24-hour window uses
+// gravity 1, which keeps half at the edge. The 30-day window uses gravity
+// 0 and ranks by engagement inside the month.
+const weekRecencyGravity = 3.0 / 17.0
+
+// recencyGravity scales age/window inside the discovery decay. Unknown
+// windows keep the original curve.
+func recencyGravity(window time.Duration) float64 {
+	switch window {
+	case 24 * time.Hour:
+		return 1
+	case 7 * 24 * time.Hour:
+		return weekRecencyGravity
+	case 30 * 24 * time.Hour:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// recencyDecay is the multiplier for a note or profile still inside the
+// window. Callers drop anything older than the window before using it.
+func recencyDecay(window time.Duration, ageSeconds, windowSeconds int64) float64 {
+	if windowSeconds <= 0 {
+		return 0
+	}
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	gravity := recencyGravity(window)
+	if gravity == 0 || ageSeconds == 0 {
+		return 1
+	}
+	return 1.0 / (1.0 + gravity*(float64(ageSeconds)/float64(windowSeconds)))
+}
+
+// RankRecencyMatters reports whether age changes a discovery score inside
+// this API window label. The 30-day list ranks by engagement; its cutoff
+// is the only recency filter. Unknown labels keep the 24-hour curve.
+func RankRecencyMatters(windowLabel string) bool {
+	var window time.Duration
+	switch windowLabel {
+	case "7d":
+		window = 7 * 24 * time.Hour
+	case "30d":
+		window = 30 * 24 * time.Hour
+	default:
+		window = 24 * time.Hour
+	}
+	return recencyGravity(window) > 0
+}
+
+// computeTrendingScore blends windowed engagement into a trending score.
+// Engagement inputs are float64 "weights", not raw event counts: the
+// projection counts each engager pubkey once per signal (excluding the note
+// author), and optionally scales each engager by trust-graph proximity, so a
+// single account emitting many events cannot inflate the score.
+//
+// Reactions and reposts are cheap to buy, and they are scored apart.
+// Reactions count in full up to four points per unlock unit. Reposts count
+// at two points per person up to one person per unlock unit, and they do
+// not consume the reaction budget. An unlock unit is a share-scaled
+// substantive replier plus a zapper: cheapUnlockShare scales only the
+// reply part. Zaps open likes and reposts even when a greeting pile is
+// most of the thread. replyWeight includes the greeting pile at
+// sqrt(people) times its strongest weight, and one vote from any other
+// copied phrase. substantiveReplyWeight leaves those piles out.
+// cheapUnlockShare is 1 while a pile is not most of the repliers. When it
+// is, the share is the fraction of repliers outside the pile. The replies
+// and the zaps still add their own score. A repost from someone in the
+// pile is omitted before it gets here. Surplus reactions count at
+// cheapEngagementFloor, surplus reposts at repostSurplusFloor. The share
+// is a headcount ratio, so halving every engager's trust weight halves
+// the reply, reaction, repost, and zap-count terms. Zap amount is
+// zapAmountSignal of the already-weighted millisats, so that term shrinks
+// by less than half.
+//
+// Recency depends on the window. A 24-hour score keeps half at the edge of
+// the day, a 7-day score keeps 85% at the end of the week, and a 30-day
+// score does not decay inside the month. Anything older than the window
+// scores 0.
+// CohortTrendingScore ranks one note from the engagement weights of a single
+// cohort. Every reply counts as substantive and the cheap-engagement unlock
+// share is 1: the caller has already dropped the note author and anyone
+// outside the cohort. Recency follows the same window curve as the global
+// discovery score.
+func CohortTrendingScore(
+	window time.Duration,
+	nowUnix int64,
+	noteCreatedAt int64,
+	replyWeight float64,
+	repostWeight float64,
+	reactionWeight float64,
+	zapWeight float64,
+	zapMSats float64,
+) float64 {
+	return computeTrendingScore(window, nowUnix, noteCreatedAt, replyWeight, replyWeight, repostWeight, reactionWeight, zapWeight, zapMSats, 1)
+}
+
+func computeTrendingScore(
+	window time.Duration,
+	nowUnix int64,
+	noteCreatedAt int64,
+	replyWeight float64,
+	substantiveReplyWeight float64,
+	repostWeight float64,
+	reactionWeight float64,
+	zapWeight float64,
+	zapMSats float64,
+	cheapUnlockShare float64,
+) float64 {
+	windowSeconds := int64(window / time.Second)
+	if windowSeconds <= 0 {
+		return 0
+	}
+	ageSeconds := nowUnix - noteCreatedAt
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	if ageSeconds > windowSeconds {
+		return 0
+	}
+	replyWeight = math.Max(0, replyWeight)
+	substantiveReplyWeight = math.Max(0, substantiveReplyWeight)
+	if substantiveReplyWeight > replyWeight {
+		substantiveReplyWeight = replyWeight
+	}
+	repostWeight = math.Max(0, repostWeight)
+	reactionWeight = math.Max(0, reactionWeight)
+	zapWeight = math.Max(0, zapWeight)
+	zapMSats = math.Max(0, zapMSats)
+
+	if cheapUnlockShare < 0 {
+		cheapUnlockShare = 0
+	} else if cheapUnlockShare > 1 {
+		cheapUnlockShare = 1
+	}
+	unlockUnits := substantiveReplyWeight*cheapUnlockShare + zapWeight
+	base := replyWeight*3.0 +
+		zapWeight*2.0 +
+		zapAmountSignal(zapMSats) +
+		reactionSignal(reactionWeight, unlockUnits) +
+		repostReachSignal(repostWeight, unlockUnits)
+	decay := recencyDecay(window, ageSeconds, windowSeconds)
+	score := base * decay
+	if score <= 0 {
+		return 0
+	}
+	return math.Round(score*1000.0) / 1000.0
+}
+
+// zapAmountSignal scores zap volume for a note and for a profile.
+// log(1 + msats/100000): 100 sats is 0.7, 10_000 is about 4.6, 50_000
+// about 6.2, and a million about 9. A single payer cannot outrank a short
+// thread. Callers pass millisatoshis already scaled by the sender's trust
+// weight.
+func zapAmountSignal(zapMSats float64) float64 {
+	if zapMSats <= 0 {
+		return 0
+	}
+	return math.Log1p(zapMSats / 100000.0)
+}
+
+// reactionSignal scores likes. Within the points replies and zaps unlock,
+// the weight is unchanged. Past it, only cheapEngagementFloor of the
+// surplus counts. With no unlock the whole pile is surplus.
+func reactionSignal(reactionWeight, unlockUnits float64) float64 {
+	if reactionWeight <= 0 {
+		return 0
+	}
+	if unlockUnits < 0 {
+		unlockUnits = 0
+	}
+	unlocked := unlockUnits * cheapEngagementUnlockPerSubstantive
+	if reactionWeight <= unlocked {
+		return reactionWeight
+	}
+	return unlocked + cheapEngagementFloor*(reactionWeight-unlocked)
+}
+
+// repostReachSignal scores distinct reposters as reach. One full-weight
+// repost per unlock unit counts at repostPointsPerPerson. Further reposts
+// count at repostSurplusFloor of that, so a boost farm cannot buy the top
+// slot and a repost still outranks a leftover like.
+func repostReachSignal(repostWeight, unlockUnits float64) float64 {
+	if repostWeight <= 0 {
+		return 0
+	}
+	if unlockUnits < 0 {
+		unlockUnits = 0
+	}
+	if repostWeight <= unlockUnits {
+		return repostPointsPerPerson * repostWeight
+	}
+	surplus := repostWeight - unlockUnits
+	return repostPointsPerPerson*unlockUnits + repostPointsPerPerson*repostSurplusFloor*surplus
+}
+
+// computeProfileTrendingScore ranks profiles by engagement on the root notes
+// they published in the window. motionAt is the newest of those notes or the
+// latest engagement on them — an outbound like is not activity. replyCount is
+// accepted so callers can keep passing the authored reply counter, and it
+// does not enter the rate: replies are not posts. engagementReceived is the
+// farm-discounted weight of distinct engagers on those notes: a greeting pile
+// is sqrt(people) times its strongest weight, any other copied phrase is one
+// vote, surplus reactions count at the cheap floor, and surplus reposts
+// count at the lower reach floor.
+func computeProfileTrendingScore(
+	window time.Duration,
+	nowUnix int64,
+	motionAt *int64,
+	postCount int64,
+	replyCount int64,
+	engagementReceived float64,
+	zapVolumeMSats float64,
+	activeDays int,
+) float64 {
+	windowSeconds := int64(window / time.Second)
+	if windowSeconds <= 0 || motionAt == nil {
+		return 0
+	}
+	ageSeconds := nowUnix - *motionAt
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	if ageSeconds > windowSeconds {
+		return 0
+	}
+	safePosts := maxInt64(0, postCount)
+	safeEngagement := math.Max(0, engagementReceived)
+	safeZapVolume := math.Max(0, zapVolumeMSats)
+	safeActiveDays := maxInt64(0, int64(activeDays))
+	// No root note in the window is not "infinite engagement per post".
+	// The +1 smoothing below is only for accounts that did publish.
+	if safePosts <= 0 || safeEngagement <= 0 {
+		return 0
+	}
+
+	// Posting volume and consistency are deliberately kept as minor,
+	// secondary signals: this score is meant to rank profiles by how much
+	// engagement their posts earn, not by how often they post. Volume
+	// mostly matters through engagementPerPost/qualityBoost below.
+	engagementSignal := 3.0 * math.Log1p(safeEngagement)
+	postingSignal := 0.35 * math.Log1p(float64(safePosts))
+	zapSignal := zapAmountSignal(safeZapVolume)
+	consistencySignal := 0.5 * math.Log1p(float64(safeActiveDays))
+
+	// qualityBoost rewards engagement-per-post with diminishing (sqrt)
+	// returns instead of a hard cap, so accounts with exceptional per-post
+	// engagement keep pulling ahead of merely-good ones rather than
+	// flattening out at the same boost.
+	engagementPerPost := safeEngagement / (1.0 + float64(safePosts))
+	qualityBoost := 1.0 + math.Min(6.0, math.Sqrt(engagementPerPost))
+	postingPressure := float64(safePosts) / (1.0 + safeEngagement + float64(safeActiveDays))
+	volumePenalty := 1.0 / (1.0 + math.Max(0.0, postingPressure-1.0))
+
+	base := (engagementSignal + postingSignal + zapSignal + consistencySignal) * qualityBoost * volumePenalty
+	decay := recencyDecay(window, ageSeconds, windowSeconds)
+	score := base * decay
+	if score <= 0 {
+		return 0
+	}
+	return math.Round(score*1000.0) / 1000.0
+}
+
+// computeProfileRisingScore takes float64 newFollowers/engagement inputs so
+// callers can pass either raw counters or deduplicated trust-weighted votes.
+// engagementReceived is one person per window after the same farm discount:
+// a reply or a zap beats a like, and a like-only ring sits on the cheap floor.
+func computeProfileRisingScore(
+	trendingScore float64,
+	followerCount int64,
+	newFollowers float64,
+	engagementReceived float64,
+	postCount int64,
+	replyCount int64,
+	activeDays int,
+) float64 {
+	safeFollowerCount := maxInt64(0, followerCount)
+	safeNewFollowers := math.Max(0, newFollowers)
+	safeEngagement := math.Max(0, engagementReceived)
+	safePosts := maxInt64(0, postCount)
+	safeReplies := maxInt64(0, replyCount)
+	safeActiveDays := maxInt64(0, int64(activeDays))
+	totalPosts := safePosts + safeReplies
+	// A handful of new followers is common noise. The first two never count,
+	// and anything short of 10 credited followers (12 raw) is still too small
+	// to win "Up and coming" on growth alone. +3 and +5 used to outrank a
+	// larger absolute jump because the audience penalty crushed bigger accounts.
+	creditedNewFollowers, _, followerMomentum := FollowerMomentum(safeFollowerCount, safeNewFollowers)
+	// Same idea for engagement: a single (weighted) interaction is not
+	// evidence of momentum -- any account can pick up one stray boost or
+	// reaction. With trust weighting live, engagement inputs are already
+	// deduplicated per-engager and scaled by trust proximity, so clearing
+	// this floor requires interactions from more than one real account.
+	const risingEngagementNoiseFloor = 1.0
+	creditedEngagement := math.Max(0, safeEngagement-risingEngagementNoiseFloor)
+	// Rising requires credited momentum of its own: either real follower
+	// growth or above-noise engagement. A positive trending score alone is
+	// NOT enough -- trending measures engagement-per-post quality, and
+	// letting it qualify a profile here would re-admit exactly the
+	// "one boosted note, nothing else" accounts the floors exist to block.
+	if creditedNewFollowers <= 0 && creditedEngagement <= 0 {
+		return 0
+	}
+	// Gentle log through the "small account" range, then a multiplicative
+	// hinge past risingAudienceSoftCap so mid/large accounts fall off
+	// quickly. A 400-follower account stays in the intended band; a
+	// 5,000- or 50,000-follower account needs far more momentum to compete.
+	// No hard cutoff: anyone can still appear if the growth is enormous.
+	const risingAudienceSoftCap = 500.0
+	audiencePenalty := 1.0 + 1.3*math.Log10(1.0+float64(safeFollowerCount))
+	if audiencePenalty <= 0 {
+		audiencePenalty = 1.0
+	}
+	if float64(safeFollowerCount) > risingAudienceSoftCap {
+		audiencePenalty *= float64(safeFollowerCount) / risingAudienceSoftCap
+	}
+	// Follower momentum is the credited count itself inside the small-account
+	// band, so +22 ranks above +14. Past the soft cap the same jump is divided
+	// by followers/500. The log audience penalty still applies to engagement
+	// and trending, which is what keeps a large account's reaction burst from
+	// reading as "up and coming".
+	// relativeEngagementMomentum gives a small account a real path into the
+	// ranking purely from getting outsized engagement relative to its own
+	// (tiny) audience, independent of whether it gained any new followers.
+	// The *100 scale-up keeps typical fractional engagement/follower
+	// ratios (e.g. 0.5 engagement per follower) in a range where log1p
+	// produces a meaningful signal instead of ~0.
+	//
+	// Two guards keep this from being the bot backdoor it used to be:
+	//   - Audience prior: the denominator is (10 + followers), not
+	//     (1 + followers), so a 3-follower account can't turn a dozen
+	//     boosts on one note into an enormous ratio. Genuinely small
+	//     accounts still benefit -- the prior only caps how explosive the
+	//     ratio can get at near-zero audience.
+	//   - Sample-size shrinkage: the signal is scaled by
+	//     credited/(credited+15), so a 12-interaction burst keeps ~45% of
+	//     its value while 60+ sustained interactions keep 80%+. Small
+	//     evidence earns proportionally small trust.
+	engagementPerFollower := creditedEngagement / (10.0 + float64(safeFollowerCount))
+	sampleShrinkage := creditedEngagement / (creditedEngagement + 15.0)
+	relativeEngagementMomentum := 3.0 * math.Log1p(engagementPerFollower*100.0) * sampleShrinkage
+	engagementMomentum := 0.4*math.Log1p(creditedEngagement) + relativeEngagementMomentum
+	qualityFactor := 1.0 + math.Min(1.0, safeEngagement/(1.0+float64(totalPosts)))
+	postingPressure := float64(totalPosts) / (1.0 + safeEngagement + float64(safeActiveDays))
+	volumePenalty := 1.0 / (1.0 + math.Max(0.0, postingPressure-1.0))
+	engagementMomentum = engagementMomentum * qualityFactor * volumePenalty
+	// Consistency multiplier: engagement concentrated in a single day of
+	// activity (the classic drive-by bot boost pattern) earns a third of
+	// the credit; 3+ days of authored activity earn full credit. Unlike
+	// the old sqrt(activeDays) division this never punishes sustained
+	// activity -- it only discounts single-burst evidence. Follower
+	// momentum stays untouched: a lagging growth count must not shrink
+	// because the account has been active longer.
+	if safeActiveDays > 0 {
+		engagementMomentum *= math.Min(1.0, float64(safeActiveDays)/3.0)
+	}
+	score := followerMomentum + (0.2*math.Max(0, trendingScore)+engagementMomentum)/audiencePenalty
+	if score <= 0 {
+		return 0
+	}
+	return math.Round(score*1000.0) / 1000.0
+}
+
+// FollowerMomentum is the follower-growth term inside computeProfileRisingScore.
+// credited is raw growth minus the two-follower noise floor, and zero unless
+// that remainder is at least 10. penalty is 1 up to 500 followers and
+// followers/500 after that. momentum is credited/penalty. The arithmetic is
+// the score's; callers use it to explain a rank without recomputing the rest.
+func FollowerMomentum(followerCount int64, newFollowers float64) (credited, penalty, momentum float64) {
+	const risingFollowerNoiseFloor = 2.0
+	const risingFollowerCreditMinimum = 10.0
+	const risingAudienceSoftCap = 500.0
+	credited = math.Max(0, math.Max(0, newFollowers)-risingFollowerNoiseFloor)
+	if credited < risingFollowerCreditMinimum {
+		credited = 0
+	}
+	penalty = 1
+	if float64(maxInt64(0, followerCount)) > risingAudienceSoftCap {
+		penalty = float64(maxInt64(0, followerCount)) / risingAudienceSoftCap
+	}
+	if penalty <= 0 {
+		penalty = 1
+	}
+	momentum = credited / penalty
+	return credited, penalty, momentum
+}
+
+func maxInt64(a int64, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}

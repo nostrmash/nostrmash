@@ -1,0 +1,396 @@
+groups:
+  - name: nostrmash-core-workflows
+    interval: 30s
+    rules:
+      - alert: NostrMashAPIDown
+        expr: up{job="nostrmash-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "API scrape target is down"
+          description: "Prometheus cannot scrape api:8080/metrics for 2m. Traefik will return 503 no available server to clients. Check Coolify/API container status, OOM kills at the 512MiB default cap, and recent deploys."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashAPIRestarted
+        expr: changes(process_start_time_seconds{job="nostrmash-api"}[15m]) >= 1
+        for: 2m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "API process start time flipped"
+          description: "The API process restarted within the last 15m. Includes planned Coolify deploys; unexpected flips are usually an OOM at the 512MiB default cap or a crash-loop. Correlate with Coolify history and docker events."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashAPIHighErrorRate
+        expr: nostrmash:api:error_ratio5m > 0.01
+        for: 15m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "API 5xx error ratio is above 1%"
+          description: "Sustained 5xx error ratio (5m) is above 1% for 15m. Follow API availability SLO triage in docs/operations.md."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      # The 15m warning above stayed quiet through the 2026-11-14 burst:
+      # about one in five API responses was a 500 for roughly ten minutes.
+      - alert: NostrMashAPIErrorBurst
+        expr: sum(rate(nostrmash_api_requests_total{path_template=~"/api/v1/.*|/primal/v1/.*",status_code="500"}[5m])) / clamp_min(sum(rate(nostrmash_api_requests_total{path_template=~"/api/v1/.*|/primal/v1/.*"}[5m])), 0.001) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "API is returning HTTP 500 for more than 5% of requests"
+          description: "The 5m HTTP 500 ratio has been above 5% for 2m. This is the pool-exhaustion failure mode: requests queue on the API database pool and then fail. Check nostrmash:db_pool:wait_rate5m and in-use connections before looking for a bad deploy."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashAPICriticalPathLatencyHigh
+        expr: nostrmash:api:critical_path_latency_p95_seconds:5m > 1.5
+        for: 10m
+        labels:
+          severity: warning
+          slo: api-latency
+        annotations:
+          summary: "API critical-path p95 latency is high"
+          description: "p95 latency of the Postgres store operations backing events/{id}, threads/{eventId}, and profiles/{pubkey} exceeds 1.5s for 10m. Measured at the store layer (nostrmash_db_operation_duration_seconds), not the HTTP handler, so relay-fallback time on local misses is excluded — see NostrMashFallbackLatencyHigh for that. /api/v1/search is also excluded (see NostrMashSearchLatencyHigh) since it fails independently on Meilisearch pressure. Check DB pool pressure and query/store trace spans."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashSearchLatencyHigh
+        expr: nostrmash:api:search_latency_p95_seconds:5m > 2
+        for: 10m
+        labels:
+          severity: warning
+          slo: search-latency
+        annotations:
+          summary: "Search API p95 latency is high"
+          description: "/api/v1/search p95 latency exceeds 2s for 10m. This route's latency is dominated by Meilisearch, not Postgres — check Meilisearch CPU/health first (docker stats, /tasks queue depth), in particular whether a FullSync is running (worker/api startup logs: meilisearch_indexes_stale) or the sweeper is behind (nostrmash_pending_meilisearch_syncs, NostrMashMeilisearchSyncLagHigh)."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashDBPoolSaturation
+        expr: nostrmash:db_pool:max_open_usage_ratio > 0.90 and nostrmash:db_pool:wait_rate5m > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          slo: api-latency
+        annotations:
+          summary: "DB pool saturation is sustained"
+          description: "Pool usage ratio > 0.90 with non-trivial wait rate for 10m. Investigate slow queries and pool tuning."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashDBPoolWaitBurst
+        expr: nostrmash:db_pool:max_open_usage_ratio > 0.95 and nostrmash:db_pool:wait_rate5m > 1
+        for: 2m
+        labels:
+          severity: critical
+          slo: api-latency
+        annotations:
+          summary: "DB pool is full and callers are waiting"
+          description: "Pool usage is above 95% and the wait rate is above 1/s for 2m. New API requests should be failing fast with 503 overloaded. Find the query holding connections before raising DATABASE_MAX_CONNS; the per-service ceilings exist so the four binaries cannot fill Postgres max_connections."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashWorkerDeadLetterRateHigh
+        expr: nostrmash:worker:dead_ratio30m > 0.01 and nostrmash:worker:terminal_jobs_total:increase30m > 20
+        for: 30m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Worker dead-letter ratio exceeds SLO threshold"
+          description: "Dead-letter ratio over 30m is above 1% with meaningful volume. Inspect derivation failures and queue transitions."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashWorkerRetryStorm
+        expr: nostrmash:worker:retry_ratio15m > 0.30 and sum(increase(nostrmash_worker_jobs_total{outcome=~"succeeded|dead|retry"}[15m])) > 30
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Worker retries dominate recent job outcomes"
+          description: "Retry ratio >30% in 15m. Look for derivation regressions, dependency errors, or queue contention."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashQueueClaimErrorsHigh
+        expr: nostrmash:queue:claim_errors_rate5m > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Queue claim operation is erroring"
+          description: "Claim operation errors are sustained. Check DB connectivity, lock contention, and queue table health."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashIngestLikelyStalled
+        expr: nostrmash:ingest:checkpoint_freshness_seconds:max > 600
+        for: 10m
+        labels:
+          severity: warning
+          slo: ingest-freshness
+        annotations:
+          summary: "Ingest checkpoint freshness is stale"
+          description: "Live checkpoint freshness exceeded 10 minutes for 10m. Investigate relay connectivity and ingest loop health."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRebuildProcessingSlow
+        expr: nostrmash:rebuild:active_runs > 0 and nostrmash:rebuild:active_oldest_age_seconds > 1800
+        for: 15m
+        labels:
+          severity: warning
+          slo: rebuild-completion
+        annotations:
+          summary: "Active rebuild age is elevated"
+          description: "At least one rebuild run has been active for over 30 minutes. Investigate rebuild state and queue pressure."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRebuildJobsDead
+        expr: increase(nostrmash_worker_jobs_total{job_type="rebuild_projection_scope",outcome="dead"}[30m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: rebuild-completion
+        annotations:
+          summary: "Rebuild jobs are dead-lettering"
+          description: "At least one rebuild projection-scope job dead-lettered in 30m. Treat as rebuild recovery incident."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashTrustRunStuck
+        expr: nostrmash:trust:active_runs > 0 and nostrmash:trust:active_oldest_run_age_seconds > 1800
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Trust run appears stuck"
+          description: "At least one trust run has remained active for over 30 minutes. Inspect trust phase metadata and trust queue health."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashTrustSnapshotStale
+        expr: nostrmash:trust:active_snapshot_age_seconds > 21600
+        for: 30m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Trust snapshot is stale"
+          description: "Most recent succeeded trust run is older than 6 hours. Trigger a trust run and verify trust_worker health."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRelayWindowSnapshotStale
+        expr: nostrmash:discovery:relay_window_snapshot_age_seconds > 900
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Homepage relay-window snapshot is stale"
+          description: "The home_window_24h snapshot backing the homepage's note-volume/active-authors numbers and \"Updated Xd ago\" freshness label is older than 15 minutes (refresh runs every 5m). Check that the worker process is running and inspect relay_window_snapshots_refresh_failed / relay_window_snapshots_refresh_panicked logs."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashTrustRetryStorm
+        expr: nostrmash:trust:phase_retry_ratio15m > 0.30 and sum(increase(nostrmash_worker_jobs_total{job_type=~"trust_.*",outcome=~"succeeded|dead|retry"}[15m])) > 20
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Trust phase retries dominate recent outcomes"
+          description: "Trust retry ratio exceeded 30% over 15m with meaningful volume. Inspect sync/compute/promote errors by phase."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashFallbackFailureRatioHigh
+        expr: nostrmash:lookup:fallback_error_ratio5m_by_entity > 0.10 and nostrmash:lookup:fallback_attempt_rate5m_by_entity > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          slo: api-latency
+        annotations:
+          summary: "Relay fallback infra errors are sustained"
+          description: "Fallback error ratio exceeds 10% with meaningful traffic for 15m. Inspect relay health, timeout/fanout tuning, and degraded_to_not_found fallback logs."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashFallbackLatencyHigh
+        expr: nostrmash:lookup:fallback_latency_p95_seconds:5m_by_entity > 1.5 and nostrmash:lookup:fallback_attempt_rate5m_by_entity > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          slo: api-latency
+        annotations:
+          summary: "Relay fallback latency p95 is elevated"
+          description: "Fallback lookup p95 latency exceeds 1.5s with sustained volume. Check relay response behavior and fallback timeout budget."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashLocalMissRatioHigh
+        expr: nostrmash:lookup:local_miss_ratio5m_by_surface > 0.50 and nostrmash:lookup:local_total_rate5m_by_surface > 0.05
+        for: 20m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "Local lookup miss ratio is elevated"
+          description: "More than half of fallback-enabled lookups are local misses for 20m. Investigate ingest freshness and hot-data locality."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRetentionPurgeFailing
+        expr: nostrmash:retention:purge_error_rate5m > 0
+        for: 15m
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Retention purge loop is failing"
+          description: "Retention purge runs are erroring over 15m. Inspect worker logs and retention configuration for jobs/invalid_events."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRetentionBatchDurationHigh
+        expr: nostrmash:retention:batch_duration_p95_seconds:6h > 30 and sum by (operation) (rate(nostrmash_db_operation_duration_seconds_count{operation=~"purge_.*|prune_.*|groom_.*"}[6h])) > 0.01
+        for: 3h
+        labels:
+          severity: warning
+          slo: worker-throughput
+        annotations:
+          summary: "Retention batch p95 latency is high"
+          description: "Retention/store purge operation {{ $labels.operation }} has 6h p95 batch duration above 30s for 3h. nostrmash_db_operation_duration_seconds buckets extend through 900s so this threshold is observable (they used to saturate at 10s). This is the leading indicator of the table-size-scaling anti-pattern (self-join / full GROUP BY catchup). Inspect EXPLAIN for that query and recent retention logs."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashEventTagsJunkCatchupSustained
+        expr: nostrmash:retention:purged_rows_rate1h_by_target{target="event_tags"} > 10
+        for: 12h
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "event_tags junk prune is in sustained catchup"
+          description: "event_tags retention is deleting more than 10 rows/s for 12h. After the allowlist + historical drain this should be near-zero; sustained catchup usually means ingest-side filtering regressed or a new junk tag class appeared."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashMeilisearchSyncLagHigh
+        # Threshold 900s (was 300s): since the sweeper moved to a 60s
+        # interval with large batches (each Meilisearch commit costs
+        # seconds of CPU at production index size, so fewer/larger tasks
+        # are deliberate), oldest-age routinely sawtooths several minutes
+        # during ingest bursts and post-restart catchup while the sweeper
+        # is making steady progress — the 5m line flapped continuously.
+        # 15m sustained for 15m means search results are genuinely stale
+        # and the sweeper is not keeping up, not just batching.
+        expr: nostrmash_pending_meilisearch_sync_oldest_age_seconds > 900 and nostrmash_pending_meilisearch_syncs > 0
+        for: 15m
+        labels:
+          severity: warning
+          slo: search-freshness
+        annotations:
+          summary: "Meilisearch index lag is elevated"
+          description: "The oldest pending Meilisearch sync has been waiting over 15 minutes for 15m while the backlog is non-empty. The sweeper cannot keep up; check Meilisearch health, WORKER_MEILISEARCH_SWEEPER_* tuning, and derivation logs."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashMeilisearchSweeperStalled
+        expr: sum(rate(nostrmash_worker_meilisearch_sweeper_batch_duration_seconds_count[15m])) == 0 and nostrmash_pending_meilisearch_syncs > 0
+        for: 10m
+        labels:
+          severity: critical
+          slo: search-freshness
+        annotations:
+          summary: "Meilisearch sweeper has stopped completing batches entirely"
+          description: "No Meilisearch sweeper batch (success or error) has completed in 15m while pending_meilisearch_syncs is non-empty. Every sweeper goroutine is hung, not just slow or erroring — a slow-but-alive sweeper still emits batch observations every WORKER_MEILISEARCH_SWEEPER_INTERVAL even on an empty queue. Restart the worker to clear the stuck goroutines (WORKER_MEILISEARCH_SWEEPER_BATCH_TIMEOUT bounds each goroutine going forward so this should self-heal within that timeout), then check Meilisearch health/CPU."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashDatabaseGrowthSustained
+        # 100 MiB/h (104857600). Steady growth is ~75 MiB/h, so the old
+        # 50 MiB/h line fired on ordinary ingest. The daily multi-GB
+        # vacuum swings last under this 6h hold. Disk fill is
+        # NostrMashDiskUsageHigh.
+        expr: nostrmash:storage:database_growth_bytes_per_hour:6h > 104857600
+        for: 6h
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Database storage growth is sustained"
+          description: "Database size growth exceeds 100 MiB/hour over a 6h derivative window. Review high-growth tables and retention posture."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashGiftWrapIngestHigh
+        # 2 accepts/s is about 7k gift wraps an hour. Ordinary DM traffic
+        # is far below that; a single recipient's flood is tens per second.
+        # The hourly budget should already be dropping the excess
+        # (NostrMashGiftWrapRecipientBudget). This fires when accepted
+        # volume itself is still too high.
+        expr: sum(rate(nostrmash_ingest_gate_decisions_total{kind="1059",decision="accept"}[10m])) > 2
+        for: 10m
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Gift wrap ingest is far above normal"
+          description: "Kind 1059 accepts exceed 2/s for 10m. Check INGESTOR_GIFT_WRAP_RECIPIENT_PER_HOUR and whether one trusted recipient is being wrapped by many ephemeral authors."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashGiftWrapRecipientBudget
+        expr: sum(rate(nostrmash_ingest_gate_decisions_total{kind="1059",decision="reject_recipient_budget"}[10m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Gift wrap recipient budget is dropping a sustained flood"
+          description: "Kind 1059 events are being rejected by the per-recipient hourly budget at more than 1/s for 15m. Ingest is protected; investigate the recipient and the relays delivering the wraps."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashAuthorAnalyticsBacklog
+        expr: nostrmash_pending_author_analytics_recomputes > 20000
+        for: 2h
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Author analytics recompute queue is not draining"
+          description: "pending_author_analytics_recomputes has stayed above 20k for 2h. The sweeper is standing down under database pressure or events that do not affect analytics are still being marked dirty."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashProfileStatsBacklog
+        expr: nostrmash_pending_profile_stats_recomputes > 5000
+        for: 1h
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Profile stats recompute queue is not draining"
+          description: "pending_profile_stats_recomputes has stayed above 5k for 1h. Check profile-stats sweeper errors and database saturation."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashInvalidEventsGrowthHigh
+        expr: nostrmash:storage:heavy_table_growth_bytes_per_hour:6h{table="invalid_events"} > 10485760
+        for: 6h
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "invalid_events table growth is elevated"
+          description: "invalid_events growth exceeds 10 MiB/hour over 6h. Check malformed traffic/relays and invalid_events retention effectiveness."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashDiskUsageHigh
+        expr: nostrmash_storage_pressure_ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          slo: capacity-planning
+        annotations:
+          summary: "Storage pressure is high"
+          description: "Database size exceeds 90% of the configured STORAGE_PRESSURE_CAPACITY_BYTES budget for 10m. The storage governor is running aggressive retention; review high-growth tiers (nostrmash_storage_tier_bytes) and consider raising capacity or tightening retention."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashStoragePressureCritical
+        expr: nostrmash_storage_pressure_level >= 4
+        for: 5m
+        labels:
+          severity: critical
+          slo: capacity-planning
+        annotations:
+          summary: "Storage pressure critical: candidate ingest paused"
+          description: "Storage pressure level 4 (pause_candidate) for 5m. Candidate-expanding ingest is paused and the gate is forced trusted_only. Operator intervention required: expand storage or reduce retained data."
+          runbook: "docs/operations.md#alert-response-playbook"

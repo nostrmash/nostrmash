@@ -1,0 +1,14 @@
+{
+  "body": {
+    "consistency": "eventual",
+    "created_at": 1700000200,
+    "event_id": "relay_evt_1",
+    "projection_v": 1,
+    "pubkey": "pubkey_abc",
+    "relays": [
+      "wss://relay.primal.net",
+      "wss://nos.lol"
+    ]
+  },
+  "status": 200
+}

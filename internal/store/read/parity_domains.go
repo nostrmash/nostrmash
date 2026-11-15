@@ -1,0 +1,678 @@
+package read
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/nostrmash/nostrmash/internal/domainnorm"
+	"github.com/nostrmash/nostrmash/internal/languagelabel"
+)
+
+// domainMediaURLFilterClause excludes obvious media/attachment links.
+// is_media is set at projection time (migration 000088) from the same
+// extension list the regex used to test, so aggregates can use the partial
+// index instead of reading every URL off the heap.
+const domainMediaURLFilterClause = `NOT event_urls.is_media`
+
+func (s *Read) GetEventLinkedDomains(
+	ctx context.Context,
+	eventID string,
+	limit int,
+) ([]EventDomainLinkProjection, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return nil, fmt.Errorf("event id is required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, url, domain
+		FROM event_urls
+		WHERE event_id = $1
+		ORDER BY domain ASC, url ASC
+		LIMIT $2
+	`, eventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get event linked domains: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]EventDomainLinkProjection, 0, limit)
+	for rows.Next() {
+		var row EventDomainLinkProjection
+		if err := rows.Scan(&row.EventID, &row.URL, &row.Domain); err != nil {
+			return nil, fmt.Errorf("scan event linked domain row: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read event linked domain rows: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Read) GetTopDomainsByAuthor(
+	ctx context.Context,
+	pubkey string,
+	window time.Duration,
+	limit int,
+	offset int,
+) ([]DomainStatProjection, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	pubkey = strings.TrimSpace(pubkey)
+	if pubkey == "" {
+		return nil, fmt.Errorf("pubkey is required")
+	}
+	return s.getTopDomains(ctx, window, limit, offset, &pubkey)
+}
+
+func (s *Read) GetTopDomains(
+	ctx context.Context,
+	window time.Duration,
+	limit int,
+	offset int,
+) ([]DomainStatProjection, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	return s.getTopDomains(ctx, window, limit, offset, nil)
+}
+
+func (s *Read) getTopDomains(
+	ctx context.Context,
+	window time.Duration,
+	limit int,
+	offset int,
+	pubkey *string,
+) ([]DomainStatProjection, error) {
+	if window <= 0 {
+		return nil, fmt.Errorf("window must be positive")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	minCreatedAt := time.Now().UTC().Add(-window).Unix()
+	if pubkey == nil {
+		query := fmt.Sprintf(`
+			SELECT
+				canonical_domain,
+				COUNT(*)::bigint AS link_count,
+				COUNT(DISTINCT event_id)::bigint AS note_count,
+				COUNT(DISTINCT author_pubkey)::bigint AS unique_authors
+			FROM event_urls
+			WHERE created_at >= $1
+			  AND %s
+			GROUP BY canonical_domain
+			ORDER BY
+				unique_authors DESC,
+				(COUNT(DISTINCT author_pubkey))::double precision / GREATEST(COUNT(DISTINCT event_id), 1) DESC,
+				note_count DESC,
+				link_count DESC,
+				canonical_domain ASC
+			LIMIT $2 OFFSET $3
+		`, domainMediaURLFilterClause)
+		rows, err := s.pool.Query(ctx, query, minCreatedAt, limit, offset)
+		if err != nil {
+			return nil, fmt.Errorf("get top discovery domains: %w", err)
+		}
+		defer rows.Close()
+		return scanDomainStatRows(rows)
+	}
+	query := fmt.Sprintf(`
+		SELECT
+			canonical_domain,
+			COUNT(*)::bigint AS link_count,
+			COUNT(DISTINCT event_id)::bigint AS note_count,
+			COUNT(DISTINCT author_pubkey)::bigint AS unique_authors
+		FROM event_urls
+		WHERE author_pubkey = $1
+		  AND created_at >= $2
+		  AND %s
+		GROUP BY canonical_domain
+		ORDER BY
+			note_count DESC,
+			link_count DESC,
+			canonical_domain ASC
+		LIMIT $3 OFFSET $4
+	`, domainMediaURLFilterClause)
+	rows, err := s.pool.Query(ctx, query, *pubkey, minCreatedAt, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get top domains by author: %w", err)
+	}
+	defer rows.Close()
+	return scanDomainStatRows(rows)
+}
+
+func (s *Read) GetTrendingDomains(
+	ctx context.Context,
+	window time.Duration,
+	lang string,
+	limit int,
+	offset int,
+) ([]DomainSummaryProjection, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	if window <= 0 {
+		return nil, fmt.Errorf("window must be positive")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > discoveryReadLimit {
+		limit = discoveryReadLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	nowUnix := time.Now().UTC().Unix()
+	day := int64((24 * time.Hour) / time.Second)
+	windowFloor := nowUnix - int64(window/time.Second)
+	args := []any{nowUnix - day, nowUnix - (7 * day), windowFloor, limit, offset}
+	languageJoin := ""
+	languageClause := ""
+	if lang != "" {
+		languageJoin = "JOIN note_discovery_stats nds ON nds.event_id = event_urls.event_id"
+		languageClause = "AND " + languagelabel.FilterSQL("nds", "$6::text")
+		args = append(args, lang)
+	}
+	query := fmt.Sprintf(`
+		SELECT
+			event_urls.canonical_domain,
+			MAX(event_urls.created_at),
+			COUNT(*) FILTER (WHERE event_urls.created_at >= $1),
+			COUNT(DISTINCT event_urls.event_id) FILTER (WHERE event_urls.created_at >= $1),
+			COUNT(DISTINCT event_urls.author_pubkey) FILTER (WHERE event_urls.created_at >= $1),
+			COUNT(*) FILTER (WHERE event_urls.created_at >= $2),
+			COUNT(DISTINCT event_urls.event_id) FILTER (WHERE event_urls.created_at >= $2),
+			COUNT(DISTINCT event_urls.author_pubkey) FILTER (WHERE event_urls.created_at >= $2)
+		FROM event_urls
+		%s
+		WHERE event_urls.created_at >= $3
+		  AND %s
+		  %s
+		GROUP BY event_urls.canonical_domain
+		ORDER BY
+			COUNT(DISTINCT event_urls.author_pubkey) FILTER (WHERE event_urls.created_at >= $3) DESC,
+			(COUNT(DISTINCT event_urls.author_pubkey) FILTER (WHERE event_urls.created_at >= $3))::double precision /
+				GREATEST(COUNT(DISTINCT event_urls.event_id) FILTER (WHERE event_urls.created_at >= $3), 1) DESC,
+			COUNT(DISTINCT event_urls.event_id) FILTER (WHERE event_urls.created_at >= $3) DESC,
+			COUNT(*) FILTER (WHERE event_urls.created_at >= $3) DESC,
+			event_urls.canonical_domain ASC
+		LIMIT $4 OFFSET $5
+	`, languageJoin, domainMediaURLFilterClause, languageClause)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get trending domains: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]DomainSummaryProjection, 0, limit)
+	for rows.Next() {
+		var row DomainSummaryProjection
+		if err := rows.Scan(
+			&row.Domain,
+			&row.LatestEventAt,
+			&row.Activity.Last24h.LinkCount,
+			&row.Activity.Last24h.NoteCount,
+			&row.Activity.Last24h.UniqueAuthors,
+			&row.Activity.Last7d.LinkCount,
+			&row.Activity.Last7d.NoteCount,
+			&row.Activity.Last7d.UniqueAuthors,
+		); err != nil {
+			return nil, fmt.Errorf("scan trending domain row: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read trending domain rows: %w", err)
+	}
+	return out, nil
+}
+
+// domainSnapshotActivityRow mirrors one 24h/7d activity sub-object inside
+// the top_domains_24h / top_domains_7d snapshot payload.
+type domainSnapshotActivityRow struct {
+	LinkCount     int64 `json:"link_count"`
+	NoteCount     int64 `json:"note_count"`
+	UniqueAuthors int64 `json:"unique_authors"`
+}
+
+// domainSnapshotRow mirrors one entry inside the top_domains_24h /
+// top_domains_7d snapshot payload — the same shape GetTrendingDomains scans
+// from a live query, just precomputed.
+type domainSnapshotRow struct {
+	Domain        string                    `json:"domain"`
+	LatestEventAt *int64                    `json:"latest_event_at"`
+	Activity24h   domainSnapshotActivityRow `json:"activity_24h"`
+	Activity7d    domainSnapshotActivityRow `json:"activity_7d"`
+	Activity30d   domainSnapshotActivityRow `json:"activity_30d"`
+}
+
+func domainSummaryFromSnapshot(row domainSnapshotRow) DomainSummaryProjection {
+	return DomainSummaryProjection{
+		Domain:        row.Domain,
+		LatestEventAt: row.LatestEventAt,
+		Activity: DomainActivityStatsProjection{
+			Last24h: domainActivityFromSnapshot(row.Activity24h),
+			Last7d:  domainActivityFromSnapshot(row.Activity7d),
+			Last30d: domainActivityFromSnapshot(row.Activity30d),
+		},
+	}
+}
+
+func domainActivityFromSnapshot(row domainSnapshotActivityRow) DomainActivityProjection {
+	return DomainActivityProjection{
+		LinkCount:     row.LinkCount,
+		NoteCount:     row.NoteCount,
+		UniqueAuthors: row.UniqueAuthors,
+	}
+}
+
+// resolveHomeDomainsSnapshotLabel maps a fixed trending window to the
+// matching precomputed snapshot label. 24h, 7d, and 30d are snapshotted.
+func resolveHomeDomainsSnapshotLabel(window time.Duration) (string, error) {
+	switch window {
+	case 24 * time.Hour:
+		return relaySnapshotLabelTopDomains24h, nil
+	case 7 * 24 * time.Hour:
+		return relaySnapshotLabelTopDomains7d, nil
+	case 30 * 24 * time.Hour:
+		return relaySnapshotLabelTopDomains30d, nil
+	default:
+		return "", fmt.Errorf("unsupported home trending domains window: %s", window)
+	}
+}
+
+// GetHomeTrendingDomains reads the precomputed top-domains list from
+// relay_window_snapshots. The live GetTrendingDomains aggregate (a
+// COUNT(DISTINCT) over event_urls) is CPU-bound at production scale; the
+// homepage's fixed (24h, 7d, top-N) shape is snapshotted out-of-band by
+// internal/derivation/projection_relay_window_snapshots.go on the same
+// cadence as the relay/hashtag/language snapshots. As with those, there is
+// intentionally no live-query fallback if the snapshot row is missing: we
+// serve an empty list and rely on the worker to populate it, rather than
+// reintroduce the multi-second aggregate onto the request path.
+func (s *Read) GetHomeTrendingDomains(
+	ctx context.Context,
+	window time.Duration,
+	lang string,
+	limit int,
+) ([]DomainSummaryProjection, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	label, err := resolveHomeDomainsSnapshotLabel(window)
+	if err != nil {
+		return nil, err
+	}
+	if lang != "" {
+		return s.homeTrendingDomainsForLanguage(ctx, label+".lang", lang, limit)
+	}
+	var payload []byte
+	err = s.pool.QueryRow(ctx, `
+		SELECT payload
+		FROM relay_window_snapshots
+		WHERE snapshot_label = $1
+	`, label).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isUndefinedRelationError(err) {
+			return []DomainSummaryProjection{}, nil
+		}
+		return nil, fmt.Errorf("read top domains snapshot %q: %w", label, err)
+	}
+	var rows []domainSnapshotRow
+	if err := json.Unmarshal(payload, &rows); err != nil {
+		return nil, fmt.Errorf("decode top domains snapshot %q: %w", label, err)
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]DomainSummaryProjection, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domainSummaryFromSnapshot(row))
+	}
+	return out, nil
+}
+
+func (s *Read) homeTrendingDomainsForLanguage(ctx context.Context, label, lang string, limit int) ([]DomainSummaryProjection, error) {
+	payload, err := s.readSnapshotPayload(ctx, label)
+	if err != nil || len(payload) == 0 {
+		return []DomainSummaryProjection{}, err
+	}
+	var byLang map[string][]domainSnapshotRow
+	if err := json.Unmarshal(payload, &byLang); err != nil {
+		return nil, fmt.Errorf("decode top domains snapshot %q: %w", label, err)
+	}
+	rows := byLang[lang]
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]DomainSummaryProjection, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domainSummaryFromSnapshot(row))
+	}
+	return out, nil
+}
+
+func (s *Read) GetDomainSummary(
+	ctx context.Context,
+	domain string,
+	recentLimit int,
+	topLimit int,
+) (DomainSummaryProjection, error) {
+	if s == nil || s.pool == nil {
+		return DomainSummaryProjection{}, fmt.Errorf("store is not initialized")
+	}
+	normalized := domainnorm.CanonicalizeDiscoveryDomain(domain)
+	if normalized == "" {
+		return DomainSummaryProjection{}, ErrNotFound
+	}
+	if recentLimit <= 0 {
+		recentLimit = 5
+	}
+	if recentLimit > 20 {
+		recentLimit = 20
+	}
+	if topLimit <= 0 {
+		topLimit = 5
+	}
+	if topLimit > 20 {
+		topLimit = 20
+	}
+
+	var summary DomainSummaryProjection
+	nowUnix := time.Now().UTC().Unix()
+	day := int64((24 * time.Hour) / time.Second)
+	query := fmt.Sprintf(`
+		SELECT
+			MAX(created_at),
+			COUNT(*) FILTER (WHERE created_at >= $2),
+			COUNT(DISTINCT event_id) FILTER (WHERE created_at >= $2),
+			COUNT(DISTINCT author_pubkey) FILTER (WHERE created_at >= $2),
+			COUNT(*) FILTER (WHERE created_at >= $3),
+			COUNT(DISTINCT event_id) FILTER (WHERE created_at >= $3),
+			COUNT(DISTINCT author_pubkey) FILTER (WHERE created_at >= $3),
+			COUNT(*) FILTER (WHERE created_at >= $4),
+			COUNT(DISTINCT event_id) FILTER (WHERE created_at >= $4),
+			COUNT(DISTINCT author_pubkey) FILTER (WHERE created_at >= $4),
+			COUNT(*),
+			COUNT(DISTINCT event_id),
+			COUNT(DISTINCT author_pubkey)
+		FROM event_urls
+		WHERE canonical_domain = $1
+		  AND %s
+	`, domainMediaURLFilterClause)
+	if err := s.pool.QueryRow(ctx, query, normalized, nowUnix-day, nowUnix-(7*day), nowUnix-(30*day)).Scan(
+		&summary.LatestEventAt,
+		&summary.Activity.Last24h.LinkCount,
+		&summary.Activity.Last24h.NoteCount,
+		&summary.Activity.Last24h.UniqueAuthors,
+		&summary.Activity.Last7d.LinkCount,
+		&summary.Activity.Last7d.NoteCount,
+		&summary.Activity.Last7d.UniqueAuthors,
+		&summary.Activity.Last30d.LinkCount,
+		&summary.Activity.Last30d.NoteCount,
+		&summary.Activity.Last30d.UniqueAuthors,
+		&summary.Activity.All.LinkCount,
+		&summary.Activity.All.NoteCount,
+		&summary.Activity.All.UniqueAuthors,
+	); err != nil {
+		return DomainSummaryProjection{}, fmt.Errorf("get domain summary: %w", err)
+	}
+	if summary.Activity.All.LinkCount == 0 {
+		return DomainSummaryProjection{}, ErrNotFound
+	}
+	summary.Domain = normalized
+
+	recent, err := s.GetDomainNotes(ctx, normalized, "latest", "30d", recentLimit, 0)
+	if err != nil {
+		return DomainSummaryProjection{}, err
+	}
+	top, err := s.GetDomainNotes(ctx, normalized, "top", "30d", topLimit, 0)
+	if err != nil {
+		return DomainSummaryProjection{}, err
+	}
+	summary.RecentNotes = recent
+	summary.TopNotes = top
+	return summary, nil
+}
+
+func (s *Read) GetDomainNotes(
+	ctx context.Context,
+	domain string,
+	sort string,
+	window string,
+	limit int,
+	offset int,
+) ([]TrendingNote, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is not initialized")
+	}
+	normalized := domainnorm.CanonicalizeDiscoveryDomain(domain)
+	if normalized == "" {
+		return nil, ErrNotFound
+	}
+	exists, err := s.hasDomain(ctx, normalized)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+
+	sort = strings.ToLower(strings.TrimSpace(sort))
+	if sort == "" {
+		sort = "latest"
+	}
+	if sort != "latest" && sort != "top" {
+		return nil, fmt.Errorf("unsupported domain notes sort: %s", sort)
+	}
+	window = strings.ToLower(strings.TrimSpace(window))
+	if window == "" {
+		window = "24h"
+	}
+	filterClause, urlsFilter, scoreExpr, err := resolveDomainNotesWindow(window)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Pick the domain's event ids from the covering index first. Joining
+	// every note in the time window and then filtering to this domain made
+	// Postgres walk note_discovery_stats (a cold github.com summary did that
+	// twice and took ~19s). event_urls.created_at is the note timestamp, so
+	// the same window predicate is an index range on
+	// idx_event_urls_domain_activity. Latest notes can stop after `limit`
+	// ids; top notes still have to score each id in the window, but only
+	// the page of winners loads event content.
+	idSource := fmt.Sprintf(`
+		SELECT event_id, MAX(created_at) AS created_at
+		FROM event_urls
+		WHERE canonical_domain = $1
+		  AND %s
+		  AND %s
+		GROUP BY event_id
+	`, domainMediaURLFilterClause, urlsFilter)
+	noteCols := `
+			s.event_id,
+			s.author_pubkey,
+			s.created_at,
+			e.content,
+			s.reply_count,
+			s.repost_count,
+			s.reaction_count,
+			s.zap_count,
+			s.zap_msats,
+			%s AS score`
+	var query string
+	if sort == "latest" {
+		query = fmt.Sprintf(`
+			WITH picked AS (
+				%s
+				ORDER BY MAX(created_at) DESC, event_id DESC
+				LIMIT $2 OFFSET $3
+			)
+			SELECT
+				%s
+			FROM picked
+			JOIN note_discovery_stats s ON s.event_id = picked.event_id
+			JOIN events e ON e.id = s.event_id
+			WHERE %s
+			ORDER BY s.created_at DESC, s.event_id DESC
+		`, idSource, fmt.Sprintf(noteCols, scoreExpr), filterClause)
+	} else {
+		query = fmt.Sprintf(`
+			WITH ranked AS (
+				SELECT
+					s.event_id,
+					s.author_pubkey,
+					s.created_at,
+					s.reply_count,
+					s.repost_count,
+					s.reaction_count,
+					s.zap_count,
+					s.zap_msats,
+					%s AS score
+				FROM (
+					%s
+				) picked
+				JOIN note_discovery_stats s ON s.event_id = picked.event_id
+				WHERE %s
+				ORDER BY score DESC, s.created_at DESC, s.event_id DESC
+				LIMIT $2 OFFSET $3
+			)
+			SELECT
+				ranked.event_id,
+				ranked.author_pubkey,
+				ranked.created_at,
+				e.content,
+				ranked.reply_count,
+				ranked.repost_count,
+				ranked.reaction_count,
+				ranked.zap_count,
+				ranked.zap_msats,
+				ranked.score
+			FROM ranked
+			JOIN events e ON e.id = ranked.event_id
+			ORDER BY ranked.score DESC, ranked.created_at DESC, ranked.event_id DESC
+		`, scoreExpr, idSource, filterClause)
+	}
+
+	rows, err := s.pool.Query(ctx, query, normalized, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get domain notes: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TrendingNote, 0, limit)
+	for rows.Next() {
+		var row TrendingNote
+		if err := rows.Scan(
+			&row.EventID,
+			&row.AuthorPubkey,
+			&row.CreatedAt,
+			&row.Content,
+			&row.ReplyCount,
+			&row.RepostCount,
+			&row.ReactionCount,
+			&row.ZapCount,
+			&row.ZapMSats,
+			&row.Score,
+		); err != nil {
+			return nil, fmt.Errorf("scan domain note row: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read domain note rows: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Read) hasDomain(ctx context.Context, domain string) (bool, error) {
+	var exists bool
+	query := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM event_urls WHERE canonical_domain = $1 AND %s)`, domainMediaURLFilterClause)
+	if err := s.pool.QueryRow(ctx, query, domain).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check domain existence: %w", err)
+	}
+	return exists, nil
+}
+
+// resolveDomainNotesWindow returns the note_discovery_stats predicate, the
+// matching event_urls predicate, and the score expression. The URL predicate
+// must stay equivalent to the stats predicate: both compare the note's
+// created_at, which is stored on event_urls as well.
+func resolveDomainNotesWindow(window string) (string, string, string, error) {
+	switch window {
+	case "24h":
+		cutoff := "extract(epoch from now())::bigint - (24 * 60 * 60)"
+		return "s.created_at >= " + cutoff, "created_at >= " + cutoff, "s.score_24h", nil
+	case "7d":
+		cutoff := "extract(epoch from now())::bigint - (7 * 24 * 60 * 60)"
+		return "s.created_at >= " + cutoff, "created_at >= " + cutoff, "s.score_7d", nil
+	case "30d":
+		cutoff := "extract(epoch from now())::bigint - (30 * 24 * 60 * 60)"
+		return "s.created_at >= " + cutoff,
+			"created_at >= " + cutoff,
+			"((s.reply_count * 3.0) + (s.repost_count * 2.0) + s.reaction_count + (s.zap_count * 2.0) + LN(1.0 + (s.zap_msats / 100000.0))) / (1.0 + ((extract(epoch from now())::bigint - s.created_at) / (30.0 * 24 * 60 * 60)))",
+			nil
+	case "all":
+		return "TRUE",
+			"TRUE",
+			"((s.reply_count * 3.0) + (s.repost_count * 2.0) + s.reaction_count + (s.zap_count * 2.0) + LN(1.0 + (s.zap_msats / 100000.0)))",
+			nil
+	default:
+		return "", "", "", fmt.Errorf("unsupported domain notes window: %s", window)
+	}
+}
+
+func scanDomainStatRows(rows pgx.Rows) ([]DomainStatProjection, error) {
+	out := make([]DomainStatProjection, 0)
+	for rows.Next() {
+		var row DomainStatProjection
+		if err := rows.Scan(&row.Domain, &row.LinkCount, &row.NoteCount, &row.UniqueAuthors); err != nil {
+			return nil, fmt.Errorf("scan top domain row: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read top domain rows: %w", err)
+	}
+	return out, nil
+}

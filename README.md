@@ -1,0 +1,301 @@
+# NostrMash
+
+Run your own Nostr data plane with durable ingest, rebuildable read models, and plug-in compatibility for existing clients.
+
+![NostrMash hero](docs/readme-hero.svg)
+
+[![CI](https://github.com/nostrmash/nostrmash/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nostrmash/nostrmash/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/nostrmash/nostrmash?display_name=tag)](https://github.com/nostrmash/nostrmash/releases)
+[![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Postgres primary](https://img.shields.io/badge/postgres-primary-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Docker first](https://img.shields.io/badge/docker-first-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Primal compatibility](https://img.shields.io/badge/primal-cache_compatibility-8B5CF6)](docs/primal_compatibility_matrix.md)
+[![Self-hostable](https://img.shields.io/badge/self--hostable-0F766E)](docs/coolify.md)
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue)](LICENSE)
+
+NostrMash is a Go-based, Docker-native Nostr ingestion and indexing platform for teams that want to own their Nostr backend instead of renting a black box. It connects to relays, stores canonical raw events durably in Postgres, then builds higher-level read models asynchronously for profiles, replies, threads, counts, trust outputs, and product-facing query surfaces.
+
+The design goal is simple: keep raw Nostr truth durable, inspectable, and replayable, while keeping product-facing state rebuildable and versioned. It is Docker-first so self-hosting stays low-friction, and Primal-compatible at the boundary so clients already shaped around Primal Cache can adopt it without an all-at-once rewrite.
+
+The public explorer is [nostrmash-web](https://github.com/nostrmash/nostrmash-web). SmartFlowSocial's [cache worker](https://github.com/smartflowsocial/smartflowsocial-cache-worker) calls this API before it falls back to Primal.
+
+## At a glance
+
+| Area | Value |
+| --- | --- |
+| Runtime | Go `1.26+` (CI/Docker pin `1.26.10`) |
+| Primary datastore | Postgres (canonical) |
+| Trust working state | Redis |
+| Deployment posture | Docker-first, self-hostable |
+| Services | `api`, `ingestor`, `worker`, `trust_worker` |
+| Search backend | Meilisearch (optional), Postgres fallback |
+| Default API address | `http://localhost:8080` |
+| Ingest runtime modes | `live`, `replay` |
+| Bootstrap options | optional `backfill` |
+| License | [Unlicense](LICENSE) (public domain) |
+
+## Why this exists
+
+Most ingest systems get into trouble when they collapse durable truth and read-time convenience into the same layer. NostrMash keeps those concerns separate:
+
+- raw events are stored first and treated as durable truth
+- invalid payloads are quarantined instead of disappearing silently
+- derived state is asynchronous and rebuildable
+- projection changes are explicit, versioned, and observable
+
+The result is a system that can ingest like infrastructure, evolve like an application, and recover like an operated platform.
+
+Three design choices follow from that:
+
+- **run your own instance easily**: Docker compatibility is a first-class choice, not an afterthought, so local boot and self-hosted deployment stay low-friction
+- **keep core truth separate from product shape**: canonical ingest stays durable while read models remain explicit, rebuildable, and replaceable
+- **adopt without rewriting everything at once**: the Primal-compatible HTTP and WebSocket boundary exists so environments already using Primal Cache-style surfaces can integrate NostrMash as a practical replacement path
+
+## System model
+
+NostrMash runs as six cooperating pieces, plus an optional search backend:
+
+- `api` serves the native API, the Primal-compatible boundary for Primal Cache-style integration, health/metrics, and operator-facing admin endpoints
+- `ingestor` connects to relays, validates payloads, optionally gates canonical writes by trust (kind-1 author / engagement target), writes canonical rows, records checkpoints, and enqueues derivation work
+- `worker` drains the default Postgres-backed job queue, materializes derived state, and purges aged raw engagement events
+- `trust_worker` reconciles seeds, refreshes `trust_graph_snapshot`, runs trust-specific jobs, and promotes published trust outputs (Redis optional)
+- `postgres` is the canonical store for raw events, checkpoints, queue state, derivation metadata, projections, and published trust outputs
+- `redis` is disposable working state for the trust pipeline
+- `meilisearch` (optional, enabled in the checked-in compose stack) backs full-text search; when disabled or unavailable, search endpoints fall back to the Postgres search path
+
+![NostrMash system overview](docs/readme-system-overview.svg)
+
+## Start here
+
+Choose the path that matches what you need:
+
+| If you are... | Start here | Then read |
+| --- | --- | --- |
+| New to the project | [docs/architecture.md](docs/architecture.md) | [docs/api.md](docs/api.md) |
+| Booting locally | [docs/development.md](docs/development.md) | [docs/architecture.md](docs/architecture.md) |
+| Deploying to production | [docs/coolify.md](docs/coolify.md) | [docs/operations.md](docs/operations.md) |
+| Operating the stack | [docs/operations.md](docs/operations.md) | [docs/observability.md](docs/observability.md) |
+| Integrating with the API | [docs/api.md](docs/api.md) | [docs/openapi.yaml](docs/openapi.yaml) |
+| Replacing or mirroring Primal Cache | [docs/primal_compatibility_matrix.md](docs/primal_compatibility_matrix.md) | [docs/compatibility_rollout.md](docs/compatibility_rollout.md) |
+| Contributing changes | [CONTRIBUTING.md](CONTRIBUTING.md) | [docs/testing.md](docs/testing.md) |
+| Operating compatibility surfaces | [docs/primal_compatibility_matrix.md](docs/primal_compatibility_matrix.md) | [docs/compatibility_rollout.md](docs/compatibility_rollout.md) |
+| Planning trust and ranking work | [docs/architecture/trust-subsystem.md](docs/architecture/trust-subsystem.md) | [docs/architecture/trust-bounded-ingest.md](docs/architecture/trust-bounded-ingest.md) |
+| Bounding storage after deploy/wipe | [docs/architecture/trust-bounded-ingest.md](docs/architecture/trust-bounded-ingest.md) | [docs/operations.md#trust-bounded-ingest-rollout](docs/operations.md#trust-bounded-ingest-rollout) |
+
+For the complete docs hub and source-of-truth map, use [docs/README.md](docs/README.md).
+
+## Quick start
+
+Bring up the local stack:
+
+```bash
+docker compose up --build
+```
+
+Verify the stack:
+
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+curl http://localhost:8080/metrics
+```
+
+What this starts:
+
+- `postgres`
+- `redis`
+- `meilisearch`
+- `api`
+- `ingestor`
+- `worker`
+- `trust_worker`
+
+Runtime notes:
+
+- migrations are embedded and run on service startup
+- the local ingestor is configured for `live` mode with the `default_v1` filter group
+- admin routes require `ADMIN_BEARER_TOKEN`; without it, `/admin/*` returns `503 admin_unavailable`
+- relay settings can be overridden at boot, for example `INGESTOR_RELAY_URLS=... INGESTOR_RELAY_ALLOWLIST=... docker compose up --build`
+
+### Meilisearch operations
+
+Meilisearch is optional and can be turned on per deployment:
+
+- enable with `MEILI_ENABLED=true`
+- set the endpoint with `MEILI_URL` (for Docker Compose: `http://meilisearch:7700`)
+- provide credentials with `MEILI_MASTER_KEY` (and optionally `MEILI_SEARCH_API_KEY`)
+
+When disabled or unavailable, search endpoints automatically fall back to the Postgres search path.
+
+Run a full Meilisearch backfill (notes, profiles, documents) from the admin API:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $ADMIN_BEARER_TOKEN" \
+  "http://localhost:8080/admin/v1/search/meilisearch/sync?batch_size=1000"
+```
+
+Runtime behavior:
+
+- API startup ensures Meilisearch indexes and settings when enabled
+- worker derivation runs best-effort per-event sync into Meilisearch
+- sync errors do not fail canonical projection jobs; Postgres remains source of truth
+
+### First 60 seconds
+
+Use this sequence to confirm that the system is not only up, but actually doing its job:
+
+1. Check process health:
+
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+```
+
+2. Check persisted relay ingest state from the public API:
+
+```bash
+curl http://localhost:8080/api/v1/relays/health
+```
+
+3. If you have `ADMIN_BEARER_TOKEN`, check the operator snapshot:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_BEARER_TOKEN" \
+  http://localhost:8080/admin/v1/system
+curl -H "Authorization: Bearer $ADMIN_BEARER_TOKEN" \
+  http://localhost:8080/admin/v1/relays
+```
+
+4. Once relay data has arrived, try a real content read:
+
+```bash
+curl "http://localhost:8080/api/v1/events/<event-id>"
+curl "http://localhost:8080/api/v1/profiles/<pubkey>"
+```
+
+A successful event read returns the canonical event plus relay provenance:
+
+```json
+{
+  "event": {
+    "id": "8f0c1d...",
+    "pubkey": "82341f...",
+    "kind": 1,
+    "created_at": 1721390000,
+    "content": "gm nostr",
+    "tags": [],
+    "sig": "a6b3d2..."
+  },
+  "provenance": {
+    "relays": [
+      { "relay_url": "wss://relay.damus.io", "seen_at": "2026-07-19T12:00:05Z" }
+    ]
+  },
+  "consistency": "strong"
+}
+```
+
+The first two steps are deterministic and should work on any healthy local boot. The content reads depend on what your configured relays have delivered so far; `not_found` usually means the ingestor has not seen that object locally yet.
+
+If you want the day-to-day local workflow instead of the one-command boot path, go to [docs/development.md](docs/development.md).
+
+## Quality checks
+
+Use [CONTRIBUTING.md](CONTRIBUTING.md) as the contributor entrypoint. The canonical reproducible verification path (pinned toolchain + ephemeral Postgres) is:
+
+```bash
+make verify-docker
+```
+
+Use `make verify-local` or `make ci` when you already have Go `1.26.10` and local dependencies aligned and want faster inner-loop checks.
+
+Common local follow-up commands:
+
+```bash
+make format
+make cover
+```
+
+## Go toolchain policy
+
+- Minimum supported language/runtime version: Go `1.26` (`go.mod` uses `go 1.26`)
+- Recommended local toolchain: Go `1.26.10` (`go.mod` uses `toolchain go1.26.10`)
+- CI and Docker builders are pinned to Go `1.26.10` for reproducible verification (including `make verify-docker`)
+
+Why this split:
+
+- `go` directive communicates the minimum supported major/minor line for contributors
+- exact patch pinning is handled by CI/Docker, while the `toolchain` directive keeps local behavior consistent when your installed Go supports toolchain auto-selection
+
+## Local verification commands
+
+Prefer the containerized path for outsider/reviewer verification:
+
+```bash
+make verify-docker
+```
+
+Use local/native commands when validating changes against the intended Go `1.26.x` policy:
+
+```bash
+# Build
+make build
+
+# Test (full)
+make test
+
+# Lint
+make lint
+
+# Integration-backed parity (requires Postgres)
+export TEST_DATABASE_URL=postgres://nostrmash:nostrmash@localhost:5432/nostrmash?sslmode=disable
+make ci
+```
+
+Integration test note:
+
+- DB-backed integration tests require `TEST_DATABASE_URL` or `DATABASE_URL`
+- the checked-in `docker-compose.yml` publishes Postgres on `localhost:5432`
+- for local CI parity, `docker compose up -d postgres` is enough for host-based test runs
+
+Example:
+
+```bash
+export TEST_DATABASE_URL=postgres://nostrmash:nostrmash@localhost:5432/nostrmash?sslmode=disable
+make ci
+```
+
+## Repository layout
+
+- `cmd/api`, `cmd/ingestor`, `cmd/worker`, `cmd/trust_worker`: service entrypoints
+- `cmd/configdoc`, `cmd/rulecheck`: repo maintenance helpers for generated config docs and rule validation
+- `internal/api`: native read API and admin handlers
+- `internal/api_primal`: compatibility HTTP and WebSocket boundary for `/primal`
+- `internal/ingestor`: live relay handling, backfill, and relay lifecycle management
+- `internal/nostr`: event parsing and validation
+- `internal/store`: Postgres access, migrations, checkpoints, canonical read/write paths
+- `internal/derivation`: projection handlers, versioning, and rebuild orchestration
+- `internal/jobs`: Postgres-backed queue
+- `internal/query`, `internal/config`, `internal/metrics`, `internal/runtimebootstrap`: shared read orchestration, config, telemetry, and runtime startup wiring
+- `internal/trust`, `internal/worker`: trust/ranking pipeline and shared worker runtime behavior
+- `internal/replay`, `internal/archtest`: deterministic replay tooling and architectural boundary checks
+- `migrations`: embedded schema migrations
+
+## Status and scope
+
+- Postgres remains the canonical datastore in this repository today
+- the compatibility HTTP and WebSocket surface implements the currently supported legacy-shaped cache/API surface documented in this repository
+- use [docs/primal_compatibility_matrix.md](docs/primal_compatibility_matrix.md) for the current compatibility inventory and [docs/compatibility_rollout.md](docs/compatibility_rollout.md) for operational guidance
+- trust and ranking are active repository surfaces; see [docs/architecture/trust-subsystem.md](docs/architecture/trust-subsystem.md) and the storage-bounding ingest gate in [docs/architecture/trust-bounded-ingest.md](docs/architecture/trust-bounded-ingest.md)
+
+## Project policy references
+
+- contributor workflow: [CONTRIBUTING.md](CONTRIBUTING.md)
+- security reporting and dependency hygiene: [SECURITY.md](SECURITY.md)
+- release flow and artifact verification: [RELEASE.md](RELEASE.md)
+- migration safety: [docs/migrations.md](docs/migrations.md)
+- compatibility policy: [docs/compatibility.md](docs/compatibility.md)
+- versioning contract: [VERSIONING.md](VERSIONING.md)
+- changelog policy: [CHANGELOG.md](CHANGELOG.md)
+- license: [LICENSE](LICENSE) (Unlicense, public domain)

@@ -1,0 +1,482 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/query"
+	"github.com/nostrmash/nostrmash/internal/store"
+	storeread "github.com/nostrmash/nostrmash/internal/store/read"
+	storetrust "github.com/nostrmash/nostrmash/internal/store/trust"
+)
+
+func TestSearchDedicatedRoutes_Success(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		searchNotesFn: func(_ context.Context, q string, sort string, window *time.Duration, language string, limit int, offset int) ([]json.RawMessage, error) {
+			if q != "nostr" {
+				return []json.RawMessage{}, nil
+			}
+			if sort != "latest" {
+				t.Fatalf("unexpected notes sort: %q", sort)
+			}
+			if window == nil || *window != 7*24*time.Hour {
+				t.Fatalf("unexpected notes window: %#v", window)
+			}
+			if language != "en" {
+				t.Fatalf("unexpected notes language: %q", language)
+			}
+			if limit != 2 || offset != 1 {
+				t.Fatalf("unexpected notes pagination: limit=%d offset=%d", limit, offset)
+			}
+			return []json.RawMessage{
+				json.RawMessage(`{"id":"note_1"}`),
+				json.RawMessage(`{"id":"note_2"}`),
+			}, nil
+		},
+		searchProfilesWithOptionsFn: func(_ context.Context, q string, sort string, limit int, offset int) ([]store.ProfileProjection, error) {
+			if q == "nost" {
+				return []store.ProfileProjection{
+					{
+						Pubkey:            "pk_suggest",
+						MetadataEventID:   "meta_suggest",
+						MetadataCreatedAt: 1710001000,
+						ProfileJSON:       json.RawMessage(`{"name":"nostr fan"}`),
+					},
+				}, nil
+			}
+			if q != "alice" {
+				t.Fatalf("unexpected profiles query: %q", q)
+			}
+			if sort != "relevant" {
+				t.Fatalf("unexpected profiles sort: %q", sort)
+			}
+			if limit != 2 || offset != 3 {
+				t.Fatalf("unexpected profiles pagination: limit=%d offset=%d", limit, offset)
+			}
+			return []store.ProfileProjection{
+				{
+					Pubkey:            "pk_alice",
+					MetadataEventID:   "meta_1",
+					MetadataCreatedAt: 1710000000,
+					ProfileJSON:       json.RawMessage(`{"name":"alice"}`),
+				},
+			}, nil
+		},
+		suggestProfilesFn: func(_ context.Context, q string, limit int) ([]store.ProfileProjection, error) {
+			if q != "nost" {
+				t.Fatalf("unexpected suggest profile query: %q", q)
+			}
+			if limit != 2 {
+				t.Fatalf("unexpected suggest profile limit: %d", limit)
+			}
+			return []store.ProfileProjection{
+				{
+					Pubkey:            "pk_suggest",
+					MetadataEventID:   "meta_suggest",
+					MetadataCreatedAt: 1710001000,
+					ProfileJSON:       json.RawMessage(`{"name":"nostr fan"}`),
+				},
+			}, nil
+		},
+		suggestHashtagsFn: func(_ context.Context, q string, limit int) ([]storeread.TrendingHashtag, error) {
+			if q != "nost" {
+				t.Fatalf("unexpected suggest hashtag query: %q", q)
+			}
+			if limit != 2 {
+				t.Fatalf("unexpected suggest hashtag limit: %d", limit)
+			}
+			return []storeread.TrendingHashtag{
+				{Hashtag: "nostr", EventCount: 12, UniqueAuthors: 9},
+			}, nil
+		},
+	}, 200)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/search/notes", h.SearchNotes)
+	mux.HandleFunc("GET /api/v1/search/profiles", h.SearchProfiles)
+	mux.HandleFunc("GET /api/v1/search/suggest", h.SearchSuggest)
+
+	notesReq := httptest.NewRequest(http.MethodGet, "/api/v1/search/notes?q=nostr&sort=latest&window=7d&lang=en&limit=2&offset=1", nil)
+	notesRec := httptest.NewRecorder()
+	mux.ServeHTTP(notesRec, notesReq)
+	if notesRec.Code != http.StatusOK {
+		t.Fatalf("unexpected notes status: got %d want %d", notesRec.Code, http.StatusOK)
+	}
+	var notesBody struct {
+		Query        string            `json:"query"`
+		Sort         string            `json:"sort"`
+		Window       string            `json:"window"`
+		Notes        []json.RawMessage `json:"notes"`
+		Limit        int               `json:"limit"`
+		Offset       int               `json:"offset"`
+		Lang         string            `json:"lang"`
+		TrustMode    string            `json:"trust_mode"`
+		TrustApplied bool              `json:"trust_applied"`
+		ResultScope  string            `json:"result_scope"`
+	}
+	if err := json.Unmarshal(notesRec.Body.Bytes(), &notesBody); err != nil {
+		t.Fatalf("decode notes response: %v", err)
+	}
+	if notesBody.Query != "nostr" || notesBody.Sort != "latest" || notesBody.Window != "7d" || notesBody.Lang != "en" {
+		t.Fatalf("unexpected notes contract values: %#v", notesBody)
+	}
+	if len(notesBody.Notes) != 2 || notesBody.Limit != 2 || notesBody.Offset != 1 {
+		t.Fatalf("unexpected notes payload: %#v", notesBody)
+	}
+	if notesBody.TrustMode != "open" || notesBody.TrustApplied || notesBody.ResultScope != "open" {
+		t.Fatalf("unexpected notes trust metadata: %#v", notesBody)
+	}
+
+	profilesReq := httptest.NewRequest(http.MethodGet, "/api/v1/search/profiles?q=alice&limit=2&offset=3", nil)
+	profilesRec := httptest.NewRecorder()
+	mux.ServeHTTP(profilesRec, profilesReq)
+	if profilesRec.Code != http.StatusOK {
+		t.Fatalf("unexpected profiles status: got %d want %d", profilesRec.Code, http.StatusOK)
+	}
+	var profilesBody struct {
+		Query    string `json:"query"`
+		Sort     string `json:"sort"`
+		Profiles []struct {
+			Pubkey string `json:"pubkey"`
+		} `json:"profiles"`
+		Limit        int    `json:"limit"`
+		Offset       int    `json:"offset"`
+		TrustMode    string `json:"trust_mode"`
+		TrustApplied bool   `json:"trust_applied"`
+		ResultScope  string `json:"result_scope"`
+	}
+	if err := json.Unmarshal(profilesRec.Body.Bytes(), &profilesBody); err != nil {
+		t.Fatalf("decode profiles response: %v", err)
+	}
+	if profilesBody.Query != "alice" || profilesBody.Sort != "relevant" {
+		t.Fatalf("unexpected profiles contract values: %#v", profilesBody)
+	}
+	if len(profilesBody.Profiles) != 1 || profilesBody.Profiles[0].Pubkey != "pk_alice" {
+		t.Fatalf("unexpected profiles payload: %#v", profilesBody.Profiles)
+	}
+	if profilesBody.Limit != 2 || profilesBody.Offset != 3 {
+		t.Fatalf("unexpected profiles pagination in response: %#v", profilesBody)
+	}
+	if profilesBody.TrustMode != "prefer_trusted" || !profilesBody.TrustApplied || profilesBody.ResultScope != "prefer_trusted" {
+		t.Fatalf("unexpected profiles trust metadata: %#v", profilesBody)
+	}
+
+	suggestReq := httptest.NewRequest(http.MethodGet, "/api/v1/search/suggest?q=nost&limit=2", nil)
+	suggestRec := httptest.NewRecorder()
+	mux.ServeHTTP(suggestRec, suggestReq)
+	if suggestRec.Code != http.StatusOK {
+		t.Fatalf("unexpected suggest status: got %d want %d", suggestRec.Code, http.StatusOK)
+	}
+	var suggestBody struct {
+		Query    string `json:"query"`
+		Profiles []struct {
+			Pubkey string `json:"pubkey"`
+		} `json:"profiles"`
+		Hashtags []struct {
+			Hashtag string `json:"hashtag"`
+		} `json:"hashtags"`
+	}
+	if err := json.Unmarshal(suggestRec.Body.Bytes(), &suggestBody); err != nil {
+		t.Fatalf("decode suggest response: %v", err)
+	}
+	if suggestBody.Query != "nost" {
+		t.Fatalf("unexpected suggest query echo: %#v", suggestBody)
+	}
+	if len(suggestBody.Profiles) != 1 || suggestBody.Profiles[0].Pubkey != "pk_suggest" {
+		t.Fatalf("unexpected suggest profile payload: %#v", suggestBody.Profiles)
+	}
+	if len(suggestBody.Hashtags) != 1 || suggestBody.Hashtags[0].Hashtag != "nostr" {
+		t.Fatalf("unexpected suggest hashtag payload: %#v", suggestBody.Hashtags)
+	}
+}
+
+func TestSearchDedicatedRoutes_Validation(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{}, 200)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/search/notes", h.SearchNotes)
+	mux.HandleFunc("GET /api/v1/search/profiles", h.SearchProfiles)
+	mux.HandleFunc("GET /api/v1/search/suggest", h.SearchSuggest)
+
+	cases := []string{
+		"/api/v1/search/notes?q=",
+		"/api/v1/search/notes?q=ok&sort=top",
+		"/api/v1/search/notes?q=ok&window=2d",
+		"/api/v1/search/notes?q=ok&lang=en-US",
+		"/api/v1/search/notes?q=ok&offset=-1",
+		"/api/v1/search/profiles?q=",
+		"/api/v1/search/profiles?q=ok&sort=top",
+		"/api/v1/search/suggest?q=ok&limit=0",
+	}
+	for _, path := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("unexpected status for %s: got %d want %d", path, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestSearchSuggest_EmptyAndShortQueryReturnsEmpty(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{}, 200)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/search/suggest", h.SearchSuggest)
+	cases := []string{
+		"/api/v1/search/suggest?q=",
+		"/api/v1/search/suggest?q=n",
+		"/api/v1/search/suggest?q=%23",
+	}
+	for _, path := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status for %s: got %d want %d", path, rec.Code, http.StatusOK)
+		}
+		var body struct {
+			Profiles []any `json:"profiles"`
+			Hashtags []any `json:"hashtags"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode suggest empty response: %v", err)
+		}
+		if len(body.Profiles) != 0 || len(body.Hashtags) != 0 {
+			t.Fatalf("expected empty suggestions for %s, got %#v", path, body)
+		}
+	}
+}
+
+func TestSearchCombinedRoute_RemainsIntact(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		searchEventsFn: func(_ context.Context, q string, limit int) ([]json.RawMessage, error) {
+			if q != "nostr" || limit != 1 {
+				t.Fatalf("unexpected combined events args: q=%q limit=%d", q, limit)
+			}
+			return []json.RawMessage{json.RawMessage(`{"id":"evt_1"}`)}, nil
+		},
+		searchProfilesFn: func(_ context.Context, q string, limit int) ([]store.ProfileProjection, error) {
+			if q != "nostr" || limit != 1 {
+				t.Fatalf("unexpected combined profiles args: q=%q limit=%d", q, limit)
+			}
+			return []store.ProfileProjection{
+				{Pubkey: "pk_1", ProfileJSON: json.RawMessage(`{"name":"one"}`)},
+			}, nil
+		},
+	}, 200)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/search?q=nostr&limit=1", nil)
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(h.Search).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode combined response: %v", err)
+	}
+	if _, ok := body["events"]; !ok {
+		t.Fatalf("combined response missing events: %#v", body)
+	}
+	if _, ok := body["profiles"]; !ok {
+		t.Fatalf("combined response missing profiles: %#v", body)
+	}
+	if body["trust_mode"] != "prefer_trusted" || body["trust_applied"] != true || body["result_scope"] != "prefer_trusted" {
+		t.Fatalf("unexpected combined trust metadata: %#v", body)
+	}
+	if _, ok := body["suggested_profiles"]; ok {
+		t.Fatalf("did not expect suggested_profiles without include=suggest: %#v", body)
+	}
+}
+
+func TestSearchCombinedRoute_IncludeSuggest(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		searchEventsFn: func(_ context.Context, q string, limit int) ([]json.RawMessage, error) {
+			return []json.RawMessage{json.RawMessage(`{"id":"evt_1"}`)}, nil
+		},
+		searchProfilesFn: func(_ context.Context, q string, limit int) ([]store.ProfileProjection, error) {
+			return []store.ProfileProjection{
+				{Pubkey: "pk_1", ProfileJSON: json.RawMessage(`{"name":"one"}`)},
+			}, nil
+		},
+		suggestProfilesFn: func(_ context.Context, q string, limit int) ([]store.ProfileProjection, error) {
+			if q != "nostr" {
+				t.Fatalf("unexpected suggest query: %q", q)
+			}
+			return []store.ProfileProjection{
+				{Pubkey: "pk_suggest", ProfileJSON: json.RawMessage(`{"name":"suggested"}`)},
+			}, nil
+		},
+		suggestHashtagsFn: func(_ context.Context, q string, limit int) ([]storeread.TrendingHashtag, error) {
+			return []storeread.TrendingHashtag{
+				{Hashtag: "nostr", EventCount: 3, UniqueAuthors: 2},
+			}, nil
+		},
+	}, 200)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/search?q=nostr&limit=5&include=suggest", nil)
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(h.Search).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode combined response: %v", err)
+	}
+	if _, ok := body["suggested_profiles"]; !ok {
+		t.Fatalf("expected suggested_profiles with include=suggest: %#v", body)
+	}
+	if _, ok := body["suggested_hashtags"]; !ok {
+		t.Fatalf("expected suggested_hashtags with include=suggest: %#v", body)
+	}
+	if _, ok := body["section_totals"]; !ok {
+		t.Fatalf("expected section_totals with include=suggest: %#v", body)
+	}
+	include, _ := body["include"].([]any)
+	if len(include) != 1 || include[0] != "suggest" {
+		t.Fatalf("unexpected include echo: %#v", body["include"])
+	}
+}
+
+func TestSearchProfiles_TrustMetadataByMode(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name                string
+		mode                string
+		expectedApplied     bool
+		expectedResultScope string
+	}{
+		{name: "open", mode: "open", expectedApplied: false, expectedResultScope: "open"},
+		{name: "prefer_trusted", mode: "prefer_trusted", expectedApplied: true, expectedResultScope: "prefer_trusted"},
+		{name: "trusted_only", mode: "trusted_only", expectedApplied: true, expectedResultScope: "trusted_only"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			h := mustNewHandlersWithOptions(t, trustQualifiedFakeReader{
+				fakeEventReader: fakeEventReader{
+					searchProfilesWithOptionsFn: func(_ context.Context, _ string, _ string, _ int, _ int) ([]store.ProfileProjection, error) {
+						return []store.ProfileProjection{
+							{Pubkey: "pk_trusted", ProfileJSON: json.RawMessage(`{"name":"trusted"}`)},
+							{Pubkey: "pk_open", ProfileJSON: json.RawMessage(`{"name":"open"}`)},
+						}, nil
+					},
+				},
+				getTrustQualificationsFn: func(_ context.Context, pubkeys []string, _ storetrust.TrustQualificationPolicy) (map[string]storetrust.TrustQualification, error) {
+					out := make(map[string]storetrust.TrustQualification, len(pubkeys))
+					for _, pubkey := range pubkeys {
+						out[pubkey] = storetrust.TrustQualification{Pubkey: pubkey, Trusted: pubkey == "pk_trusted"}
+					}
+					return out, nil
+				},
+				isTrustedAuthorFn: func(_ context.Context, pubkey string, _ storetrust.TrustQualificationPolicy) (bool, error) {
+					return pubkey == "pk_trusted", nil
+				},
+			}, HandlersOptions{
+				MaxBatchSize: 200,
+				QueryOptions: query.ServiceOptions{
+					SearchRankingTrustMode: tc.mode,
+				},
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/search/profiles?q=alice&limit=2", nil)
+			rec := httptest.NewRecorder()
+			http.HandlerFunc(h.SearchProfiles).ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+			}
+
+			var body struct {
+				TrustMode    string `json:"trust_mode"`
+				TrustApplied bool   `json:"trust_applied"`
+				ResultScope  string `json:"result_scope"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if body.TrustMode != tc.mode {
+				t.Fatalf("unexpected trust_mode: got %q want %q", body.TrustMode, tc.mode)
+			}
+			if body.TrustApplied != tc.expectedApplied {
+				t.Fatalf("unexpected trust_applied: got %v want %v", body.TrustApplied, tc.expectedApplied)
+			}
+			if body.ResultScope != tc.expectedResultScope {
+				t.Fatalf("unexpected result_scope: got %q want %q", body.ResultScope, tc.expectedResultScope)
+			}
+		})
+	}
+}
+
+func TestSearchNotes_BackendErrorReturnsDegradedEmpty(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		searchNotesFn: func(_ context.Context, _ string, _ string, _ *time.Duration, _ string, _ int, _ int) ([]json.RawMessage, error) {
+			return nil, errors.New("search timeout")
+		},
+	}, 200)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/search/notes?q=nostr", nil)
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(h.SearchNotes).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["degraded"] != true {
+		t.Fatalf("expected degraded payload, got %#v", body)
+	}
+}
+
+func TestSearchProfiles_BackendErrorReturnsDegradedEmpty(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		searchProfilesWithOptionsFn: func(_ context.Context, _ string, _ string, _ int, _ int) ([]store.ProfileProjection, error) {
+			return nil, errors.New("meili timeout")
+		},
+	}, 200)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/search/profiles?q=alice", nil)
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(h.SearchProfiles).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["degraded"] != true {
+		t.Fatalf("expected degraded payload, got %#v", body)
+	}
+	profiles, ok := body["profiles"].([]any)
+	if !ok || len(profiles) != 0 {
+		t.Fatalf("expected empty profiles, got %#v", body["profiles"])
+	}
+}
+
+func TestSearchSuggest_BackendErrorReturnsDegradedEmpty(t *testing.T) {
+	h := mustNewHandlers(t, fakeEventReader{
+		suggestProfilesFn: func(_ context.Context, _ string, _ int) ([]store.ProfileProjection, error) {
+			return nil, errors.New("suggest timeout")
+		},
+	}, 200)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/search/suggest?q=al", nil)
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(h.SearchSuggest).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["degraded"] != true {
+		t.Fatalf("expected degraded payload, got %#v", body)
+	}
+}

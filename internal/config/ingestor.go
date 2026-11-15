@@ -1,0 +1,344 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+)
+
+// IngestorRuntimeConfig owns ingestor-only runtime switches.
+type IngestorRuntimeConfig struct {
+	Mode string
+	// DedupCacheSize bounds the in-memory LRU of recently persisted event
+	// IDs consulted before validation on the live hot path. 0 disables.
+	DedupCacheSize int
+	// DropBridged drops events carrying a NIP-48 proxy tag before the trust
+	// gate, in every gate mode. NostrMash indexes Nostr-native content.
+	DropBridged bool
+}
+
+// IngestorConfig owns ingestor runtime configuration plus shared settings.
+type IngestorConfig struct {
+	Shared                  SharedConfig
+	Runtime                 IngestorRuntimeConfig
+	Relay                   RelayConfig
+	Backfill                BackfillConfig
+	Replay                  ReplayConfig
+	TrustPrioritization     IngestorTrustPrioritizationConfig
+	TrustFetch              IngestorTrustFetchConfig
+	ContactCrawl            IngestorContactCrawlConfig
+	TrustGate               IngestorTrustGateConfig
+	AuthorMetadataDiscovery IngestorAuthorMetadataDiscoveryConfig
+	AccountObservation      IngestorAccountObservationConfig
+	RelayRegistry           RelayRegistryConfig
+}
+
+// IngestorAccountObservationConfig controls the cheap, counts-only observation
+// accounting on the live hot path. Observe() only buffers in memory; this loop
+// batches the account_states UPSERT.
+type IngestorAccountObservationConfig struct {
+	Enabled       bool
+	FlushInterval time.Duration
+	MaxBufferKeys int
+}
+
+// IngestorTrustGateConfig controls trust-bounded canonical ingest enforcement
+// in the live hot path. Mode "open" runs in shadow (records metrics, never
+// rejects); "trusted_only" enforces the gate (kind 1 must be from a trusted
+// author; kinds 6/7/9735 must target an already-stored event).
+type IngestorTrustGateConfig struct {
+	Mode                     string
+	RefreshInterval          time.Duration
+	MaxHops                  int
+	GiftWrapRecipientPerHour int
+}
+
+// IngestorAuthorMetadataDiscoveryConfig controls the background loop that
+// fetches kind-0 metadata from relays for note authors whose metadata was
+// never ingested.
+type IngestorAuthorMetadataDiscoveryConfig struct {
+	Enabled           bool
+	BatchSize         int
+	Interval          time.Duration
+	PageLimitPerRelay int
+}
+
+type IngestorTrustPrioritizationConfig struct {
+	Enabled    bool
+	TopPubkeys int
+}
+
+type IngestorTrustFetchConfig struct {
+	Enabled               bool
+	MaxTrackedPubkeys     int
+	MaxSelectedPerCycle   int
+	RefreshInterval       time.Duration
+	FetchCooldown         time.Duration
+	StableWindow          time.Duration
+	MaxPromotionsPerCycle int
+	RecentLookbackSeconds int64
+	PageLimitPerRelay     int
+	RetryDelay            time.Duration
+}
+
+// IngestorContactCrawlConfig controls the paced kind-3 contact-list crawl.
+// It fetches the current follow list for each queued pubkey with no time
+// filter, then walks p-tags out to MaxHops.
+type IngestorContactCrawlConfig struct {
+	Enabled            bool
+	Interval           time.Duration
+	BatchSize          int
+	SeedBatch          int
+	SeedRescanInterval time.Duration
+	MaxHops            int
+	MaxPending         int
+	MaxRelaysPerPubkey int
+	RefetchInterval    time.Duration
+	RetryDelay         time.Duration
+	RelayAllowlist     []string
+}
+
+// LoadIngestor reads ingestor configuration from environment variables.
+func LoadIngestor() (IngestorConfig, error) {
+	shared, err := loadSharedConfig("ingestor")
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+
+	localDev := isLocalDevEnvironment(shared.Environment)
+	requireTLS := getEnvBool("INGESTOR_RELAY_REQUIRE_TLS", !localDev)
+	liveBootstrapLookbackSeconds, err := getEnvNonNegativeInt64(
+		"INGESTOR_LIVE_BOOTSTRAP_LOOKBACK_SECONDS",
+		300,
+	)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	liveResumeOverlapSeconds, err := getEnvNonNegativeInt64(
+		"INGESTOR_LIVE_RESUME_OVERLAP_SECONDS",
+		60,
+	)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	trustGateRefreshInterval, err := getEnvPositiveDurationStrict("INGESTOR_TRUST_GATE_REFRESH_INTERVAL", 2*time.Minute)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	trustGateMaxHops, err := getEnvPositiveIntStrict("INGESTOR_TRUST_GATE_MAX_HOPS", 2)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	dedupCacheSize, err := getEnvNonNegativeIntStrict("INGESTOR_DEDUP_CACHE_SIZE", 100000)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	contactCrawlMaxHops, err := getEnvNonNegativeIntStrict("INGESTOR_CONTACT_CRAWL_MAX_HOPS", 2)
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+
+	cfg := IngestorConfig{
+		Shared: shared,
+		Runtime: IngestorRuntimeConfig{
+			Mode:           strings.ToLower(strings.TrimSpace(getEnv("INGESTOR_MODE", "live"))),
+			DedupCacheSize: dedupCacheSize,
+			DropBridged:    getEnvBool("INGESTOR_DROP_BRIDGED", true),
+		},
+		Relay: RelayConfig{
+			URLs:           parseCSVEnv("INGESTOR_RELAY_URLS"),
+			Allowlist:      parseCSVEnv("INGESTOR_RELAY_ALLOWLIST"),
+			Disabled:       parseCSVEnv("INGESTOR_RELAY_DISABLED"),
+			RequireTLS:     requireTLS,
+			ConnectTimeout: getEnvDuration("INGESTOR_RELAY_CONNECT_TIMEOUT", 10*time.Second),
+			InitialBackoff: getEnvDuration("INGESTOR_RELAY_BACKOFF_INITIAL", 1*time.Second),
+			MaxBackoff:     getEnvDuration("INGESTOR_RELAY_BACKOFF_MAX", 30*time.Second),
+			LagThreshold:   getEnvDuration("INGESTOR_RELAY_LAG_THRESHOLD", 45*time.Second),
+			FilterGroups:   defaultFilterGroups(),
+			ActiveFilterGroup: strings.TrimSpace(
+				getEnv("INGESTOR_FILTER_GROUP", defaultFilterGroupName),
+			),
+			LiveBootstrapLookbackSeconds: liveBootstrapLookbackSeconds,
+			LiveResumeOverlapSeconds:     liveResumeOverlapSeconds,
+		},
+		Backfill: BackfillConfig{
+			Enabled:        getEnvBool("INGESTOR_BACKFILL_ENABLED", false),
+			Mode:           strings.TrimSpace(getEnv("INGESTOR_BACKFILL_MODE", "backfill")),
+			Since:          getEnvOptionalUnix("INGESTOR_BACKFILL_SINCE"),
+			Until:          getEnvOptionalUnix("INGESTOR_BACKFILL_UNTIL"),
+			PageLimit:      getEnvInt("INGESTOR_BACKFILL_PAGE_LIMIT", 500),
+			IdleTimeout:    getEnvDuration("INGESTOR_BACKFILL_IDLE_TIMEOUT", 3*time.Second),
+			EmptyPageMax:   getEnvInt("INGESTOR_BACKFILL_EMPTY_PAGE_MAX", 2),
+			ConnectTimeout: getEnvDuration("INGESTOR_BACKFILL_CONNECT_TIMEOUT", 10*time.Second),
+		},
+		Replay: ReplayConfig{
+			FixturePath: strings.TrimSpace(os.Getenv("INGESTOR_REPLAY_FIXTURE_PATH")),
+		},
+		TrustPrioritization: IngestorTrustPrioritizationConfig{
+			Enabled:    getEnvBool("INGESTOR_TRUST_PRIORITIZATION_ENABLED", true),
+			TopPubkeys: getEnvInt("INGESTOR_TRUST_PRIORITIZATION_TOP_PUBKEYS", 2000),
+		},
+		TrustGate: IngestorTrustGateConfig{
+			Mode:                     strings.ToLower(strings.TrimSpace(getEnv("INGESTOR_TRUST_GATE_MODE", "open"))),
+			RefreshInterval:          trustGateRefreshInterval,
+			MaxHops:                  trustGateMaxHops,
+			GiftWrapRecipientPerHour: getEnvInt("INGESTOR_GIFT_WRAP_RECIPIENT_PER_HOUR", 240),
+		},
+		TrustFetch: IngestorTrustFetchConfig{
+			Enabled:               getEnvBool("INGESTOR_TRUST_FETCH_ENABLED", true),
+			MaxTrackedPubkeys:     getEnvInt("INGESTOR_TRUST_FETCH_MAX_TRACKED_PUBKEYS", 5000),
+			MaxSelectedPerCycle:   getEnvInt("INGESTOR_TRUST_FETCH_MAX_SELECTED_PER_CYCLE", 100),
+			RefreshInterval:       getEnvDuration("INGESTOR_TRUST_FETCH_REFRESH_INTERVAL", 2*time.Minute),
+			FetchCooldown:         getEnvDuration("INGESTOR_TRUST_FETCH_COOLDOWN", 30*time.Minute),
+			StableWindow:          getEnvDuration("INGESTOR_TRUST_FETCH_STABLE_WINDOW", 10*time.Minute),
+			MaxPromotionsPerCycle: getEnvInt("INGESTOR_TRUST_FETCH_MAX_PROMOTIONS_PER_CYCLE", 50),
+			RecentLookbackSeconds: getEnvInt64("INGESTOR_TRUST_FETCH_RECENT_LOOKBACK_SECONDS", 172800),
+			PageLimitPerRelay:     getEnvInt("INGESTOR_TRUST_FETCH_PAGE_LIMIT_PER_RELAY", 200),
+			RetryDelay:            getEnvDuration("INGESTOR_TRUST_FETCH_RETRY_DELAY", 10*time.Minute),
+		},
+		ContactCrawl: IngestorContactCrawlConfig{
+			Enabled:            getEnvBool("INGESTOR_CONTACT_CRAWL_ENABLED", false),
+			Interval:           getEnvDuration("INGESTOR_CONTACT_CRAWL_INTERVAL", time.Minute),
+			BatchSize:          getEnvInt("INGESTOR_CONTACT_CRAWL_BATCH_SIZE", 20),
+			SeedBatch:          getEnvInt("INGESTOR_CONTACT_CRAWL_SEED_BATCH", 200),
+			SeedRescanInterval: getEnvDuration("INGESTOR_CONTACT_CRAWL_SEED_RESCAN_INTERVAL", 6*time.Hour),
+			MaxHops:            contactCrawlMaxHops,
+			MaxPending:         getEnvInt("INGESTOR_CONTACT_CRAWL_MAX_PENDING", 100000),
+			MaxRelaysPerPubkey: getEnvInt("INGESTOR_CONTACT_CRAWL_MAX_RELAYS_PER_PUBKEY", 3),
+			RefetchInterval:    getEnvDuration("INGESTOR_CONTACT_CRAWL_REFETCH_INTERVAL", 168*time.Hour),
+			RetryDelay:         getEnvDuration("INGESTOR_CONTACT_CRAWL_RETRY_DELAY", 10*time.Minute),
+			RelayAllowlist:     parseCSVEnv("INGESTOR_CONTACT_CRAWL_RELAY_ALLOWLIST"),
+		},
+		AuthorMetadataDiscovery: IngestorAuthorMetadataDiscoveryConfig{
+			Enabled:           getEnvBool("INGESTOR_AUTHOR_METADATA_DISCOVERY_ENABLED", true),
+			BatchSize:         getEnvInt("INGESTOR_AUTHOR_METADATA_DISCOVERY_BATCH_SIZE", 50),
+			Interval:          getEnvDuration("INGESTOR_AUTHOR_METADATA_DISCOVERY_INTERVAL", 3*time.Minute),
+			PageLimitPerRelay: getEnvInt("INGESTOR_AUTHOR_METADATA_DISCOVERY_PAGE_LIMIT", 10),
+		},
+		AccountObservation: IngestorAccountObservationConfig{
+			Enabled:       getEnvBool("INGESTOR_ACCOUNT_OBSERVATION_ENABLED", true),
+			FlushInterval: getEnvDuration("INGESTOR_ACCOUNT_OBSERVATION_FLUSH_INTERVAL", 10*time.Second),
+			MaxBufferKeys: getEnvInt("INGESTOR_ACCOUNT_OBSERVATION_MAX_BUFFER_KEYS", 100000),
+		},
+	}
+
+	relayRegistryCfg, err := LoadRelayRegistryConfig()
+	if err != nil {
+		return IngestorConfig{}, err
+	}
+	cfg.RelayRegistry = relayRegistryCfg
+
+	if err := applyConfiguredFilterGroups(&cfg.Relay); err != nil {
+		return IngestorConfig{}, err
+	}
+	if err := validateRelayConfig(cfg.Relay); err != nil {
+		return IngestorConfig{}, err
+	}
+	if err := validateBackfillConfig(cfg.Backfill); err != nil {
+		return IngestorConfig{}, err
+	}
+	if err := validateIngestorMode(cfg.Shared.ServiceName, cfg.Runtime.Mode, cfg.Replay, cfg.Relay, cfg.RelayRegistry.Enabled); err != nil {
+		return IngestorConfig{}, err
+	}
+	if strings.TrimSpace(cfg.Shared.Database.URL) == "" {
+		return IngestorConfig{}, fmt.Errorf("DATABASE_URL is required")
+	}
+	if cfg.TrustPrioritization.Enabled && cfg.TrustPrioritization.TopPubkeys <= 0 {
+		return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_PRIORITIZATION_TOP_PUBKEYS must be > 0 when trust prioritization is enabled")
+	}
+	switch cfg.TrustGate.Mode {
+	case "open", "trusted_only":
+	default:
+		return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_GATE_MODE %q must be one of: open, trusted_only", cfg.TrustGate.Mode)
+	}
+	if cfg.TrustGate.RefreshInterval <= 0 {
+		return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_GATE_REFRESH_INTERVAL must be > 0")
+	}
+	if cfg.TrustGate.MaxHops <= 0 {
+		return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_GATE_MAX_HOPS must be > 0")
+	}
+	if cfg.TrustFetch.Enabled {
+		if cfg.TrustFetch.MaxTrackedPubkeys <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_MAX_TRACKED_PUBKEYS must be > 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.MaxSelectedPerCycle <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_MAX_SELECTED_PER_CYCLE must be > 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.RefreshInterval <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_REFRESH_INTERVAL must be > 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.FetchCooldown < 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_COOLDOWN must be >= 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.StableWindow < 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_STABLE_WINDOW must be >= 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.MaxPromotionsPerCycle <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_MAX_PROMOTIONS_PER_CYCLE must be > 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.RecentLookbackSeconds < 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_RECENT_LOOKBACK_SECONDS must be >= 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.PageLimitPerRelay <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_PAGE_LIMIT_PER_RELAY must be > 0 when trust fetch is enabled")
+		}
+		if cfg.TrustFetch.RetryDelay < 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_TRUST_FETCH_RETRY_DELAY must be >= 0 when trust fetch is enabled")
+		}
+	}
+	if err := validateContactCrawlConfig(cfg.ContactCrawl, cfg.Relay.RequireTLS); err != nil {
+		return IngestorConfig{}, err
+	}
+	if cfg.AuthorMetadataDiscovery.Enabled {
+		if cfg.AuthorMetadataDiscovery.BatchSize <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_AUTHOR_METADATA_DISCOVERY_BATCH_SIZE must be > 0 when author metadata discovery is enabled")
+		}
+		if cfg.AuthorMetadataDiscovery.Interval <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_AUTHOR_METADATA_DISCOVERY_INTERVAL must be > 0 when author metadata discovery is enabled")
+		}
+		if cfg.AuthorMetadataDiscovery.PageLimitPerRelay <= 0 {
+			return IngestorConfig{}, fmt.Errorf("INGESTOR_AUTHOR_METADATA_DISCOVERY_PAGE_LIMIT must be > 0 when author metadata discovery is enabled")
+		}
+	}
+	return cfg, nil
+}
+
+func validateContactCrawlConfig(cfg IngestorContactCrawlConfig, requireTLS bool) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.Interval <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_INTERVAL must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.BatchSize <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_BATCH_SIZE must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.SeedBatch <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_SEED_BATCH must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.SeedRescanInterval <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_SEED_RESCAN_INTERVAL must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.MaxHops < 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_MAX_HOPS must be >= 0 when contact list crawl is enabled")
+	}
+	if cfg.MaxPending <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_MAX_PENDING must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.MaxRelaysPerPubkey <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_MAX_RELAYS_PER_PUBKEY must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.RefetchInterval <= 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_REFETCH_INTERVAL must be > 0 when contact list crawl is enabled")
+	}
+	if cfg.RetryDelay < 0 {
+		return fmt.Errorf("INGESTOR_CONTACT_CRAWL_RETRY_DELAY must be >= 0 when contact list crawl is enabled")
+	}
+	for _, relayURL := range cfg.RelayAllowlist {
+		if _, err := normalizeRelayURL(relayURL, requireTLS); err != nil {
+			return fmt.Errorf("invalid INGESTOR_CONTACT_CRAWL_RELAY_ALLOWLIST entry %q: %w", relayURL, err)
+		}
+	}
+	return nil
+}

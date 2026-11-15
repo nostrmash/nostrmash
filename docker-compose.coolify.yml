@@ -1,0 +1,271 @@
+name: nostrmash
+
+x-nostrmash-service: &nostrmash-service
+  # Only `api` declares `build:` below. The four runtime services share
+  # this image tag; if every service also has a build block, Coolify's
+  # `docker compose build` compiles the same Dockerfile four times in
+  # parallel and races on unpacking `nostrmash:coolify` — that is what
+  # aborted deploy #186 mid-unpack. `docker compose up` still starts all
+  # four from the image `api` produced.
+  image: nostrmash:coolify
+  restart: unless-stopped
+  init: true
+  # Coolify's app-level Resource Limits UI does not apply per Compose service.
+  # These cgroup caps survive redeploy; override via env if needed.
+  mem_limit: ${NOSTRMASH_SERVICE_MEM_LIMIT:-512m}
+
+# Liveness only (process is listening). Coolify Compose applications have no
+# per-service Healthcheck UI — they show "unknown" until Compose defines one.
+# Do not probe /ready here: a Postgres blip would mark the container unhealthy.
+x-http-healthcheck: &http-healthcheck
+  interval: 15s
+  timeout: 3s
+  retries: 5
+  start_period: 60s
+
+x-common-env: &common-env
+  DATABASE_URL: ${DATABASE_URL}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  MEILI_ENABLED: ${MEILI_ENABLED:-false}
+  MEILI_URL: ${MEILI_URL:-http://meilisearch:7700}
+  MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-}
+  MEILI_SEARCH_API_KEY: ${MEILI_SEARCH_API_KEY:-}
+  # The one-shot migrate service owns schema migrations; serving processes
+  # only wait for the schema to reach head. A boot-blocking migration inside
+  # a health-checked container gets killed and rolled back mid-flight.
+  MIGRATE_ON_BOOT: ${MIGRATE_ON_BOOT:-false}
+
+# Serving services start only after the one-shot migrate service has applied
+# all pending migrations and exited 0.
+x-depends-on-migrate: &depends-on-migrate
+  migrate:
+    condition: service_completed_successfully
+
+services:
+  migrate:
+    <<: *nostrmash-service
+    restart: "no"
+    command: ["/app/migrate"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+  meilisearch:
+    image: getmeili/meilisearch:v1.56.0
+    restart: unless-stopped
+    init: true
+    expose:
+      - "7700"
+    # Single-server budget: keep Meili from evicting Postgres page cache.
+    # Shrink the index below ~10GB before relying on this cap under load.
+    mem_limit: ${MEILI_MEM_LIMIT:-6g}
+    environment:
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_MAX_INDEXING_MEMORY: ${MEILI_MAX_INDEXING_MEMORY:-2GiB}
+      # The v1.42 volume cannot open under 1.56 until this runs. It is a
+      # no-op once the database is already on this version.
+      MEILI_UPGRADE_DB: "true"
+    volumes:
+      - meili_data_v2:/meili_data
+    # Official image ships wget. /health is unauthenticated and stays 200
+    # while the process is up, including during index reopen after a restart.
+    # start_period covers the 12GB production index cold-open.
+    healthcheck:
+      <<: *http-healthcheck
+      start_period: 180s
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7700/health"]
+
+  api:
+    <<: *nostrmash-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Do not interpolate ${SOURCE_COMMIT} / ${APP_VERSION} here. Coolify
+      # locks those as undeletable UI env vars. Coolify already passes
+      # --build-arg SOURCE_COMMIT on compose builds; the Dockerfile
+      # declares ARG SOURCE_COMMIT and stamps ldflags from it when .git
+      # is not in the build context.
+    command: ["/app/api"]
+    depends_on:
+      <<: *depends-on-migrate
+    expose:
+      - "8080"
+    environment:
+      <<: *common-env
+      HTTP_ADDR: ":8080"
+      # Cap pool size on the single-server host so raised work_mem stays safe.
+      DATABASE_MAX_CONNS: ${API_DATABASE_MAX_CONNS:-32}
+      ADMIN_BEARER_TOKEN: ${ADMIN_BEARER_TOKEN}
+      API_MAX_BATCH_SIZE: ${API_MAX_BATCH_SIZE:-200}
+      HTTP_RATE_LIMIT_RPM: ${HTTP_RATE_LIMIT_RPM:-240}
+      HTTP_RATE_LIMIT_BURST: ${HTTP_RATE_LIMIT_BURST:-60}
+      HTTP_SEARCH_RATE_LIMIT_RPM: ${HTTP_SEARCH_RATE_LIMIT_RPM:-60}
+      HTTP_BATCH_RATE_LIMIT_RPM: ${HTTP_BATCH_RATE_LIMIT_RPM:-40}
+      HTTP_DM_COMPAT_RATE_LIMIT_RPM: ${HTTP_DM_COMPAT_RATE_LIMIT_RPM:-30}
+      INGESTOR_RELAY_URLS: ${INGESTOR_RELAY_URLS}
+      INGESTOR_RELAY_DISABLED: ${INGESTOR_RELAY_DISABLED:-}
+      PRIMAL_WS_ALLOWED_ORIGINS: ${PRIMAL_WS_ALLOWED_ORIGINS:-}
+      PRIMAL_WS_ALLOW_ANY_ORIGIN: ${PRIMAL_WS_ALLOW_ANY_ORIGIN:-false}
+      PRIMAL_WS_MAX_MESSAGE_BYTES: ${PRIMAL_WS_MAX_MESSAGE_BYTES:-1048576}
+      PRIMAL_WS_MAX_REQ_PER_MINUTE: ${PRIMAL_WS_MAX_REQ_PER_MINUTE:-240}
+      PRIMAL_WS_MAX_SUBSCRIPTIONS: ${PRIMAL_WS_MAX_SUBSCRIPTIONS:-200}
+      PRIMAL_WS_REQUEST_TIMEOUT: ${PRIMAL_WS_REQUEST_TIMEOUT:-10s}
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "busybox", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+
+  # Local edge cache. Attach the public Coolify domain here (not to api) so
+  # GET /api/v1/discovery/* is absorbed from nginx's disk cache. Cloudflare
+  # in front of this service is the real CDN; see docs/coolify.md.
+  #
+  # Do not bind-mount nginx.conf: Coolify resolves compose volumes against
+  # the persistent app directory, which does not contain the git checkout.
+  # A missing host file is created as a directory and the container fails
+  # to start (deploy #189). Bake the config into a tiny image instead.
+  edge:
+    image: nostrmash-edge:coolify
+    build:
+      context: ./deploy/edge-cache
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    mem_limit: ${EDGE_MEM_LIMIT:-128m}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "8080"
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+
+  ingestor:
+    <<: *nostrmash-service
+    command: ["/app/ingestor"]
+    depends_on:
+      <<: *depends-on-migrate
+    environment:
+      <<: *common-env
+      METRICS_ADDR: ${INGESTOR_METRICS_ADDR:-:9090}
+      INGESTOR_MODE: ${INGESTOR_MODE:-live}
+      INGESTOR_FILTER_GROUP: ${INGESTOR_FILTER_GROUP:-default_v1}
+      INGESTOR_FILTER_GROUPS_JSON: ${INGESTOR_FILTER_GROUPS_JSON:-}
+      INGESTOR_RELAY_URLS: ${INGESTOR_RELAY_URLS}
+      INGESTOR_RELAY_ALLOWLIST: ${INGESTOR_RELAY_ALLOWLIST}
+      INGESTOR_RELAY_DISABLED: ${INGESTOR_RELAY_DISABLED:-}
+      INGESTOR_RELAY_REQUIRE_TLS: ${INGESTOR_RELAY_REQUIRE_TLS:-true}
+      INGESTOR_RELAY_CONNECT_TIMEOUT: ${INGESTOR_RELAY_CONNECT_TIMEOUT:-10s}
+      INGESTOR_RELAY_BACKOFF_INITIAL: ${INGESTOR_RELAY_BACKOFF_INITIAL:-1s}
+      INGESTOR_RELAY_BACKOFF_MAX: ${INGESTOR_RELAY_BACKOFF_MAX:-30s}
+      INGESTOR_RELAY_LAG_THRESHOLD: ${INGESTOR_RELAY_LAG_THRESHOLD:-45s}
+      INGESTOR_LIVE_BOOTSTRAP_LOOKBACK_SECONDS: ${INGESTOR_LIVE_BOOTSTRAP_LOOKBACK_SECONDS:-300}
+      INGESTOR_LIVE_RESUME_OVERLAP_SECONDS: ${INGESTOR_LIVE_RESUME_OVERLAP_SECONDS:-60}
+      INGESTOR_BACKFILL_ENABLED: ${INGESTOR_BACKFILL_ENABLED:-false}
+      INGESTOR_BACKFILL_MODE: ${INGESTOR_BACKFILL_MODE:-backfill}
+      INGESTOR_BACKFILL_SINCE: ${INGESTOR_BACKFILL_SINCE:-}
+      INGESTOR_BACKFILL_UNTIL: ${INGESTOR_BACKFILL_UNTIL:-}
+      INGESTOR_BACKFILL_PAGE_LIMIT: ${INGESTOR_BACKFILL_PAGE_LIMIT:-500}
+      INGESTOR_BACKFILL_CONNECT_TIMEOUT: ${INGESTOR_BACKFILL_CONNECT_TIMEOUT:-10s}
+      INGESTOR_BACKFILL_IDLE_TIMEOUT: ${INGESTOR_BACKFILL_IDLE_TIMEOUT:-3s}
+      INGESTOR_BACKFILL_EMPTY_PAGE_MAX: ${INGESTOR_BACKFILL_EMPTY_PAGE_MAX:-2}
+      INGESTOR_REPLAY_FIXTURE_PATH: ${INGESTOR_REPLAY_FIXTURE_PATH:-}
+      # Live ingest only receives follow lists newer than its relay checkpoint.
+      # This crawl imports the current kind-3 for authors already stored here,
+      # which is what moves follower counts. Set the flag to false to pause it.
+      INGESTOR_CONTACT_CRAWL_ENABLED: ${INGESTOR_CONTACT_CRAWL_ENABLED:-true}
+      INGESTOR_CONTACT_CRAWL_INTERVAL: ${INGESTOR_CONTACT_CRAWL_INTERVAL:-1m}
+      INGESTOR_CONTACT_CRAWL_BATCH_SIZE: ${INGESTOR_CONTACT_CRAWL_BATCH_SIZE:-20}
+      INGESTOR_CONTACT_CRAWL_SEED_BATCH: ${INGESTOR_CONTACT_CRAWL_SEED_BATCH:-200}
+      INGESTOR_CONTACT_CRAWL_MAX_HOPS: ${INGESTOR_CONTACT_CRAWL_MAX_HOPS:-2}
+      INGESTOR_CONTACT_CRAWL_RELAY_ALLOWLIST: ${INGESTOR_CONTACT_CRAWL_RELAY_ALLOWLIST:-}
+      RELAY_REGISTRY_ENABLED: ${RELAY_REGISTRY_ENABLED:-false}
+      RELAY_REGISTRY_RECONCILE_POLL_INTERVAL: ${RELAY_REGISTRY_RECONCILE_POLL_INTERVAL:-30s}
+      RELAY_REGISTRY_RECONCILE_DRAIN_TIMEOUT: ${RELAY_REGISTRY_RECONCILE_DRAIN_TIMEOUT:-10s}
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "busybox", "wget", "-qO-", "http://127.0.0.1:9090/metrics"]
+
+  worker:
+    <<: *nostrmash-service
+    # Language models stay resident at about 1.2 GiB. The shared 512m cap
+    # OOM-kills the process about a minute after startup.
+    mem_limit: ${WORKER_MEM_LIMIT:-2g}
+    command: ["/app/worker"]
+    depends_on:
+      <<: *depends-on-migrate
+    environment:
+      <<: *common-env
+      METRICS_ADDR: ${WORKER_METRICS_ADDR:-:9090}
+      DEBUG_ADDR: ${WORKER_DEBUG_ADDR:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      # Tight terminal-job retention keeps the jobs indexes from bloating under
+      # high churn on the single-server host (heap is tiny; indexes were 4.7 GB).
+      WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE: ${WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE:-6h}
+      WORKER_JOB_RETENTION_DEAD_MAX_AGE: ${WORKER_JOB_RETENTION_DEAD_MAX_AGE:-168h}
+      WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT: ${WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT:-20000}
+      # Storage governor budget. Default 50 GiB; size to ~80% of the volume
+      # backing Postgres. 0 disables all defensive actions (observe-only).
+      STORAGE_PRESSURE_CAPACITY_BYTES: ${STORAGE_PRESSURE_CAPACITY_BYTES:-53687091200}
+      STORAGE_PRESSURE_WARN_PERCENT: ${STORAGE_PRESSURE_WARN_PERCENT:-80}
+      STORAGE_PRESSURE_AGGRESSIVE_PERCENT: ${STORAGE_PRESSURE_AGGRESSIVE_PERCENT:-90}
+      STORAGE_PRESSURE_DISABLE_HYDRATION_PERCENT: ${STORAGE_PRESSURE_DISABLE_HYDRATION_PERCENT:-95}
+      STORAGE_PRESSURE_PAUSE_CANDIDATE_PERCENT: ${STORAGE_PRESSURE_PAUSE_CANDIDATE_PERCENT:-98}
+      RELAY_REGISTRY_ENABLED: ${RELAY_REGISTRY_ENABLED:-false}
+      RELAY_REGISTRY_SEED_RELAYS: ${RELAY_REGISTRY_SEED_RELAYS:-}
+      RELAY_REGISTRY_ALLOW_PRIVATE_NETWORK: ${RELAY_REGISTRY_ALLOW_PRIVATE_NETWORK:-false}
+      RELAY_REGISTRY_REFRESH_INTERVAL: ${RELAY_REGISTRY_REFRESH_INTERVAL:-5m}
+      RELAY_REGISTRY_DISCOVERY_ENABLED: ${RELAY_REGISTRY_DISCOVERY_ENABLED:-false}
+      RELAY_REGISTRY_DISCOVERY_MIN_DISTINCT_USER_REFS: ${RELAY_REGISTRY_DISCOVERY_MIN_DISTINCT_USER_REFS:-3}
+      RELAY_REGISTRY_DISCOVERY_MAX_NEW_CANDIDATES: ${RELAY_REGISTRY_DISCOVERY_MAX_NEW_CANDIDATES:-25}
+      RELAY_REGISTRY_PROBING_ENABLED: ${RELAY_REGISTRY_PROBING_ENABLED:-false}
+      RELAY_REGISTRY_PROBING_INTERVAL: ${RELAY_REGISTRY_PROBING_INTERVAL:-5m}
+      RELAY_REGISTRY_PROBING_TIMEOUT_CONNECT: ${RELAY_REGISTRY_PROBING_TIMEOUT_CONNECT:-10s}
+      RELAY_REGISTRY_PROBING_TIMEOUT_EOSE: ${RELAY_REGISTRY_PROBING_TIMEOUT_EOSE:-15s}
+      RELAY_REGISTRY_PROBING_MAX_PARALLEL: ${RELAY_REGISTRY_PROBING_MAX_PARALLEL:-5}
+      RELAY_REGISTRY_NIP11_ENABLED: ${RELAY_REGISTRY_NIP11_ENABLED:-true}
+      RELAY_REGISTRY_NIP11_INTERVAL: ${RELAY_REGISTRY_NIP11_INTERVAL:-15m}
+      RELAY_REGISTRY_NIP11_FRESHNESS: ${RELAY_REGISTRY_NIP11_FRESHNESS:-24h}
+      RELAY_REGISTRY_NIP11_TIMEOUT: ${RELAY_REGISTRY_NIP11_TIMEOUT:-8s}
+      RELAY_REGISTRY_NIP11_MAX_PARALLEL: ${RELAY_REGISTRY_NIP11_MAX_PARALLEL:-4}
+      RELAY_REGISTRY_NIP11_BATCH_SIZE: ${RELAY_REGISTRY_NIP11_BATCH_SIZE:-25}
+      RELAY_REGISTRY_ADMISSION_MAX_TOTAL_ACTIVE: ${RELAY_REGISTRY_ADMISSION_MAX_TOTAL_ACTIVE:-20}
+      RELAY_REGISTRY_ADMISSION_MAX_DYNAMIC_ACTIVE: ${RELAY_REGISTRY_ADMISSION_MAX_DYNAMIC_ACTIVE:-15}
+      RELAY_REGISTRY_ADMISSION_MAX_PROBATION: ${RELAY_REGISTRY_ADMISSION_MAX_PROBATION:-20}
+      RELAY_REGISTRY_ADMISSION_MIN_SCORE_PROBATION: ${RELAY_REGISTRY_ADMISSION_MIN_SCORE_PROBATION:-10}
+      RELAY_REGISTRY_ADMISSION_MIN_SCORE_ACTIVE: ${RELAY_REGISTRY_ADMISSION_MIN_SCORE_ACTIVE:-30}
+      RELAY_REGISTRY_ADMISSION_DEMOTE_FAILURE_THRESHOLD: ${RELAY_REGISTRY_ADMISSION_DEMOTE_FAILURE_THRESHOLD:-60}
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "busybox", "wget", "-qO-", "http://127.0.0.1:9090/metrics"]
+
+  trust_worker:
+    <<: *nostrmash-service
+    command: ["/app/trust_worker"]
+    depends_on:
+      <<: *depends-on-migrate
+    # Redis graph sync + in-memory score compute stream ~5M follower_edges;
+    # 256m OOMs / Redis client timeouts mid-compute. Keep under the single-server
+    # RAM budget but large enough for a full adjacency load.
+    mem_limit: ${TRUST_WORKER_MEM_LIMIT:-2g}
+    environment:
+      <<: *common-env
+      METRICS_ADDR: ${TRUST_WORKER_METRICS_ADDR:-:9090}
+      DEBUG_ADDR: ${TRUST_WORKER_DEBUG_ADDR:-}
+      TRUST_REDIS_URL: ${TRUST_REDIS_URL:-}
+      TRUST_WORKER_CONCURRENCY: ${TRUST_WORKER_CONCURRENCY:-2}
+      TRUST_WORKER_CLAIM_BATCH_SIZE: ${TRUST_WORKER_CLAIM_BATCH_SIZE:-5}
+      TRUST_WORKER_POLL_INTERVAL: ${TRUST_WORKER_POLL_INTERVAL:-1s}
+      TRUST_WORKER_RETRY_DELAY: ${TRUST_WORKER_RETRY_DELAY:-5s}
+      TRUST_ENABLE_SCORE_COMPUTE: ${TRUST_ENABLE_SCORE_COMPUTE:-true}
+      TRUST_ENABLE_REDIS_SYNC: ${TRUST_ENABLE_REDIS_SYNC:-false}
+      WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE: ${WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE:-6h}
+      WORKER_JOB_RETENTION_DEAD_MAX_AGE: ${WORKER_JOB_RETENTION_DEAD_MAX_AGE:-168h}
+      WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT: ${WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT:-20000}
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "busybox", "wget", "-qO-", "http://127.0.0.1:9090/metrics"]
+
+volumes:
+  meili_data_v2:

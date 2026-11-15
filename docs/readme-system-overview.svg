@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="452" viewBox="0 0 1200 452" role="img" aria-labelledby="overviewTitle overviewDesc">
+  <title id="overviewTitle">NostrMash system overview</title>
+  <desc id="overviewDesc">System overview showing a durable canonical Postgres core, rebuildable views on the main pipeline, a separate trust working-state branch, and an independent compatibility edge.</desc>
+  <defs>
+    <linearGradient id="overviewBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fcfcfd"/>
+      <stop offset="100%" stop-color="#f4f5f7"/>
+    </linearGradient>
+    <linearGradient id="overviewInk" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#374151"/>
+    </linearGradient>
+    <filter id="overviewShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0f172a" flood-opacity="0.08"/>
+    </filter>
+    <style>
+      .panel { fill: url(#overviewBg); stroke: #e5e7eb; stroke-width: 1.5; filter: url(#overviewShadow); }
+      .group { fill: #ffffff; stroke: #e5e7eb; stroke-width: 1.5; filter: url(#overviewShadow); }
+      .lane { fill: #fbfcfc; stroke: #d9dee3; stroke-width: 1.2; }
+      .compatGroup { fill: #fafafb; stroke: #dcdfe5; stroke-width: 1.2; }
+      .coreNode { fill: #fafbfc; stroke: #d4d7dd; stroke-width: 1.35; }
+      .coreFocus { fill: #f6f7f8; stroke: #4b5563; stroke-width: 1.9; }
+      .support { fill: #fcfcfd; stroke: #d7dbe1; stroke-width: 1.25; }
+      .trust { fill: #f8fbf9; stroke: #b8cbc0; stroke-width: 1.35; }
+      .api { fill: #fafbfc; stroke: #cfd8e1; stroke-width: 1.25; }
+      .compat { fill: #fafafb; stroke: #d6d0df; stroke-width: 1.35; }
+      .kicker { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 0.12em; text-transform: uppercase; fill: #5b6470; }
+      .title { font: 800 29px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .small { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #6b7280; letter-spacing: 0.08em; text-transform: uppercase; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .body { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .laneLabel { font: 680 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .arrow { stroke: #435063; stroke-width: 2.25; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+      .softArrow { stroke: #718094; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 5 6; }
+    </style>
+    <marker id="overviewArrowHead" markerWidth="8" markerHeight="8" refX="6.6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
+      <polygon points="0 0, 6.6 3.5, 0 7" fill="#435063"/>
+    </marker>
+    <marker id="overviewSoftArrowHead" markerWidth="8" markerHeight="8" refX="6.6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
+      <polygon points="0 0, 6.6 3.5, 0 7" fill="#718094"/>
+    </marker>
+  </defs>
+
+  <rect x="20" y="20" width="1160" height="412" rx="28" class="panel"/>
+
+  <text x="56" y="64" class="kicker">NostrMash architecture</text>
+  <text x="56" y="98" class="title">Own the data plane. Keep the client boundary compatible.</text>
+  <text x="56" y="124" class="subtitle">Canonical truth stays durable in Postgres. Views, trust state, and compatibility reads stay rebuildable.</text>
+
+  <rect x="48" y="148" width="1104" height="240" rx="26" class="group"/>
+  <text x="78" y="176" class="small">Self-hosted stack</text>
+
+  <rect x="666" y="306" width="292" height="58" rx="20" class="lane"/>
+  <rect x="986" y="306" width="104" height="58" rx="20" class="compatGroup"/>
+
+  <rect x="82" y="206" width="138" height="84" rx="18" class="support"/>
+  <text x="151" y="238" class="label" text-anchor="middle">Relays</text>
+  <text x="151" y="264" class="body" text-anchor="middle">live + backfill</text>
+
+  <rect x="252" y="206" width="156" height="84" rx="18" class="coreNode"/>
+  <text x="330" y="238" class="label" text-anchor="middle">Ingestor</text>
+  <text x="330" y="264" class="body" text-anchor="middle">validate + write</text>
+
+  <rect x="432" y="190" width="218" height="104" rx="20" class="coreFocus"/>
+  <text x="541" y="229" class="label" text-anchor="middle">Canonical Postgres</text>
+  <text x="541" y="254" class="body" text-anchor="middle">events, checkpoints</text>
+  <text x="541" y="273" class="body" text-anchor="middle">jobs, projections</text>
+
+  <rect x="676" y="206" width="110" height="84" rx="18" class="support"/>
+  <text x="731" y="238" class="label" text-anchor="middle">Jobs</text>
+  <text x="731" y="264" class="body" text-anchor="middle">queue + replay</text>
+
+  <rect x="820" y="194" width="138" height="98" rx="18" class="coreNode"/>
+  <text x="889" y="229" class="label" text-anchor="middle">Worker</text>
+  <text x="889" y="255" class="body" text-anchor="middle">derive views</text>
+
+  <rect x="992" y="194" width="92" height="98" rx="18" class="api"/>
+  <text x="1038" y="234" class="label" text-anchor="middle">API</text>
+  <text x="1038" y="258" class="body" text-anchor="middle">native reads</text>
+
+  <rect x="676" y="314" width="110" height="42" rx="14" class="trust"/>
+  <text x="731" y="341" class="laneLabel" text-anchor="middle">Redis</text>
+
+  <rect x="810" y="314" width="138" height="42" rx="14" class="trust"/>
+  <text x="879" y="341" class="laneLabel" text-anchor="middle">Trust worker</text>
+
+  <rect x="992" y="314" width="92" height="42" rx="14" class="compat"/>
+  <text x="1038" y="341" class="laneLabel" text-anchor="middle">Primal</text>
+
+  <path d="M220 246 H247" class="arrow" marker-end="url(#overviewArrowHead)"/>
+  <path d="M408 246 H427" class="arrow" marker-end="url(#overviewArrowHead)"/>
+  <path d="M650 246 H671" class="arrow" marker-end="url(#overviewArrowHead)"/>
+  <path d="M786 246 H815" class="arrow" marker-end="url(#overviewArrowHead)"/>
+  <path d="M958 246 H987" class="arrow" marker-end="url(#overviewArrowHead)"/>
+
+  <path d="M541 294 V335 H671" class="softArrow" marker-end="url(#overviewSoftArrowHead)"/>
+  <path d="M786 335 H805" class="softArrow" marker-end="url(#overviewSoftArrowHead)"/>
+
+  <rect x="480" y="301" width="122" height="24" rx="12" fill="#ffffff" stroke="#d3dce8" stroke-width="1.1"/>
+  <text x="541" y="317" class="small" text-anchor="middle">Durable truth</text>
+
+  <text x="812" y="384" class="small" text-anchor="middle">Trust working state</text>
+  <text x="1038" y="380" class="small" text-anchor="middle">Compatibility edge</text>
+</svg>

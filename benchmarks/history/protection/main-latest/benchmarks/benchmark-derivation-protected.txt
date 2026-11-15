@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+pkg: github.com/nostrmash/nostrmash/internal/derivation
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkDeriveEventReferences-4   	 2177648	       555.1 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2151480	       563.3 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2137222	       554.1 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2129973	       560.8 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2177929	       557.8 ns/op	    1424 B/op	       5 allocs/op
+PASS
+ok  	github.com/nostrmash/nostrmash/internal/derivation	8.852s

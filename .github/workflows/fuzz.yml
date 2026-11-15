@@ -1,0 +1,51 @@
+name: Fuzz
+
+# Fuzz targets' seed corpora run on every PR via the normal test suite, but
+# nothing ever runs with -fuzz there. This nightly job gives the WS/API fuzz
+# targets a real (bounded) execution budget off the PR critical path. A crash
+# is a real bug, so the job is gating; the crasher input is uploaded as an
+# artifact for replay and committing as a regression seed.
+
+on:
+  schedule:
+    # 07:20 UTC daily (offset off the hour to dodge scheduler congestion).
+    - cron: "20 7 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Per-target fuzz budget (e.g. 20s, 2m)"
+        required: false
+        default: "60s"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: WS/API fuzz budget
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.11"
+          cache: true
+
+      - name: Run fuzz targets
+        env:
+          FUZZTIME: ${{ inputs.fuzztime || '60s' }}
+        run: make fuzz
+
+      - name: Upload fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashers-${{ github.run_number }}
+          path: |
+            internal/api/testdata/fuzz/
+            internal/api_primal/testdata/fuzz/
+          retention-days: 30
+          if-no-files-found: ignore

@@ -1,0 +1,13 @@
+# Keep .git in the build context so the Dockerfile can stamp
+# main.buildCommit from `git rev-parse HEAD` (Coolify's SOURCE_COMMIT
+# env is a frozen override and must not label a newer checkout).
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+id_rsa
+id_ed25519
+credentials.json
+secrets/
+*.md

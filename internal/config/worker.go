@@ -1,0 +1,843 @@
+package config
+
+import (
+	"fmt"
+	"net/url"
+	"time"
+)
+
+type WorkerConfig struct {
+	Shared                     SharedConfig
+	Concurrency                int
+	LiveConcurrency            int
+	BackfillConcurrency        int
+	ClaimBatchSize             int
+	JobRecovery                WorkerJobRecoveryConfig
+	JobRetention               WorkerJobRetentionConfig
+	InvalidEventRetention      WorkerInvalidEventRetentionConfig
+	EngagementRetention        WorkerEngagementRetentionConfig
+	ReplaceableRetention       WorkerReplaceableRetentionConfig
+	DeletionRetention          WorkerDeletionRetentionConfig
+	DeletionLedgerRetention    WorkerDeletionLedgerRetentionConfig
+	UntrustedAuthorRetention   WorkerUntrustedAuthorRetentionConfig
+	AuthorRecentRetention      WorkerAuthorRecentRetentionConfig
+	SearchDocsRetention        WorkerSearchDocsRetentionConfig
+	EventRelaysRetention       WorkerEventRelaysRetentionConfig
+	EventTagsRetention         WorkerEventTagsRetentionConfig
+	AppliedStatDeltasRetention WorkerAppliedStatDeltasRetentionConfig
+	FollowerGainRetention      WorkerFollowerGainEventsRetentionConfig
+	TrustRetentionHooks        TrustRetentionHooksConfig
+	TrustRetentionLoop         WorkerTrustRetentionLoopConfig
+	AuthorAnalyticsSweeper     WorkerAuthorAnalyticsSweeperConfig
+	ProfileStatsSweeper        WorkerProfileStatsSweeperConfig
+	MeilisearchSweeper         WorkerMeilisearchSweeperConfig
+	IncrementalStats           WorkerIncrementalStatsConfig
+	DiscoveryEngagement        WorkerDiscoveryEngagementConfig
+	AccountState               WorkerAccountStateConfig
+	Hydration                  HydrationConfig
+	Meilisearch                MeilisearchConfig
+	RelayRegistry              RelayRegistryConfig
+	NIP05                      WorkerNIP05Config
+	ExpiredEventRetention      WorkerExpiredEventRetentionConfig
+	BridgedEventRetention      WorkerBridgedEventRetentionConfig
+}
+
+// WorkerIncrementalStatsConfig controls the O(1) delta path that replaces
+// full-history recomputes for profile_public_stats, author_activity_daily,
+// and profile_discovery_stats. See docs/design/incremental-author-stats.md.
+type WorkerIncrementalStatsConfig struct {
+	ProfilePublicStats    bool
+	AuthorActivityDaily   bool
+	WindowedRollups       bool
+	ProfileDiscoveryStats bool
+	Reconciliation        WorkerIncrementalStatsReconciliationConfig
+}
+
+// WorkerIncrementalStatsReconciliationConfig configures the periodic
+// correctness backstop described in
+// docs/design/incremental-author-stats.md ("Correctness backstop: keep
+// full-recompute, make it rare"). Each run full-recomputes SampleSize
+// pubkeys (read-only) and compares against the incrementally-maintained
+// values, logging/alerting on any mismatch.
+type WorkerIncrementalStatsReconciliationConfig struct {
+	Enabled    bool
+	Interval   time.Duration
+	SampleSize int
+}
+
+// WorkerDiscoveryEngagementConfig controls trust-graph weighting of
+// discovery scoring: note trending, hot-conversation reply weights, and
+// profile trending/rising score inputs (engagement, zap volume, new-follower
+// momentum). Per-engager deduplication and author self-engagement exclusion
+// are unconditional; TrustWeighted additionally scales each engager's vote
+// by trust-graph proximity (hop ladder bounded by TRUST_MAX_HOPS) with
+// UntrustedWeight for engagers outside the graph.
+type WorkerDiscoveryEngagementConfig struct {
+	TrustWeighted   bool
+	UntrustedWeight float64
+}
+
+// WorkerAccountStateConfig configures the derived account-state recompute loop.
+// The loop periodically reads a batch of accounts whose state is stale, derives
+// a fresh state from cheap signals (trust hops, observation count, profile
+// presence, note count), records any transition, and refreshes the per-state
+// count metrics. It also prunes the append-only transition audit table.
+type WorkerAccountStateConfig struct {
+	Enabled                   bool
+	Interval                  time.Duration
+	BatchSize                 int
+	StaleAfter                time.Duration
+	TransitionRetentionMaxAge time.Duration
+}
+
+// WorkerAuthorAnalyticsSweeperConfig configures the background loop that
+// drains pending_author_analytics_recomputes. The per-event derive bundle
+// only marks affected pubkeys as dirty (cheap upsert); this sweeper runs
+// the heavy aggregation rebuild once per pubkey per cycle, naturally
+// coalescing event bursts into a single rebuild.
+//
+// WindowsDays controls which window_days values the per-pubkey rebuild
+// recomputes. The schema permits {7, 30, 90}; the default of {7, 30}
+// drops the most expensive window because each rebuild's cost is roughly
+// linear in the window count and dominated by the 90d scan. Operators
+// who need the 90d window refreshed in real time can set
+// WORKER_AUTHOR_ANALYTICS_WINDOWS_DAYS=7,30,90.
+//
+// RebuildTimeout caps how long a single per-pubkey rebuild can hold its
+// transaction (and therefore its pgxpool connection). On timeout the
+// transaction rolls back, the per-pubkey advisory lock auto-releases,
+// and the pending row is restored — so the pubkey is automatically
+// retried on the next sweeper cycle. This is a safety net against any
+// single hot pubkey monopolizing a connection long enough to starve
+// bundle workers.
+type WorkerAuthorAnalyticsSweeperConfig struct {
+	Enabled        bool
+	Interval       time.Duration
+	BatchSize      int
+	Concurrency    int
+	WindowsDays    []int
+	RebuildTimeout time.Duration
+}
+
+// WorkerProfileStatsSweeperConfig configures the background loop that
+// drains pending_profile_stats_recomputes. The per-event derive bundle
+// only marks affected pubkeys as dirty (cheap upsert); this sweeper
+// runs the heavy ProjectProfilePublicStats and
+// ProjectProfileDiscoveryStats recompute once per pubkey per cycle,
+// coalescing event bursts into a single recompute and removing the
+// per-pubkey advisory-lock contention from the bundle critical path.
+type WorkerProfileStatsSweeperConfig struct {
+	Enabled     bool
+	Interval    time.Duration
+	BatchSize   int
+	Concurrency int
+}
+
+// WorkerMeilisearchSweeperConfig configures the background loop that
+// drains pending_meilisearch_syncs. The per-event derive bundle only
+// records that an event needs indexing (cheap upsert); this sweeper
+// performs the actual HTTP sync to Meilisearch out of band so a slow
+// Meilisearch never caps live-pool throughput.
+//
+// BatchTimeout bounds the entire claim+sync call the sweeper loop makes
+// per tick (DrainPendingMeilisearchSyncBatch), not just the Meilisearch
+// HTTP portion that meili.SyncEventsBatch already caps internally.
+// Production observed the sweeper goroutines going completely silent
+// for hours (zero batches observed, success or error) while Meilisearch
+// was CPU-saturated — consistent with a hang somewhere in the call path
+// that the inner Meili-only timeout never covered (e.g. the claim
+// transaction). This is the same safety net pattern as
+// WorkerAuthorAnalyticsSweeperConfig.RebuildTimeout: on timeout the
+// call returns, the batch is logged as a timed-out error, and the next
+// ticker cycle retries — a goroutine can never block longer than this
+// regardless of where in DrainPendingMeilisearchSyncBatch it stalls.
+type WorkerMeilisearchSweeperConfig struct {
+	Enabled      bool
+	Interval     time.Duration
+	BatchSize    int
+	Concurrency  int
+	BatchTimeout time.Duration
+}
+
+type WorkerJobRetentionConfig struct {
+	Enabled          bool
+	SucceededMaxAge  time.Duration
+	DeadMaxAge       time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+type WorkerInvalidEventRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+	PayloadTrim      WorkerInvalidEventPayloadTrimConfig
+}
+
+type WorkerInvalidEventPayloadTrimConfig struct {
+	Enabled    bool
+	MaxAge     time.Duration
+	BatchLimit int
+}
+
+// WorkerNIP05Config configures outbound NIP-05 verification. It is off until
+// an operator turns it on, because it fetches https://domain/.well-known/nostr.json.
+type WorkerNIP05Config struct {
+	Enabled         bool
+	Interval        time.Duration
+	Batch           int
+	Timeout         time.Duration
+	RecheckInterval time.Duration
+}
+
+// WorkerExpiredEventRetentionConfig deletes events whose NIP-40 expiration
+// is older than Grace.
+type WorkerExpiredEventRetentionConfig struct {
+	Enabled          bool
+	Grace            time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerBridgedEventRetentionConfig purges stored events that carry a NIP-48
+// proxy tag. The ingestor drops new ones, so this drains the backlog that
+// predates the drop: full batches repeat after BatchPause until a short batch,
+// then the loop waits RunInterval.
+type WorkerBridgedEventRetentionConfig struct {
+	Enabled          bool
+	RunInterval      time.Duration
+	BatchPause       time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerEngagementRetentionConfig configures the purger that deletes raw
+// engagement events (kinds 6/7/1059/9321/9735) older than MaxAge. Kind 1059
+// is also deleted 48h after first_seen_at. Lifetime aggregate
+// counters (reaction_counts/repost_counts have no FK to events) survive the
+// delete; only the high-volume raw rows and their cascade-cleaned
+// contribution/interaction rows are removed.
+//
+// DeadGrace is the derivation-safety window: a raw event is never purged while
+// its derive_event_bundle job is pending/running, nor while that job is dead
+// and was last updated within DeadGrace. Past DeadGrace a permanently-dead
+// derivation no longer blocks cleanup, so one broken path cannot pin disk
+// forever.
+type WorkerEngagementRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	DeadGrace        time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerReplaceableRetentionConfig configures the purger that deletes raw
+// replaceable events (kinds 0/3/10000/10002/10003 and parameterized 30023)
+// that have been strictly superseded by a newer winner. The latest-version
+// projections (contact_lists_latest, relay_lists_latest, profiles_latest,
+// replaceable_state) all reference the winner, so only superseded versions are
+// removed and the read models survive.
+//
+// MinAge is the stability window applied to events.first_seen_at: a superseded
+// version is only eligible once it has existed for at least this long, so a
+// freshly-ingested version (including backfilled events with an ancient
+// author-claimed created_at) is never purged immediately after being
+// superseded.
+//
+// DeadGrace is the derivation-safety window: a candidate is never purged while
+// its derive_event_bundle job is pending/running, nor while that job is dead
+// and was last updated within DeadGrace.
+type WorkerReplaceableRetentionConfig struct {
+	Enabled          bool
+	MinAge           time.Duration
+	DeadGrace        time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerUntrustedAuthorRetentionConfig configures the purgers that delete
+// author-gated rows whose author is absent from trust_graph_snapshot:
+//
+//   - raw events (kinds 1/4/5/9802/10000/10003/30023), once older than MaxAge
+//     (enforced on both created_at and first_seen_at). Kind-1 replies that
+//     already have a thread_edges row are kept (target-exists ingest). This is
+//     the months-scale complement to the ingest trust gate: the gate bounds
+//     inflow, this reclaims untrusted residue accepted while the gate was
+//     open (shadow mode, pre-gate history).
+//   - derived event_urls / event_hashtags rows (added 2026-08-01), with no
+//     age gating — these are the retroactive complement to the write-time
+//     trust gate in internal/derivation (projection_urls.go /
+//     projection_hashtags.go): that gate stops new rows for untrusted
+//     authors going forward, this reclaims rows written before the gate
+//     existed, or from an author later dropped from the trust graph.
+//
+// The default MaxAge is deliberately short (14 d): with the default
+// INGESTOR_TRUST_GATE_MODE=open a firehose deployment ingests everything, so
+// the untrusted horizon is what actually bounds steady-state disk usage.
+//
+// Fail-safe: every purge here deletes nothing while trust_graph_snapshot is
+// empty, so an unbootstrapped trust pipeline never causes mass deletion.
+//
+// DeadGrace mirrors the other retention loops (derivation-safety window) and
+// only applies to the raw-events purge; the link purges have no equivalent
+// in-flight-derivation hazard since they never delete an events row.
+type WorkerUntrustedAuthorRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	DeadGrace        time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerAuthorRecentRetentionConfig configures the pruner that bounds the
+// author_recent_events projection: rows older than MaxAge are removed, and
+// each author keeps at most PerAuthorCap newest rows. The projection is
+// rebuildable from canonical events, so this retention is purely a disk/read
+// bound; PerAuthorCap must stay above the API's per-request max limit so
+// bounded reads are unaffected.
+//
+// AuthorBatchLimit caps how many over-cap authors a single cap pass trims,
+// keeping the per-run GROUP BY work bounded.
+type WorkerAuthorRecentRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	PerAuthorCap     int
+	AuthorBatchLimit int
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerSearchDocsRetentionConfig configures the search_documents groomer:
+// note bodies older than BodyMaxAge are trimmed to BodyMaxChars (the
+// generated search_tsv shrinks with the body), and rows whose source event no
+// longer exists are pruned. Both operations are rebuildable state changes;
+// stale trimmed rows regain their full body if the source is re-indexed.
+type WorkerSearchDocsRetentionConfig struct {
+	Enabled      bool
+	BodyMaxAge   time.Duration
+	BodyMaxChars int
+	RunInterval  time.Duration
+	BatchLimit   int
+}
+
+// WorkerTrustRetentionLoopConfig owns the loop cadence for the durable
+// trust-retention hooks (stale trusted discovery candidates, idle low-value
+// account_states rows). The per-scope enable flags and horizons live in
+// TrustRetentionHooksConfig (TRUST_RETENTION_* envs); this struct only adds
+// the worker-side execution knobs.
+type WorkerTrustRetentionLoopConfig struct {
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerEventRelaysRetentionConfig configures the provenance pruner that
+// deletes event_relays rows seen before MaxAge, always retaining the
+// earliest-seen row per event so first-provenance survives. Windowed relay
+// analytics read far inside the horizon and are unaffected.
+type WorkerEventRelaysRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerEventTagsRetentionConfig configures the pruner that deletes
+// event_tags rows excluded by the ingest allowlist (junk tag names, kind-3
+// contact-list p-tags, kind-10002 relay-list r-tags). See
+// internal/eventtags and docs/design/storage-discipline.md. No age
+// horizon: once the historical backlog drains, each tick is a no-op.
+type WorkerEventTagsRetentionConfig struct {
+	Enabled          bool
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerAppliedStatDeltasRetentionConfig configures the pruner that reclaims
+// orphaned applied_stat_deltas ledger rows (see
+// docs/design/incremental-author-stats.md and
+// internal/store/retention/applied_stat_deltas_retention.go). A row is only
+// ever pruned once its source event has been deleted — GracePeriod is a
+// conservative buffer on top of that (not itself a correctness
+// requirement) that keeps freshly-inserted rows out of the scan.
+type WorkerAppliedStatDeltasRetentionConfig struct {
+	Enabled          bool
+	GracePeriod      time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerFollowerGainEventsRetentionConfig configures the pruner that deletes
+// follower_gain_events rows (true kind=3 edge-diff follower gains, see
+// migrations/000086_follower_gain_events.sql) whose insert time has aged
+// past MaxAge. Every reader windows gains to at most 30 days, so MaxAge only
+// needs to exceed that; the prune is hygiene that keeps the table bounded
+// by roughly one horizon of gains, not a correctness horizon.
+type WorkerFollowerGainEventsRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerDeletionRetentionConfig configures the purger that deletes raw deletion
+// events (kind 5) older than MaxAge once their derivation has completed. The
+// distilled deletion_events ledger row survives (migration 000050 dropped the
+// events FK cascade), so tombstone knowledge is preserved while the
+// high-volume raw rows and their cascade-cleaned tags/references are removed.
+//
+// DeadGrace is the derivation-safety window: a raw event is never purged while
+// its derive_event_bundle job is pending/running, nor while that job is dead
+// and was last updated within DeadGrace.
+type WorkerDeletionRetentionConfig struct {
+	Enabled          bool
+	MaxAge           time.Duration
+	DeadGrace        time.Duration
+	RunInterval      time.Duration
+	DeleteBatchLimit int
+}
+
+// WorkerDeletionLedgerRetentionConfig configures the sweep that purges
+// deletion_events tombstone ledger rows older than MaxAge whose target event
+// is not stored. Every ledger consumer anti-joins it against stored events,
+// so orphan tombstones only matter if their target arrives later via
+// fallback/backfill — MaxAge bounds how long that window stays open.
+// Tombstones whose target is stored are never purged regardless of age.
+//
+// ScanBatchLimit bounds each keyset window (rows scanned, not rows deleted);
+// the sweep walks the whole eligible range once per RunInterval, so the
+// interval is deliberately long (daily) rather than the hourly cadence of
+// the bounded single-batch purges.
+type WorkerDeletionLedgerRetentionConfig struct {
+	Enabled        bool
+	MaxAge         time.Duration
+	RunInterval    time.Duration
+	ScanBatchLimit int
+}
+
+func LoadWorker() (WorkerConfig, error) {
+	shared, err := loadSharedConfig("worker")
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	concurrency, err := loadWorkerConcurrency()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	jobRecovery, err := loadWorkerJobRecoveryConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	jobRetention, err := loadWorkerJobRetentionConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	retention, err := loadWorkerRetentionConfigs()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	trustRetentionHooks, err := loadTrustRetentionHooksConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	sweepers, err := loadWorkerSweeperConfigs()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	accountState, err := loadWorkerAccountStateConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	incrementalStats, err := loadWorkerIncrementalStatsConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	discoveryEngagement, err := loadWorkerDiscoveryEngagementConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	hydrationCfg, err := loadHydrationConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	nip05Cfg, err := loadWorkerNIP05Config()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	expiredCfg, err := loadExpiredEventRetentionConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	bridgedCfg, err := loadBridgedEventRetentionConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	cfg := WorkerConfig{
+		Shared:                     shared,
+		Concurrency:                concurrency.Concurrency,
+		LiveConcurrency:            concurrency.LiveConcurrency,
+		BackfillConcurrency:        concurrency.BackfillConcurrency,
+		ClaimBatchSize:             concurrency.ClaimBatchSize,
+		JobRecovery:                jobRecovery,
+		JobRetention:               jobRetention,
+		InvalidEventRetention:      retention.InvalidEvent,
+		EngagementRetention:        retention.Engagement,
+		ReplaceableRetention:       retention.Replaceable,
+		DeletionRetention:          retention.Deletion,
+		DeletionLedgerRetention:    retention.DeletionLedger,
+		UntrustedAuthorRetention:   retention.UntrustedAuthor,
+		AuthorRecentRetention:      retention.AuthorRecent,
+		SearchDocsRetention:        retention.SearchDocs,
+		EventRelaysRetention:       retention.EventRelays,
+		EventTagsRetention:         retention.EventTags,
+		AppliedStatDeltasRetention: retention.AppliedStatDeltas,
+		FollowerGainRetention:      retention.FollowerGainEvents,
+		TrustRetentionHooks:        trustRetentionHooks,
+		TrustRetentionLoop:         retention.TrustRetention,
+		AuthorAnalyticsSweeper:     sweepers.AuthorAnalytics,
+		ProfileStatsSweeper:        sweepers.ProfileStats,
+		MeilisearchSweeper:         sweepers.Meilisearch,
+		IncrementalStats:           incrementalStats,
+		DiscoveryEngagement:        discoveryEngagement,
+		AccountState:               accountState,
+		Hydration:                  hydrationCfg,
+		Meilisearch:                loadWorkerMeilisearchConfig(),
+		NIP05:                      nip05Cfg,
+		ExpiredEventRetention:      expiredCfg,
+		BridgedEventRetention:      bridgedCfg,
+	}
+	relayRegistryCfg, err := LoadRelayRegistryConfig()
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	cfg.RelayRegistry = relayRegistryCfg
+
+	if err := validateWorkerConfig(cfg); err != nil {
+		return WorkerConfig{}, err
+	}
+	return cfg, nil
+}
+
+// loadWorkerJobRetentionConfig reads the WORKER_JOB_RETENTION_* envs and
+// returns the populated config. Called by both LoadWorker and LoadTrustWorker
+// so that the trust worker (which previously did not run the retention loop
+// at all) shares the same retention semantics. Defaults are tuned for the
+// observed steady-state job volume: succeeded jobs are queue exhaust and only
+// matter for live debugging (6h), dead jobs keep a short triage window (7d).
+// Keeping these tight prevents the jobs indexes from bloating under high churn
+// on a single-server host.
+func loadWorkerJobRetentionConfig() (WorkerJobRetentionConfig, error) {
+	succeededMaxAge, err := getEnvPositiveDurationStrict("WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE", 6*time.Hour)
+	if err != nil {
+		return WorkerJobRetentionConfig{}, err
+	}
+	deadMaxAge, err := getEnvPositiveDurationStrict("WORKER_JOB_RETENTION_DEAD_MAX_AGE", 7*24*time.Hour)
+	if err != nil {
+		return WorkerJobRetentionConfig{}, err
+	}
+	runInterval, err := getEnvPositiveDurationStrict("WORKER_JOB_RETENTION_RUN_INTERVAL", 15*time.Minute)
+	if err != nil {
+		return WorkerJobRetentionConfig{}, err
+	}
+	deleteBatchLimit, err := getEnvPositiveIntStrict("WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT", 2000)
+	if err != nil {
+		return WorkerJobRetentionConfig{}, err
+	}
+	return WorkerJobRetentionConfig{
+		Enabled:          getEnvBool("WORKER_JOB_RETENTION_ENABLED", true),
+		SucceededMaxAge:  succeededMaxAge,
+		DeadMaxAge:       deadMaxAge,
+		RunInterval:      runInterval,
+		DeleteBatchLimit: deleteBatchLimit,
+	}, nil
+}
+
+func validateWorkerConfig(cfg WorkerConfig) error {
+	if cfg.Concurrency <= 0 {
+		return fmt.Errorf("WORKER_CONCURRENCY must be > 0")
+	}
+	if cfg.LiveConcurrency < 0 {
+		return fmt.Errorf("WORKER_LIVE_CONCURRENCY must be >= 0")
+	}
+	if cfg.BackfillConcurrency < 0 {
+		return fmt.Errorf("WORKER_BACKFILL_CONCURRENCY must be >= 0")
+	}
+	if cfg.ClaimBatchSize <= 0 {
+		return fmt.Errorf("WORKER_CLAIM_BATCH_SIZE must be > 0")
+	}
+	if err := validateWorkerJobRecoveryConfig(cfg.JobRecovery); err != nil {
+		return err
+	}
+	if cfg.JobRetention.Enabled {
+		if cfg.JobRetention.SucceededMaxAge <= 0 {
+			return fmt.Errorf("WORKER_JOB_RETENTION_SUCCEEDED_MAX_AGE must be > 0")
+		}
+		if cfg.JobRetention.DeadMaxAge <= 0 {
+			return fmt.Errorf("WORKER_JOB_RETENTION_DEAD_MAX_AGE must be > 0")
+		}
+		if cfg.JobRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_JOB_RETENTION_RUN_INTERVAL must be > 0")
+		}
+		if cfg.JobRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_JOB_RETENTION_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.InvalidEventRetention.Enabled {
+		if cfg.InvalidEventRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_INVALID_EVENTS_RETENTION_MAX_AGE must be > 0")
+		}
+		if cfg.InvalidEventRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_INVALID_EVENTS_RETENTION_RUN_INTERVAL must be > 0")
+		}
+		if cfg.InvalidEventRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_INVALID_EVENTS_RETENTION_DELETE_BATCH_LIMIT must be > 0")
+		}
+		if cfg.InvalidEventRetention.PayloadTrim.Enabled {
+			if cfg.InvalidEventRetention.PayloadTrim.MaxAge <= 0 {
+				return fmt.Errorf("WORKER_INVALID_EVENTS_PAYLOAD_TRIM_MAX_AGE must be > 0")
+			}
+			if cfg.InvalidEventRetention.PayloadTrim.BatchLimit <= 0 {
+				return fmt.Errorf("WORKER_INVALID_EVENTS_PAYLOAD_TRIM_BATCH_LIMIT must be > 0")
+			}
+			if cfg.InvalidEventRetention.PayloadTrim.MaxAge >= cfg.InvalidEventRetention.MaxAge {
+				return fmt.Errorf("WORKER_INVALID_EVENTS_PAYLOAD_TRIM_MAX_AGE must be smaller than WORKER_INVALID_EVENTS_RETENTION_MAX_AGE")
+			}
+		}
+	}
+	if cfg.EngagementRetention.Enabled {
+		if cfg.EngagementRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_ENGAGEMENT_MAX_AGE must be > 0")
+		}
+		if cfg.EngagementRetention.DeadGrace <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_ENGAGEMENT_DEAD_GRACE must be > 0")
+		}
+		if cfg.EngagementRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_ENGAGEMENT_RUN_INTERVAL must be > 0")
+		}
+		if cfg.EngagementRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_ENGAGEMENT_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.ReplaceableRetention.Enabled {
+		if cfg.ReplaceableRetention.MinAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_REPLACEABLE_MIN_AGE must be > 0")
+		}
+		if cfg.ReplaceableRetention.DeadGrace <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_REPLACEABLE_DEAD_GRACE must be > 0")
+		}
+		if cfg.ReplaceableRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_REPLACEABLE_RUN_INTERVAL must be > 0")
+		}
+		if cfg.ReplaceableRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_REPLACEABLE_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.DeletionRetention.Enabled {
+		if cfg.DeletionRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_MAX_AGE must be > 0")
+		}
+		if cfg.DeletionRetention.DeadGrace <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_DEAD_GRACE must be > 0")
+		}
+		if cfg.DeletionRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_RUN_INTERVAL must be > 0")
+		}
+		if cfg.DeletionRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.DeletionLedgerRetention.Enabled {
+		if cfg.DeletionLedgerRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_LEDGER_MAX_AGE must be > 0")
+		}
+		if cfg.DeletionLedgerRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_LEDGER_RUN_INTERVAL must be > 0")
+		}
+		if cfg.DeletionLedgerRetention.ScanBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_DELETION_LEDGER_SCAN_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.UntrustedAuthorRetention.Enabled {
+		if cfg.UntrustedAuthorRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_UNTRUSTED_AUTHOR_MAX_AGE must be > 0")
+		}
+		if cfg.UntrustedAuthorRetention.DeadGrace <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_UNTRUSTED_AUTHOR_DEAD_GRACE must be > 0")
+		}
+		if cfg.UntrustedAuthorRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_UNTRUSTED_AUTHOR_RUN_INTERVAL must be > 0")
+		}
+		if cfg.UntrustedAuthorRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_UNTRUSTED_AUTHOR_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.AuthorRecentRetention.Enabled {
+		if cfg.AuthorRecentRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_MAX_AGE must be > 0")
+		}
+		if cfg.AuthorRecentRetention.PerAuthorCap <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_PER_AUTHOR_CAP must be > 0")
+		}
+		if cfg.AuthorRecentRetention.PerAuthorCap < 100 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_PER_AUTHOR_CAP must be >= 100 (the API serves up to 100 recent events per request)")
+		}
+		if cfg.AuthorRecentRetention.AuthorBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_AUTHOR_BATCH_LIMIT must be > 0")
+		}
+		if cfg.AuthorRecentRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_RUN_INTERVAL must be > 0")
+		}
+		if cfg.AuthorRecentRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_AUTHOR_RECENT_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.SearchDocsRetention.Enabled {
+		if cfg.SearchDocsRetention.BodyMaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_SEARCH_DOCS_BODY_MAX_AGE must be > 0")
+		}
+		if cfg.SearchDocsRetention.BodyMaxChars <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_SEARCH_DOCS_BODY_MAX_CHARS must be > 0")
+		}
+		if cfg.SearchDocsRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_SEARCH_DOCS_RUN_INTERVAL must be > 0")
+		}
+		if cfg.SearchDocsRetention.BatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_SEARCH_DOCS_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.EventRelaysRetention.Enabled {
+		if cfg.EventRelaysRetention.MaxAge <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EVENT_RELAYS_MAX_AGE must be > 0")
+		}
+		if cfg.EventRelaysRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EVENT_RELAYS_RUN_INTERVAL must be > 0")
+		}
+		if cfg.EventRelaysRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EVENT_RELAYS_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.EventTagsRetention.Enabled {
+		if cfg.EventTagsRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EVENT_TAGS_RUN_INTERVAL must be > 0")
+		}
+		if cfg.EventTagsRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EVENT_TAGS_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.AppliedStatDeltasRetention.Enabled {
+		if cfg.AppliedStatDeltasRetention.GracePeriod <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_APPLIED_STAT_DELTAS_GRACE_PERIOD must be > 0")
+		}
+		if cfg.AppliedStatDeltasRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_APPLIED_STAT_DELTAS_RUN_INTERVAL must be > 0")
+		}
+		if cfg.AppliedStatDeltasRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_APPLIED_STAT_DELTAS_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.FollowerGainRetention.Enabled {
+		if cfg.FollowerGainRetention.MaxAge < 31*24*time.Hour {
+			return fmt.Errorf("WORKER_RETENTION_FOLLOWER_GAIN_EVENTS_MAX_AGE must be >= 744h (rows feed the 30d discovery window)")
+		}
+		if cfg.FollowerGainRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_FOLLOWER_GAIN_EVENTS_RUN_INTERVAL must be > 0")
+		}
+		if cfg.FollowerGainRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_FOLLOWER_GAIN_EVENTS_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.AuthorAnalyticsSweeper.Enabled {
+		if cfg.AuthorAnalyticsSweeper.Interval <= 0 {
+			return fmt.Errorf("WORKER_AUTHOR_ANALYTICS_SWEEPER_INTERVAL must be > 0")
+		}
+		if cfg.AuthorAnalyticsSweeper.BatchSize <= 0 {
+			return fmt.Errorf("WORKER_AUTHOR_ANALYTICS_SWEEPER_BATCH_SIZE must be > 0")
+		}
+		if cfg.AuthorAnalyticsSweeper.Concurrency <= 0 {
+			return fmt.Errorf("WORKER_AUTHOR_ANALYTICS_SWEEPER_CONCURRENCY must be > 0")
+		}
+	}
+	if cfg.ProfileStatsSweeper.Enabled {
+		if cfg.ProfileStatsSweeper.Interval <= 0 {
+			return fmt.Errorf("WORKER_PROFILE_STATS_SWEEPER_INTERVAL must be > 0")
+		}
+		if cfg.ProfileStatsSweeper.BatchSize <= 0 {
+			return fmt.Errorf("WORKER_PROFILE_STATS_SWEEPER_BATCH_SIZE must be > 0")
+		}
+		if cfg.ProfileStatsSweeper.Concurrency <= 0 {
+			return fmt.Errorf("WORKER_PROFILE_STATS_SWEEPER_CONCURRENCY must be > 0")
+		}
+	}
+	if cfg.IncrementalStats.ProfileDiscoveryStats {
+		if !cfg.IncrementalStats.ProfilePublicStats {
+			return fmt.Errorf("WORKER_INCREMENTAL_PROFILE_DISCOVERY_STATS=true requires WORKER_INCREMENTAL_PROFILE_PUBLIC_STATS=true")
+		}
+		if !cfg.IncrementalStats.AuthorActivityDaily {
+			return fmt.Errorf("WORKER_INCREMENTAL_PROFILE_DISCOVERY_STATS=true requires WORKER_INCREMENTAL_AUTHOR_ACTIVITY_DAILY=true")
+		}
+	}
+	if cfg.IncrementalStats.Reconciliation.Enabled {
+		if cfg.IncrementalStats.Reconciliation.Interval <= 0 {
+			return fmt.Errorf("WORKER_INCREMENTAL_STATS_RECONCILIATION_INTERVAL must be > 0")
+		}
+		if cfg.IncrementalStats.Reconciliation.SampleSize <= 0 {
+			return fmt.Errorf("WORKER_INCREMENTAL_STATS_RECONCILIATION_SAMPLE_SIZE must be > 0")
+		}
+	}
+	if cfg.MeilisearchSweeper.Enabled {
+		if cfg.MeilisearchSweeper.Interval <= 0 {
+			return fmt.Errorf("WORKER_MEILISEARCH_SWEEPER_INTERVAL must be > 0")
+		}
+		if cfg.MeilisearchSweeper.BatchSize <= 0 {
+			return fmt.Errorf("WORKER_MEILISEARCH_SWEEPER_BATCH_SIZE must be > 0")
+		}
+		if cfg.MeilisearchSweeper.Concurrency <= 0 {
+			return fmt.Errorf("WORKER_MEILISEARCH_SWEEPER_CONCURRENCY must be > 0")
+		}
+	}
+	if cfg.NIP05.Enabled {
+		if cfg.NIP05.Interval <= 0 {
+			return fmt.Errorf("WORKER_NIP05_INTERVAL must be > 0")
+		}
+		if cfg.NIP05.Batch <= 0 {
+			return fmt.Errorf("WORKER_NIP05_BATCH must be > 0")
+		}
+		if cfg.NIP05.Timeout <= 0 {
+			return fmt.Errorf("WORKER_NIP05_TIMEOUT must be > 0")
+		}
+		if cfg.NIP05.RecheckInterval <= 0 {
+			return fmt.Errorf("WORKER_NIP05_RECHECK_INTERVAL must be > 0")
+		}
+	}
+	if cfg.ExpiredEventRetention.Enabled {
+		if cfg.ExpiredEventRetention.Grace <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EXPIRED_GRACE must be > 0")
+		}
+		if cfg.ExpiredEventRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EXPIRED_RUN_INTERVAL must be > 0")
+		}
+		if cfg.ExpiredEventRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_EXPIRED_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.BridgedEventRetention.Enabled {
+		if cfg.BridgedEventRetention.RunInterval <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_BRIDGED_RUN_INTERVAL must be > 0")
+		}
+		if cfg.BridgedEventRetention.BatchPause <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_BRIDGED_BATCH_PAUSE must be > 0")
+		}
+		if cfg.BridgedEventRetention.DeleteBatchLimit <= 0 {
+			return fmt.Errorf("WORKER_RETENTION_BRIDGED_DELETE_BATCH_LIMIT must be > 0")
+		}
+	}
+	if cfg.Meilisearch.Enabled {
+		if cfg.Meilisearch.URL == "" {
+			return fmt.Errorf("MEILI_ENABLED requires MEILI_URL")
+		}
+		parsed, err := url.Parse(cfg.Meilisearch.URL)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("MEILI_URL must be a valid http(s) URL")
+		}
+	}
+	return nil
+}
