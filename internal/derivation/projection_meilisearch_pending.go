@@ -77,42 +77,114 @@ func (h *Handlers) MarkMeilisearchDirty(ctx context.Context, eventID string) err
 	return nil
 }
 
-// DrainPendingMeilisearchSyncBatch claims up to limit pending event_ids
-// from pending_meilisearch_syncs using FOR UPDATE SKIP LOCKED, runs
-// h.meili.SyncEvent for each, and removes them from the pending table on
-// success. Failures re-mark the event so the next cycle retries.
-//
-// Returns the number of events synced successfully and the first error
-// encountered (if any). Callers should log and continue — the next
-// cycle will retry any failed events.
+// meiliClaimTarget selects which pending rows a drain claims. A mixed
+// batch makes Meilisearch commit every index: the notes commit costs the
+// same ~30s for a few dozen documents as it would for a full batch, and
+// running it beside every profile batch left the profiles index idle for
+// that whole commit. Profiles are almost the entire backlog, so they drain
+// on their own. Notes drain only once a full batch is waiting, or the
+// oldest note has waited out the sweeper interval.
+type meiliClaimTarget int
+
+const (
+	meiliClaimOldest meiliClaimTarget = iota
+	meiliClaimProfiles
+	meiliClaimNotes
+)
+
+// meiliClaim is one homogeneous batch already removed from
+// pending_meilisearch_syncs. SyncIDs is what Meilisearch should upsert
+// (one event per profile pubkey; every note). Picked is how many rows the
+// LIMIT locked before profile duplicates were collapsed, and is the signal
+// that more of this kind is still waiting.
+type meiliClaim struct {
+	syncIDs []string
+	picked  int
+}
+
+// DrainPendingMeilisearchSyncBatch claims one kind — whichever pending row
+// is oldest — and syncs it. Profile rows for the same author collapse to a
+// single upsert.
 func (h *Handlers) DrainPendingMeilisearchSyncBatch(ctx context.Context, limit int) (int, error) {
+	synced, _, err := h.drainPendingMeilisearchSyncBatch(ctx, limit, meiliClaimOldest)
+	return synced, err
+}
+
+// DrainPendingProfileMeilisearchSyncBatch drains kind-0 rows only. Picked
+// counts rows locked before same-author duplicates were collapsed, so a
+// full claim still reports picked == limit when many authors repeat.
+func (h *Handlers) DrainPendingProfileMeilisearchSyncBatch(ctx context.Context, limit int) (synced, picked int, err error) {
+	return h.drainPendingMeilisearchSyncBatch(ctx, limit, meiliClaimProfiles)
+}
+
+// DrainPendingNoteMeilisearchSyncBatch drains indexed note kinds only.
+func (h *Handlers) DrainPendingNoteMeilisearchSyncBatch(ctx context.Context, limit int) (synced, picked int, err error) {
+	return h.drainPendingMeilisearchSyncBatch(ctx, limit, meiliClaimNotes)
+}
+
+// IndexedNoteSyncDue reports whether a note commit is worth its fixed cost.
+// A full batch always is. A short batch is, once the oldest note has waited
+// maxWait, so a trickle still lands.
+func (h *Handlers) IndexedNoteSyncDue(ctx context.Context, batchSize int, maxWait time.Duration) (bool, error) {
 	if h == nil || h.pool == nil {
-		return 0, fmt.Errorf("handlers are not initialized")
+		return false, fmt.Errorf("handlers are not initialized")
+	}
+	var pending int64
+	var oldestSeconds float64
+	if err := h.pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(p.marked_at))), 0)
+		FROM pending_meilisearch_syncs p
+		JOIN events e ON e.id = p.event_id
+		WHERE e.kind IN (`+nostr.IndexedNoteKindsSQL+`)
+	`).Scan(&pending, &oldestSeconds); err != nil {
+		return false, fmt.Errorf("read pending note sync stats: %w", err)
+	}
+	if oldestSeconds < 0 {
+		oldestSeconds = 0
+	}
+	return NoteSyncDue(int(pending), time.Duration(oldestSeconds*float64(time.Second)), batchSize, maxWait), nil
+}
+
+// NoteSyncDue is the decision IndexedNoteSyncDue applies to a note-queue
+// snapshot. A full batch is always due. A shorter one waits out maxWait so
+// the notes commit is not spent on a handful of fresh documents.
+func NoteSyncDue(pending int, oldest time.Duration, batchSize int, maxWait time.Duration) bool {
+	if pending <= 0 || batchSize <= 0 {
+		return false
+	}
+	if pending >= batchSize {
+		return true
+	}
+	return maxWait > 0 && oldest >= maxWait
+}
+
+func (h *Handlers) drainPendingMeilisearchSyncBatch(ctx context.Context, limit int, target meiliClaimTarget) (int, int, error) {
+	if h == nil || h.pool == nil {
+		return 0, 0, fmt.Errorf("handlers are not initialized")
 	}
 	if h.meili == nil || !h.meili.Enabled() {
-		return 0, nil
+		return 0, 0, nil
 	}
 	if limit <= 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
-	eventIDs, err := h.claimPendingMeilisearchSyncs(ctx, limit)
+	claimed, err := h.claimPendingMeilisearchSyncs(ctx, limit, target)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
+	eventIDs := claimed.syncIDs
 	if len(eventIDs) == 0 {
-		return 0, nil
+		return 0, claimed.picked, nil
 	}
 
-	// Fast path: dispatch the whole batch in a single SyncEventsBatch
-	// call. This collapses len(eventIDs) × 2 individual Meilisearch
-	// tasks (which Meili processes serially per index) into 3 tasks
-	// (notes / profiles / search_documents), removing the per-event
-	// HTTP + waitForTask round-trip cost that previously capped sweeper
-	// throughput regardless of goroutine count.
+	// The claim is one kind, so SyncEventsBatch opens the notes index or
+	// the profiles index, plus search documents for that kind, and does
+	// not commit the other one.
 	batchErr := h.meili.SyncEventsBatch(ctx, h.pool, eventIDs)
 	if batchErr == nil {
-		return len(eventIDs), nil
+		return len(eventIDs), claimed.picked, nil
 	}
 
 	// Distinguish "Meili saturated / context expired" from "data
@@ -127,11 +199,13 @@ func (h *Handlers) DrainPendingMeilisearchSyncBatch(ctx context.Context, limit i
 	// adding work.
 	//
 	// On context.DeadlineExceeded / context.Canceled, re-insert the
-	// whole claimed batch in a single statement and let the next cycle
-	// retry it as a batch when Meili recovers. This is correctness-safe
-	// because (a) MarkMeilisearchDirty is idempotent on event_id and
-	// (b) Meilisearch upserts are idempotent, so a duplicate sync from
-	// a race is wasteful but not corrupting.
+	// sync ids and let the next cycle retry them as a batch when Meili
+	// recovers. Same-author profile duplicates stay deleted: one pending
+	// row per pubkey is enough, because the sync loads the latest
+	// profile. This is correctness-safe because (a) MarkMeilisearchDirty
+	// is idempotent on event_id and (b) Meilisearch upserts are
+	// idempotent, so a duplicate sync from a race is wasteful but not
+	// corrupting.
 	if errors.Is(batchErr, context.DeadlineExceeded) || errors.Is(batchErr, context.Canceled) {
 		if reErr := h.reinsertClaimedMeilisearchSyncs(eventIDs); reErr != nil {
 			slog.Error(
@@ -141,14 +215,14 @@ func (h *Handlers) DrainPendingMeilisearchSyncBatch(ctx context.Context, limit i
 				"reinsert_error", reErr,
 				"batch_error", batchErr,
 			)
-			return 0, fmt.Errorf("reinsert claimed events after meilisearch timeout (%w): %w", batchErr, reErr)
+			return 0, 0, fmt.Errorf("reinsert claimed events after meilisearch timeout (%w): %w", batchErr, reErr)
 		}
 		slog.Warn(
 			"meilisearch_batch_timeout_reinsert",
 			"claimed", len(eventIDs),
 			"batch_error", batchErr,
 		)
-		return 0, fmt.Errorf("meilisearch batch sync timed out, re-queued %d events: %w", len(eventIDs), batchErr)
+		return 0, 0, fmt.Errorf("meilisearch batch sync timed out, re-queued %d events: %w", len(eventIDs), batchErr)
 	}
 
 	// Non-timeout error: fall back to per-event sync so good events
@@ -177,9 +251,9 @@ func (h *Handlers) DrainPendingMeilisearchSyncBatch(ctx context.Context, limit i
 		// Whole batch recovered via per-event fallback; surface the
 		// original batch error so logs/metrics still record that
 		// the fast path failed.
-		return processed, fmt.Errorf("meilisearch batch sync fell back to per-event: %w", batchErr)
+		return processed, claimed.picked, fmt.Errorf("meilisearch batch sync fell back to per-event: %w", batchErr)
 	}
-	return processed, firstErr
+	return processed, claimed.picked, firstErr
 }
 
 // reinsertClaimedMeilisearchSyncs re-queues a previously-claimed
@@ -206,25 +280,71 @@ func (h *Handlers) reinsertClaimedMeilisearchSyncs(eventIDs []string) error {
 	return nil
 }
 
-// claimPendingMeilisearchSyncs atomically claims up to limit pending
-// event_ids using SELECT ... FOR UPDATE SKIP LOCKED followed by DELETE.
-// A crash between the DELETE-commit and the sync commit results in a
-// lost sync for the dropped events — but the next event from the same
-// kind=0/kind=1 author will re-mark related rows or the periodic
-// FullSync can reconcile, so eventual consistency is preserved.
-func (h *Handlers) claimPendingMeilisearchSyncs(ctx context.Context, limit int) ([]string, error) {
+// claimPendingMeilisearchSyncs atomically removes one kind of pending row.
+// A crash between the DELETE-commit and the sync commit drops that sync;
+// the next event from the same author re-marks the row, and FullSync can
+// reconcile, so eventual consistency is preserved.
+//
+// Kind 0 keeps a single sync id per pubkey and deletes every other pending
+// metadata event for that author. Those duplicates would each reindex the
+// same latest profile.
+func (h *Handlers) claimPendingMeilisearchSyncs(ctx context.Context, limit int, target meiliClaimTarget) (meiliClaim, error) {
+	if target == meiliClaimOldest {
+		kind, ok, err := h.peekOldestPendingMeiliKind(ctx)
+		if err != nil || !ok {
+			return meiliClaim{}, err
+		}
+		if kind == 0 {
+			target = meiliClaimProfiles
+		} else if nostr.IsIndexedNoteKind(kind) {
+			target = meiliClaimNotes
+		} else {
+			return meiliClaim{}, nil
+		}
+	}
+	switch target {
+	case meiliClaimProfiles:
+		return h.claimPendingProfileSyncs(ctx, limit)
+	case meiliClaimNotes:
+		return h.claimPendingNoteSyncs(ctx, limit)
+	default:
+		return meiliClaim{}, fmt.Errorf("unknown meilisearch claim target %d", target)
+	}
+}
+
+func (h *Handlers) peekOldestPendingMeiliKind(ctx context.Context) (int, bool, error) {
+	var kind int
+	err := h.pool.QueryRow(ctx, `
+		SELECT e.kind
+		FROM pending_meilisearch_syncs p
+		JOIN events e ON e.id = p.event_id
+		ORDER BY p.marked_at ASC, p.event_id ASC
+		LIMIT 1
+	`).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("peek oldest pending meilisearch kind: %w", err)
+	}
+	return kind, true, nil
+}
+
+func (h *Handlers) claimPendingNoteSyncs(ctx context.Context, limit int) (meiliClaim, error) {
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin pending meilisearch sync claim tx: %w", err)
+		return meiliClaim{}, fmt.Errorf("begin pending note sync claim tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx, `
 		WITH claimed AS (
-			SELECT event_id
-			FROM pending_meilisearch_syncs
-			ORDER BY marked_at ASC, event_id ASC
-			FOR UPDATE SKIP LOCKED
+			SELECT p.event_id
+			FROM pending_meilisearch_syncs p
+			JOIN events e ON e.id = p.event_id
+			WHERE e.kind IN (`+nostr.IndexedNoteKindsSQL+`)
+			ORDER BY p.marked_at ASC, p.event_id ASC
+			FOR UPDATE OF p SKIP LOCKED
 			LIMIT $1
 		)
 		DELETE FROM pending_meilisearch_syncs p
@@ -233,7 +353,7 @@ func (h *Handlers) claimPendingMeilisearchSyncs(ctx context.Context, limit int) 
 		RETURNING p.event_id
 	`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("claim pending meilisearch syncs: %w", err)
+		return meiliClaim{}, fmt.Errorf("claim pending note syncs: %w", err)
 	}
 	defer rows.Close()
 
@@ -241,17 +361,89 @@ func (h *Handlers) claimPendingMeilisearchSyncs(ctx context.Context, limit int) 
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan claimed event id: %w", err)
+			return meiliClaim{}, fmt.Errorf("scan claimed note id: %w", err)
 		}
 		eventIDs = append(eventIDs, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read claimed event ids: %w", err)
+		return meiliClaim{}, fmt.Errorf("read claimed note ids: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit pending meilisearch sync claim: %w", err)
+		return meiliClaim{}, fmt.Errorf("commit pending note sync claim: %w", err)
 	}
-	return eventIDs, nil
+	return meiliClaim{syncIDs: eventIDs, picked: len(eventIDs)}, nil
+}
+
+func (h *Handlers) claimPendingProfileSyncs(ctx context.Context, limit int) (meiliClaim, error) {
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return meiliClaim{}, fmt.Errorf("begin pending profile sync claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		SELECT p.event_id, e.pubkey
+		FROM pending_meilisearch_syncs p
+		JOIN events e ON e.id = p.event_id
+		WHERE e.kind = 0
+		ORDER BY p.marked_at ASC, p.event_id ASC
+		FOR UPDATE OF p SKIP LOCKED
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return meiliClaim{}, fmt.Errorf("pick pending profile syncs: %w", err)
+	}
+
+	syncIDs := make([]string, 0, limit)
+	pubkeys := make([]string, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	picked := 0
+	for rows.Next() {
+		var eventID, pubkey string
+		if err := rows.Scan(&eventID, &pubkey); err != nil {
+			rows.Close()
+			return meiliClaim{}, fmt.Errorf("scan pending profile sync: %w", err)
+		}
+		picked++
+		if _, ok := seen[pubkey]; ok {
+			continue
+		}
+		seen[pubkey] = struct{}{}
+		syncIDs = append(syncIDs, eventID)
+		pubkeys = append(pubkeys, pubkey)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return meiliClaim{}, fmt.Errorf("read pending profile syncs: %w", err)
+	}
+	rows.Close()
+	if picked == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return meiliClaim{}, fmt.Errorf("commit empty profile sync claim: %w", err)
+		}
+		return meiliClaim{}, nil
+	}
+
+	// Drop every pending metadata event for the authors we just picked,
+	// including rows newer than the LIMIT window. The sync publishes the
+	// latest profile, so the extras would repeat that work.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM pending_meilisearch_syncs p
+		WHERE p.event_id IN (
+			SELECT p2.event_id
+			FROM pending_meilisearch_syncs p2
+			JOIN events e ON e.id = p2.event_id
+			WHERE e.kind = 0
+			  AND e.pubkey = ANY($1::text[])
+			FOR UPDATE OF p2 SKIP LOCKED
+		)
+	`, pubkeys); err != nil {
+		return meiliClaim{}, fmt.Errorf("collapse pending profile syncs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return meiliClaim{}, fmt.Errorf("commit pending profile sync claim: %w", err)
+	}
+	return meiliClaim{syncIDs: syncIDs, picked: picked}, nil
 }
 
 // PendingMeilisearchSyncBacklog returns the current depth of the dirty
