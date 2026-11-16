@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nostrmash/nostrmash/internal/derivation"
+	"github.com/nostrmash/nostrmash/internal/nostr"
 	"github.com/nostrmash/nostrmash/internal/testutil/derivationbootstrap"
 )
 
@@ -376,6 +378,56 @@ func TestDrainPendingNoteSyncBatch_SkipsOlderProfiles(t *testing.T) {
 	}
 	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != len(profiles) {
 		t.Fatalf("pending = %d, want the %d profiles still queued", got, len(profiles))
+	}
+}
+
+func TestNoteClaimPlanUsesPartialIndex(t *testing.T) {
+	pool, _, _, ctx := setupMeiliSweeperTest(t)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pending_meilisearch_syncs (event_id, marked_at, kind)
+		SELECT 'old_profile_' || g, now() - interval '3 hours', 0
+		FROM generate_series(1, 4000) AS g
+	`); err != nil {
+		t.Fatalf("seed profiles: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pending_meilisearch_syncs (event_id, marked_at, kind)
+		SELECT 'note_' || g, now() - interval '1 minute', 1
+		FROM generate_series(1, 40) AS g
+	`); err != nil {
+		t.Fatalf("seed notes: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ANALYZE pending_meilisearch_syncs`); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		EXPLAIN
+		SELECT p.event_id
+		FROM pending_meilisearch_syncs p
+		WHERE p.kind IN (`+nostr.IndexedNoteKindsSQL+`)
+		ORDER BY p.marked_at ASC, p.event_id ASC
+		FOR UPDATE OF p SKIP LOCKED
+		LIMIT 10
+	`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan explain: %v", err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read explain: %v", err)
+	}
+	if !strings.Contains(plan.String(), "idx_pending_meilisearch_syncs_note_marked_at") {
+		t.Fatalf("note claim plan did not use the partial index:\n%s", plan.String())
 	}
 }
 
