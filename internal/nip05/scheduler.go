@@ -212,10 +212,12 @@ func SchedulePending(ctx context.Context, pool *pgxpool.Pool, pubkey, identifier
 
 func markProfileSearchDirty(ctx context.Context, pool *pgxpool.Pool, pubkey string) error {
 	_, err := pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id)
-		SELECT metadata_event_id
-		FROM profiles_latest
-		WHERE pubkey = $1
+		INSERT INTO pending_meilisearch_syncs (event_id, kind)
+		SELECT e.id, e.kind
+		FROM profiles_latest p
+		JOIN events e ON e.id = p.metadata_event_id
+		WHERE p.pubkey = $1
+		  AND e.kind = 0
 		ON CONFLICT (event_id) DO UPDATE
 		SET marked_at = now()
 	`, pubkey)

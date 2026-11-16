@@ -223,18 +223,27 @@ func sweepMeilisearchBacklog(
 	if workerIdx == 0 {
 		reportMeilisearchBacklogGauge(ctx, log, handlers)
 	}
+	// notesBlocked stops a failed note batch from being retried on every
+	// profile iteration of this pass. The profile queue is the large one;
+	// returning here used to leave both kinds stuck until the next tick.
+	notesBlocked := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 		notePicked := 0
-		due, err := handlers.IndexedNoteSyncDue(ctx, cfg.BatchSize, cfg.Interval)
-		if err != nil {
-			log.Error("meilisearch_sweeper_note_stats_failed", "worker_idx", workerIdx, "error", err)
-		} else if due {
-			notePicked, err = runMeilisearchBatch(ctx, log, handlers, cfg, workerIdx, true)
+		if !notesBlocked {
+			due, err := handlers.IndexedNoteSyncDue(ctx, cfg.BatchSize, cfg.Interval)
 			if err != nil {
-				return
+				log.Error("meilisearch_sweeper_note_stats_failed", "worker_idx", workerIdx, "error", err)
+				notesBlocked = true
+			} else if due {
+				var batchErr error
+				notePicked, batchErr = runMeilisearchBatch(ctx, log, handlers, cfg, workerIdx, true)
+				if batchErr != nil {
+					notePicked = 0
+					notesBlocked = true
+				}
 			}
 		}
 		profilePicked, err := runMeilisearchBatch(ctx, log, handlers, cfg, workerIdx, false)
