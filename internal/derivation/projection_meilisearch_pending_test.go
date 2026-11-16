@@ -63,13 +63,30 @@ func setupMeiliSweeperTest(t *testing.T) (*pgxpool.Pool, *fakeMeiliSyncer, *deri
 	return pool, meili, handlers, ctx
 }
 
+const meiliSweeperTestPubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func seedPendingMeilisearchSyncs(t *testing.T, ctx context.Context, pool *pgxpool.Pool, eventIDs []string) {
 	t.Helper()
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, eventIDs, 1, meiliSweeperTestPubkey, 0)
+}
+
+func seedPendingMeilisearchSyncsKind(t *testing.T, ctx context.Context, pool *pgxpool.Pool, eventIDs []string, kind int, pubkey string, age time.Duration) {
+	t.Helper()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id)
-		SELECT unnest($1::text[])
-		ON CONFLICT (event_id) DO NOTHING
-	`, eventIDs); err != nil {
+		INSERT INTO events (id, pubkey, created_at, kind, sig, content, raw_json)
+		SELECT id, $2, $3, $4, 'sig', '', '{}'::jsonb
+		FROM unnest($1::text[]) AS id
+		ON CONFLICT (id) DO NOTHING
+	`, eventIDs, pubkey, time.Now().Unix(), kind); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pending_meilisearch_syncs (event_id, marked_at)
+		SELECT id, now() - make_interval(secs => $2)
+		FROM unnest($1::text[]) AS id
+		ON CONFLICT (event_id) DO UPDATE
+		SET marked_at = EXCLUDED.marked_at
+	`, eventIDs, age.Seconds()); err != nil {
 		t.Fatalf("seed pending_meilisearch_syncs: %v", err)
 	}
 }
@@ -273,6 +290,81 @@ func TestDrainPendingMeilisearchSyncBatch_TimeoutCorrectness(t *testing.T) {
 	if len(meili.perEventCalls) != 0 {
 		t.Fatalf("per-event fallback must never run across timeout cycles, got %d calls",
 			len(meili.perEventCalls))
+	}
+}
+
+func TestDrainPendingProfileSyncBatch_CollapsesSameAuthor(t *testing.T) {
+	pool, meili, handlers, ctx := setupMeiliSweeperTest(t)
+	authorA := meiliSweeperTestPubkey
+	authorB := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"a_old", "a_mid"}, 0, authorA, 2*time.Minute)
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"a_new"}, 0, authorA, time.Minute)
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"b_only"}, 0, authorB, 30*time.Second)
+
+	synced, picked, err := handlers.DrainPendingProfileMeilisearchSyncBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain profiles: %v", err)
+	}
+	if picked != 4 {
+		t.Fatalf("picked = %d, want 4", picked)
+	}
+	if synced != 2 {
+		t.Fatalf("synced = %d, want one event per author", synced)
+	}
+	if meili.batchCalls != 1 {
+		t.Fatalf("batch calls = %d, want 1", meili.batchCalls)
+	}
+	if len(meili.batchEventIDs) != 1 || len(meili.batchEventIDs[0]) != 2 {
+		t.Fatalf("sync ids = %#v, want 2", meili.batchEventIDs)
+	}
+	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != 0 {
+		t.Fatalf("pending = %d, want the duplicate author rows removed", got)
+	}
+}
+
+func TestDrainPendingMeilisearchSyncBatch_KeepsKindsApart(t *testing.T) {
+	pool, meili, handlers, ctx := setupMeiliSweeperTest(t)
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"old_note"}, 1, meiliSweeperTestPubkey, 5*time.Minute)
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"profile_a", "profile_b"}, 0, meiliSweeperTestPubkey, time.Minute)
+
+	synced, err := handlers.DrainPendingMeilisearchSyncBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain oldest: %v", err)
+	}
+	if synced != 1 {
+		t.Fatalf("synced = %d, want only the oldest note", synced)
+	}
+	if len(meili.batchEventIDs) != 1 || len(meili.batchEventIDs[0]) != 1 || meili.batchEventIDs[0][0] != "old_note" {
+		t.Fatalf("sync ids = %#v, want [old_note]", meili.batchEventIDs)
+	}
+	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != 2 {
+		t.Fatalf("pending = %d, want the two profile rows still queued", got)
+	}
+
+	synced, picked, err := handlers.DrainPendingProfileMeilisearchSyncBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain profiles: %v", err)
+	}
+	if synced != 1 || picked != 2 {
+		t.Fatalf("profile drain synced=%d picked=%d, want 1 and 2", synced, picked)
+	}
+	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != 0 {
+		t.Fatalf("pending = %d, want empty", got)
+	}
+}
+
+func TestNoteSyncDue(t *testing.T) {
+	if derivation.NoteSyncDue(0, time.Hour, 1000, 5*time.Minute) {
+		t.Fatal("empty queue is not due")
+	}
+	if derivation.NoteSyncDue(40, time.Second, 1000, 5*time.Minute) {
+		t.Fatal("a short fresh batch is not due")
+	}
+	if !derivation.NoteSyncDue(40, 5*time.Minute, 1000, 5*time.Minute) {
+		t.Fatal("a short batch is due once it has waited out the interval")
+	}
+	if !derivation.NoteSyncDue(1000, time.Second, 1000, 5*time.Minute) {
+		t.Fatal("a full batch is due immediately")
 	}
 }
 
