@@ -337,6 +337,9 @@ func (h *Handlers) claimPendingNoteSyncs(ctx context.Context, limit int) (meiliC
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The kind list must match the predicate of
+	// idx_pending_meilisearch_syncs_note_marked_at. That partial index
+	// is what keeps this scan off the older profile prefix.
 	rows, err := tx.Query(ctx, `
 		WITH claimed AS (
 			SELECT p.event_id
