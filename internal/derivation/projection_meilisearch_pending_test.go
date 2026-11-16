@@ -3,6 +3,7 @@ package derivation_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -81,12 +82,13 @@ func seedPendingMeilisearchSyncsKind(t *testing.T, ctx context.Context, pool *pg
 		t.Fatalf("seed events: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id, marked_at)
-		SELECT id, now() - make_interval(secs => $2)
+		INSERT INTO pending_meilisearch_syncs (event_id, marked_at, kind)
+		SELECT id, now() - make_interval(secs => $2), $3
 		FROM unnest($1::text[]) AS id
 		ON CONFLICT (event_id) DO UPDATE
-		SET marked_at = EXCLUDED.marked_at
-	`, eventIDs, age.Seconds()); err != nil {
+		SET marked_at = EXCLUDED.marked_at,
+		    kind = EXCLUDED.kind
+	`, eventIDs, age.Seconds(), kind); err != nil {
 		t.Fatalf("seed pending_meilisearch_syncs: %v", err)
 	}
 }
@@ -350,6 +352,30 @@ func TestDrainPendingMeilisearchSyncBatch_KeepsKindsApart(t *testing.T) {
 	}
 	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != 0 {
 		t.Fatalf("pending = %d, want empty", got)
+	}
+}
+
+func TestDrainPendingNoteSyncBatch_SkipsOlderProfiles(t *testing.T) {
+	pool, meili, handlers, ctx := setupMeiliSweeperTest(t)
+	profiles := make([]string, 0, 40)
+	for i := 0; i < 40; i++ {
+		profiles = append(profiles, fmt.Sprintf("old_profile_%02d", i))
+	}
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, profiles, 0, meiliSweeperTestPubkey, 2*time.Hour)
+	seedPendingMeilisearchSyncsKind(t, ctx, pool, []string{"newer_note"}, 1, meiliSweeperTestPubkey, time.Minute)
+
+	synced, picked, err := handlers.DrainPendingNoteMeilisearchSyncBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain notes: %v", err)
+	}
+	if synced != 1 || picked != 1 {
+		t.Fatalf("synced=%d picked=%d, want the note behind the older profiles", synced, picked)
+	}
+	if len(meili.batchEventIDs) != 1 || len(meili.batchEventIDs[0]) != 1 || meili.batchEventIDs[0][0] != "newer_note" {
+		t.Fatalf("sync ids = %#v, want [newer_note]", meili.batchEventIDs)
+	}
+	if got := countPendingMeilisearchSyncs(t, ctx, pool); got != len(profiles) {
+		t.Fatalf("pending = %d, want the %d profiles still queued", got, len(profiles))
 	}
 }
 

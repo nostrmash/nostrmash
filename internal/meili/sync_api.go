@@ -110,8 +110,11 @@ func (c *Client) MarkEventPendingSync(ctx context.Context, pool *pgxpool.Pool, e
 		return nil
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id)
-		VALUES ($1)
+		INSERT INTO pending_meilisearch_syncs (event_id, kind)
+		SELECT id, kind
+		FROM events
+		WHERE id = $1
+		  AND (kind = 0 OR kind IN (`+nostr.IndexedNoteKindsSQL+`))
 		ON CONFLICT (event_id) DO UPDATE
 		SET marked_at = now()
 	`, eventID); err != nil {

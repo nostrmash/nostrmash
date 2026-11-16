@@ -67,11 +67,11 @@ func (h *Handlers) MarkMeilisearchDirty(ctx context.Context, eventID string) err
 	// Bump marked_at on conflict so a re-mark during an in-flight FullSync
 	// survives the post-sync prune (which only deletes marked_at <= sync start).
 	if _, err := h.pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id)
-		VALUES ($1)
+		INSERT INTO pending_meilisearch_syncs (event_id, kind)
+		VALUES ($1, $2)
 		ON CONFLICT (event_id) DO UPDATE
 		SET marked_at = now()
-	`, eventID); err != nil {
+	`, eventID, kind); err != nil {
 		return fmt.Errorf("mark meilisearch dirty: %w", err)
 	}
 	return nil
@@ -133,10 +133,9 @@ func (h *Handlers) IndexedNoteSyncDue(ctx context.Context, batchSize int, maxWai
 	var oldestSeconds float64
 	if err := h.pool.QueryRow(ctx, `
 		SELECT COUNT(*),
-		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(p.marked_at))), 0)
-		FROM pending_meilisearch_syncs p
-		JOIN events e ON e.id = p.event_id
-		WHERE e.kind IN (`+nostr.IndexedNoteKindsSQL+`)
+		       COALESCE(EXTRACT(EPOCH FROM (now() - MIN(marked_at))), 0)
+		FROM pending_meilisearch_syncs
+		WHERE kind IN (`+nostr.IndexedNoteKindsSQL+`)
 	`).Scan(&pending, &oldestSeconds); err != nil {
 		return false, fmt.Errorf("read pending note sync stats: %w", err)
 	}
@@ -237,8 +236,8 @@ func (h *Handlers) drainPendingMeilisearchSyncBatch(ctx context.Context, limit i
 				firstErr = fmt.Errorf("meilisearch sync for %s: %w", eventID, err)
 			}
 			if _, reinsertErr := h.pool.Exec(ctx, `
-				INSERT INTO pending_meilisearch_syncs (event_id)
-				VALUES ($1)
+				INSERT INTO pending_meilisearch_syncs (event_id, kind)
+				SELECT id, kind FROM events WHERE id = $1
 				ON CONFLICT (event_id) DO NOTHING
 			`, eventID); reinsertErr != nil && firstErr == nil {
 				firstErr = fmt.Errorf("re-mark failed event %s: %w", eventID, reinsertErr)
@@ -271,8 +270,10 @@ func (h *Handlers) reinsertClaimedMeilisearchSyncs(eventIDs []string) error {
 	bgCtx, cancel := context.WithTimeout(context.Background(), reinsertClaimedMeilisearchSyncsTimeout)
 	defer cancel()
 	if _, err := h.pool.Exec(bgCtx, `
-		INSERT INTO pending_meilisearch_syncs (event_id)
-		SELECT unnest($1::text[])
+		INSERT INTO pending_meilisearch_syncs (event_id, kind)
+		SELECT id, kind
+		FROM events
+		WHERE id = ANY($1::text[])
 		ON CONFLICT (event_id) DO NOTHING
 	`, eventIDs); err != nil {
 		return fmt.Errorf("reinsert claimed meilisearch syncs: %w", err)
@@ -315,10 +316,9 @@ func (h *Handlers) claimPendingMeilisearchSyncs(ctx context.Context, limit int, 
 func (h *Handlers) peekOldestPendingMeiliKind(ctx context.Context) (int, bool, error) {
 	var kind int
 	err := h.pool.QueryRow(ctx, `
-		SELECT e.kind
-		FROM pending_meilisearch_syncs p
-		JOIN events e ON e.id = p.event_id
-		ORDER BY p.marked_at ASC, p.event_id ASC
+		SELECT kind
+		FROM pending_meilisearch_syncs
+		ORDER BY marked_at ASC, event_id ASC
 		LIMIT 1
 	`).Scan(&kind)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -341,8 +341,7 @@ func (h *Handlers) claimPendingNoteSyncs(ctx context.Context, limit int) (meiliC
 		WITH claimed AS (
 			SELECT p.event_id
 			FROM pending_meilisearch_syncs p
-			JOIN events e ON e.id = p.event_id
-			WHERE e.kind IN (`+nostr.IndexedNoteKindsSQL+`)
+			WHERE p.kind IN (`+nostr.IndexedNoteKindsSQL+`)
 			ORDER BY p.marked_at ASC, p.event_id ASC
 			FOR UPDATE OF p SKIP LOCKED
 			LIMIT $1
@@ -385,7 +384,7 @@ func (h *Handlers) claimPendingProfileSyncs(ctx context.Context, limit int) (mei
 		SELECT p.event_id, e.pubkey
 		FROM pending_meilisearch_syncs p
 		JOIN events e ON e.id = p.event_id
-		WHERE e.kind = 0
+		WHERE p.kind = 0
 		ORDER BY p.marked_at ASC, p.event_id ASC
 		FOR UPDATE OF p SKIP LOCKED
 		LIMIT $1
@@ -433,7 +432,7 @@ func (h *Handlers) claimPendingProfileSyncs(ctx context.Context, limit int) (mei
 			SELECT p2.event_id
 			FROM pending_meilisearch_syncs p2
 			JOIN events e ON e.id = p2.event_id
-			WHERE e.kind = 0
+			WHERE p2.kind = 0
 			  AND e.pubkey = ANY($1::text[])
 			FOR UPDATE OF p2 SKIP LOCKED
 		)
