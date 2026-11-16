@@ -1,4 +1,4 @@
-.PHONY: lint lint-ci test test-race test-race-policy cover coverage-policy verify-clean verify-local verify-docker contract-drift rules-check benchmark-hot benchmark-query benchmark-ws benchmark-replay-derivation benchmark-protected perf-collect perf-protect-collect perf-protect-compare loadtest loadtest-api loadtest-worker loadtest-ingest loadtest-replay-rebuild loadtest-ws-api fuzz build mod-verify vulncheck configdoc configdoc-check sqlc sqlc-check fmt fmt-check imports imports-check format ci
+.PHONY: lint lint-ci test test-race test-race-policy cover coverage-policy verify-clean verify-local verify-docker contract-drift rules-check benchmark-hot benchmark-query benchmark-ws benchmark-replay-derivation benchmark-protected perf-collect perf-protect-collect perf-protect-compare perf-gate-check loadtest loadtest-api loadtest-worker loadtest-ingest loadtest-replay-rebuild loadtest-ws-api fuzz build mod-verify vulncheck configdoc configdoc-check sqlc sqlc-check fmt fmt-check imports imports-check format ci
 BENCH_HOT_PKGS := ./internal/query ./internal/store ./internal/replay ./internal/derivation ./internal/api_primal ./internal/trust
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
 GOVULNCHECK := go run golang.org/x/vuln/cmd/govulncheck@v1.1.4
@@ -90,7 +90,13 @@ perf-protect-compare:
 	REGRESSION_THRESHOLD_PCT=$(or $(REGRESSION_THRESHOLD_PCT),15) \
 	ENFORCEMENT_MODE=$(or $(ENFORCEMENT_MODE),advisory) \
 	FAIL_ON_REGRESSION=$(or $(FAIL_ON_REGRESSION),0) \
+	PROTECTED_HISTORY_FILE="$(PROTECTED_HISTORY_FILE)" \
+	PROTECTED_HISTORY_FACTOR=$(or $(PROTECTED_HISTORY_FACTOR),1.75) \
+	PROTECTED_HISTORY_WINDOW=$(or $(PROTECTED_HISTORY_WINDOW),40) \
 	bash ./scripts/perf_protect_compare.sh "$(BASELINE_DIR)" "$(CURRENT_DIR)" benchmarks/compare
+
+perf-gate-check:
+	bash ./scripts/perf_protect_compare_test.sh
 
 loadtest:
 	@echo "Available load-test targets:"
@@ -174,4 +180,4 @@ imports-check:
 
 format: fmt imports
 
-ci: fmt-check imports-check lint-ci mod-verify vulncheck test-race-policy cover coverage-policy contract-drift rules-check configdoc-check sqlc-check build
+ci: perf-gate-check fmt-check imports-check lint-ci mod-verify vulncheck test-race-policy cover coverage-policy contract-drift rules-check configdoc-check sqlc-check build
