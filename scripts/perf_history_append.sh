@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
 # Append one compact NDJSON history line to a long-lived perf/load history file,
-# pruned to the last HISTORY_MAX entries. This is the append-only companion to
-# the overwritten `main-latest` baselines in .github/workflows/perf.yml: those
-# capture only the newest run, while these accumulate the run-to-run
-# distribution that scripts/gate_recalibrate.sh reduces into threshold
-# recommendations.
+# pruned to the last HISTORY_MAX entries. The Performance Snapshot workflow
+# carries this file in the baseline artifact (it is not pushed to main). The
+# overwritten `main-latest` snapshot is the newest run; this file is the
+# run-to-run distribution that the protected-benchmark gate and
+# scripts/gate_recalibrate.sh read.
+#
+# A rerun of the same HISTORY_SHA replaces the last line instead of stacking
+# a second sample for one commit.
 #
 # Subcommands:
 #   loadtest   <summary.json> <history.ndjson>
@@ -140,12 +143,17 @@ if history_file.is_file():
             # Drop unparsable legacy lines rather than fail the whole append.
             continue
 
-existing.append(line)
+replaced = bool(existing) and str(existing[-1].get("sha")) == str(sha)
+if replaced:
+    existing[-1] = line
+else:
+    existing.append(line)
 existing = existing[-history_max:]
 
 with history_file.open("w") as out:
     for entry in existing:
         out.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
-print(f"perf_history_append: {mode} -> {history_file} ({len(existing)} entries retained)")
+action = "replaced" if replaced else "appended"
+print(f"perf_history_append: {mode} {action} -> {history_file} ({len(existing)} entries retained)")
 PY

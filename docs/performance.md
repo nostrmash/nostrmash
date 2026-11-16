@@ -227,18 +227,20 @@ How comparisons are intended to work:
 - Compare load-test scenario `summary.txt` files between snapshots for throughput/latency/retry trends.
 - Use the same bench count and similar environment settings to reduce noise before concluding regressions.
 
-### Committed baselines, gating, and recalibration
+### Baseline artifacts, gating, and recalibration
 
-CI no longer relies solely on operator-supplied baseline artifacts. Two
-baselines are regenerated and committed on every push to `main`, so pull
-requests always compare against a fresh baseline captured on the same runner
-architecture:
+Pushes to `main` publish two baselines as Actions artifacts. Pull requests
+download the latest successful artifact, captured on the same runner class.
+The workflow does not push to `main`. The committed copies are the seed used
+when no artifact exists yet (the first run after this lands, or a fork pull
+request that cannot read Actions artifacts):
 
-- **Protected benchmarks** → `benchmarks/history/protection/main-latest/`
-  (refreshed by the `baseline` job in `.github/workflows/perf.yml`).
-- **WS + API load harness** → `loadtest/baseline/main-latest/summary.json`
-  (refreshed by the `loadtest-baseline` job; the harness runs against a
-  replay-seeded Postgres so the numbers reflect a populated schema).
+- **Protected benchmarks** → artifact `protected-baseline` (`main-latest/` plus
+  `history.ndjson`), seeded from `benchmarks/history/protection/main-latest/`.
+- **WS + API load harness** → artifact `loadtest-baseline`
+  (`main-latest/summary.json` plus `history.ndjson`). The harness runs against
+  a replay-seeded Postgres so the numbers reflect a populated schema. Seeded
+  from `loadtest/baseline/main-latest/summary.json`.
 
 What is gated on pull requests:
 
@@ -249,25 +251,30 @@ What is gated on pull requests:
   (default 1%) **and** more than doubles versus the baseline channel. Latency
   (p95/p99) is reported but **advisory** — runner variance makes it too noisy
   to gate on today.
-- **Protected benchmarks.** The `compare` job runs `release_candidate`
-  enforcement against the committed baseline at `PROTECTED_THRESHOLD_PCT`
-  (default 15%).
+- **Protected benchmarks.** The `compare` job fails when a benchmark's median
+  ns/op is slower than `PROTECTED_HISTORY_FACTOR` (default 1.75×) the median
+  of the last `PROTECTED_HISTORY_WINDOW` (default 40) main snapshots. The
+  suite-shift table is still written. A row that lags the suite by
+  `PROTECTED_THRESHOLD_PCT` (default 15%) is listed as informational and does
+  not fail the job. A benchmark that got faster does not fail it either.
+  These microbenchmarks move by about 1.5× between GitHub-hosted runners, so
+  the gate is there to catch a real doubling of one benchmark.
 
 Append-only history and recalibration:
 
-- Alongside each overwritten `main-latest` baseline, the baseline jobs append
-  one compact NDJSON line (via
-  [`scripts/perf_history_append.sh`](../scripts/perf_history_append.sh)) to
+- Each main run downloads the previous baseline artifact, appends one compact
+  NDJSON line (via
+  [`scripts/perf_history_append.sh`](../scripts/perf_history_append.sh)), keeps
+  the last 90 entries, and uploads the artifact again. A rerun of the same
+  commit replaces that commit's line. The committed
   `loadtest/baseline/history.ndjson` and
-  `benchmarks/history/protection/history.ndjson`, each pruned to the last 90
-  entries. This keeps the run-to-run distribution without unbounded repo growth.
-- Once enough runs accrue, the manual `recalibrate` job (`workflow_dispatch`
-  with `recalibrate_gates=true`) runs
-  [`scripts/gate_recalibrate.sh`](../scripts/gate_recalibrate.sh), which reduces
-  those histories to suggested thresholds (error-rate floor, and a
-  per-benchmark regression percent at mean + 3σ of run-to-run deltas) versus the
-  configured gates, writing the recommendation to the job summary. It is
-  advisory: a human commits any tightened threshold.
+  `benchmarks/history/protection/history.ndjson` files seed the first artifact.
+- The manual `recalibrate` job (`workflow_dispatch` with
+  `recalibrate_gates=true`) reads those artifact histories when they exist and
+  runs [`scripts/gate_recalibrate.sh`](../scripts/gate_recalibrate.sh). It
+  prints how often the configured history-band factor would have failed a
+  later run, plus the load-harness error-rate suggestion. It is advisory: a
+  human changes the factor if they agree.
 
 Why latency and load are still not hard-gated on absolute values:
 
@@ -306,14 +313,16 @@ Mechanism:
   - `make perf-protect-compare BASELINE_DIR=... CURRENT_DIR=...` for median `ns/op` comparison on protected benchmarks.
 - CI (`.github/workflows/perf.yml`):
   - **Automatic on every PR** (`compare` job): compares the current protected
-    snapshot against the committed `benchmarks/history/protection/main-latest`
-    baseline in `release_candidate` mode at `PROTECTED_THRESHOLD_PCT`, failing on
-    regression. Advisory-only until the first `main` push creates the baseline.
-  - **Automatic on push to `main`** (`baseline` job): refreshes and commits the
-    protected baseline plus a pruned history line.
+    snapshot with the latest `protected-baseline` artifact (or the committed
+    seed when that artifact is not there yet) and fails when a benchmark is
+    slower than 1.75× the recent main-history median.
+  - **Automatic on push to `main`** (`baseline` job): refreshes the protected
+    snapshot, appends a pruned history line, and uploads the `protected-baseline`
+    artifact. It does not push to `main`.
   - Manual `workflow_dispatch` run still supports ad-hoc baseline-artifact
     comparison (`baseline_run_id` + `baseline_artifact_name`) and the
-    `recalibrate_gates` recommendation job.
+    `recalibrate_gates` recommendation job. Ad-hoc enforcement uses 1.75× the
+    chosen baseline snapshot.
 
 Release vs investigation policy:
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Compare a current WS+API load-harness summary against a committed baseline.
+# Compare a current WS+API load-harness summary against a baseline summary.
 #
 # Gating policy (mirrors the Tier 1 Remediation Plan): fail ONLY on error-rate
 # regression; latency (p95/p99) comparison is advisory to avoid runner-variance
@@ -166,7 +166,7 @@ lines = []
 lines.append("# WS + API Load Harness Comparison")
 lines.append("")
 if baseline is None:
-    lines.append("> No committed baseline found; error-rate gating is advisory only for this run.")
+    lines.append("> No baseline found; error-rate gating is advisory only for this run.")
     lines.append("")
 lines.append(f"Gating: **error-rate only** (floor {error_floor*100:.2f}%, factor {error_factor:g}x). Latency is advisory.")
 lines.append("")
