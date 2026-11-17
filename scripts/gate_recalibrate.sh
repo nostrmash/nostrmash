@@ -11,13 +11,15 @@
 #     per-channel error-rate distribution, plus advisory p95/p99 run-to-run
 #     volatility so operators can see whether the (deliberately advisory)
 #     latency signal is stable enough to ever gate.
-#   - Protected benchmarks: a per-benchmark regression percent at mean + 3σ of
-#     the run-to-run ns/op deltas, and the max across benchmarks as the single
-#     suggested PROTECTED_THRESHOLD_PCT.
+#   - Protected benchmarks: how often the history-band gate
+#     (PROTECTED_HISTORY_FACTOR times the median of the previous
+#     PROTECTED_HISTORY_WINDOW runs) would have failed a later run in this
+#     file. The per-benchmark run-to-run percent is informational. The
+#     pull-request job does not fail on PROTECTED_THRESHOLD_PCT.
 #
-# Statistics use only run-to-run *deltas* (how much a metric moves between
-# consecutive main pushes), because the gates fire on movement, not on absolute
-# level. mean + 3σ targets a ~0.1% false-positive rate on a normal-ish
+# Load-harness statistics use run-to-run deltas because that gate fires on
+# movement. The protected-benchmark gate fires on absolute level versus the
+# recent median. mean + 3σ targets a ~0.1% false-positive rate on a normal-ish
 # distribution; the script prints the sample size so a reader can discount
 # recommendations built on too few runs.
 #
@@ -40,8 +42,10 @@ CUR_FLOOR="${LOADTEST_ERROR_RATE_FLOOR:-0.01}"
 CUR_FACTOR="${LOADTEST_ERROR_RATE_FACTOR:-2.0}"
 CUR_PCT="${PROTECTED_THRESHOLD_PCT:-15}"
 MIN_SAMPLES="${RECALIBRATE_MIN_SAMPLES:-8}"
+HISTORY_FACTOR="${PROTECTED_HISTORY_FACTOR:-1.75}"
+HISTORY_WINDOW="${PROTECTED_HISTORY_WINDOW:-40}"
 
-python3 - "${LOADTEST_HISTORY}" "${BENCH_HISTORY}" "${CUR_FLOOR}" "${CUR_FACTOR}" "${CUR_PCT}" "${MIN_SAMPLES}" <<'PY'
+python3 - "${LOADTEST_HISTORY}" "${BENCH_HISTORY}" "${CUR_FLOOR}" "${CUR_FACTOR}" "${CUR_PCT}" "${MIN_SAMPLES}" "${HISTORY_FACTOR}" "${HISTORY_WINDOW}" <<'PY'
 import json
 import pathlib
 import statistics
@@ -51,6 +55,8 @@ loadtest_path = pathlib.Path(sys.argv[1])
 bench_path = pathlib.Path(sys.argv[2])
 cur_floor = float(sys.argv[3])
 cur_factor = float(sys.argv[4])
+history_factor = float(sys.argv[7]) if len(sys.argv) > 7 else 1.75
+history_window = int(sys.argv[8]) if len(sys.argv) > 8 else 40
 cur_pct = float(sys.argv[5])
 min_samples = int(sys.argv[6])
 
@@ -88,10 +94,11 @@ lines = []
 lines.append("# Gate Recalibration (advisory)")
 lines.append("")
 lines.append(
-    "Recommendations derived from run-to-run deltas in the committed perf/load "
-    "histories. Nothing is changed automatically; commit a new threshold only "
-    "if you agree. `mean + 3σ` targets ~0.1% false positives; sample sizes "
-    f"below {min_samples} are flagged LOW-DATA."
+    "Recommendations from the baseline histories. Nothing is changed "
+    "automatically. The protected-benchmark gate is a slowdown factor against "
+    "the recent median; load-harness error rate still uses a floor and a "
+    f"factor. `mean + 3σ` describes noise; sample sizes below {min_samples} "
+    "are flagged LOW-DATA."
 )
 lines.append("")
 
@@ -169,9 +176,8 @@ else:
                 continue
             series.setdefault(name, []).append(float(ns))
 
-    lines.append("| Benchmark | Runs | Δ mean+3σ | Suggested pct |")
-    lines.append("| --- | ---: | ---: | ---: |")
-    worst = 0.0
+    lines.append("| Benchmark | Runs | Δ mean+3σ |")
+    lines.append("| --- | ---: | ---: |")
     for name in sorted(series):
         values = series[name]
         deltas = []
@@ -180,19 +186,57 @@ else:
                 deltas.append(abs(b - a) / a * 100.0)
         band = mean_plus_3sigma(deltas) if deltas else None
         if band is None:
-            lines.append(f"| {name} | {len(values)} | n/a | n/a |")
+            lines.append(f"| {name} | {len(values)} | n/a |")
             continue
-        worst = max(worst, band)
-        lines.append(f"| {name} | {len(values)} | {band:.1f}% | {band:.0f}%{low_data(len(deltas))} |")
+        lines.append(f"| {name} | {len(values)} | {band:.1f}%{low_data(len(deltas))} |")
     lines.append("")
-    if worst > 0:
-        suggested_pct = max(5.0, round(worst))
-        verdict = "tighten" if suggested_pct < cur_pct else "hold/loosen"
+    lines.append(
+        "Run-to-run percents describe runner noise. They are not the pull-request "
+        f"fail gate. `PROTECTED_THRESHOLD_PCT` ({cur_pct:.0f}%) only marks informational "
+        "suite-shift outliers in the comparison report."
+    )
+
+    def ns_of(row, name):
+        entry = (row.get("benchmarks") or {}).get(name) or {}
+        ns = entry.get("ns_per_op")
+        if ns is None:
+            return None
+        try:
+            ns = float(ns)
+        except (TypeError, ValueError):
+            return None
+        return ns if ns > 0 else None
+
+    names = sorted({name for row in bench_rows for name in (row.get("benchmarks") or {})})
+    gated = 0
+    considered = 0
+    for i, cur in enumerate(bench_rows):
+        prev = bench_rows[max(0, i - history_window):i]
+        if len(prev) < min(8, history_window):
+            continue
+        considered += 1
+        hit = False
+        for name in names:
+            vals = [v for v in (ns_of(r, name) for r in prev) if v]
+            cur_ns = ns_of(cur, name)
+            if not vals or cur_ns is None:
+                continue
+            med = statistics.median(vals)
+            if med > 0 and cur_ns > med * history_factor:
+                hit = True
+                break
+        if hit:
+            gated += 1
+    if considered:
         lines.append(
-            f"- Suggested `PROTECTED_THRESHOLD_PCT`: **{suggested_pct:.0f}%** "
-            f"(configured {cur_pct:.0f}%) → **{verdict}**. This is the max per-benchmark "
-            "mean+3σ so no single benchmark trips the gate on normal noise."
+            f"- At `{history_factor:g}×` the median of the previous {history_window} runs, "
+            f"**{gated}/{considered}** later runs in this file would have failed the pull-request gate."
         )
+        if considered >= min_samples and gated / considered > 0.10:
+            lines.append(
+                "- That is more than a tenth of recorded runs. Raise `PROTECTED_HISTORY_FACTOR` "
+                "before treating the gate as quiet."
+            )
     lines.append("")
 
 print("\n".join(lines))

@@ -49,6 +49,10 @@ func Run(ctx context.Context, log *slog.Logger, build BuildInfo) error {
 		if err != nil {
 			return fmt.Errorf("redis_parse_url: %w", err)
 		}
+		// The compute phase reads follower adjacency in chunks. Each chunk
+		// still has to finish one SMEMBERS reply; the library default of
+		// 3s is what timed out the unchunked production read.
+		raiseTrustRedisIOTimeout(redisOpts)
 		redisClient = redis.NewClient(redisOpts)
 		defer func() { _ = redisClient.Close() }()
 		if err := redisClient.Ping(ctx).Err(); err != nil {
@@ -401,6 +405,23 @@ func resolveWorkerID() string {
 		host = "unknown-host"
 	}
 	return fmt.Sprintf("%s:%d", host, os.Getpid())
+}
+
+// trustRedisMinIOTimeout is the floor for the trust worker's Redis read
+// and write deadlines. go-redis applies a 3s default when these are zero,
+// which is shorter than one adjacency chunk on the production graph.
+const trustRedisMinIOTimeout = 30 * time.Second
+
+func raiseTrustRedisIOTimeout(opts *redis.Options) {
+	if opts == nil {
+		return
+	}
+	if opts.ReadTimeout < trustRedisMinIOTimeout {
+		opts.ReadTimeout = trustRedisMinIOTimeout
+	}
+	if opts.WriteTimeout < trustRedisMinIOTimeout {
+		opts.WriteTimeout = trustRedisMinIOTimeout
+	}
 }
 
 func trustWorkerModeLabel(enableRedisSync, enableScoreCompute bool) string {

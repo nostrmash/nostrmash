@@ -65,3 +65,5 @@ For load-test snapshots, compare each scenario's `summary.txt` between runs (for
 ## CI/Actions Storage
 
 Manual workflow runs (see `.github/workflows/perf.yml`) upload the collected snapshot directory as a GitHub Actions artifact so baseline outputs can be downloaded and compared later.
+
+Pushes to `main` upload a `protected-baseline` artifact: the latest protected snapshot plus `history.ndjson`. Pull requests compare against that artifact and fail only when a benchmark is slower than 1.75× the median of the recent main history. The committed `benchmarks/history/protection/main-latest/` directory seeds the first artifact. The workflow does not push to `main`.

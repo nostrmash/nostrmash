@@ -318,6 +318,11 @@ type rankNode struct {
 	Score  float64
 }
 
+// redisAdjacencyReadChunk bounds one SMEMBERS pipeline. A single pipeline of
+// every node (millions of follower edges) writes for minutes and then loses
+// the reply to the Redis client's read deadline. Tests may lower this.
+var redisAdjacencyReadChunk = 256
+
 func (r *Runtime) loadAdjacencyFromRedis(ctx context.Context, runID int64, snapshotRef string) (map[string][]string, map[string]struct{}, error) {
 	if r.redis == nil {
 		return nil, nil, fmt.Errorf("redis is not configured")
@@ -329,34 +334,57 @@ func (r *Runtime) loadAdjacencyFromRedis(ctx context.Context, runID int64, snaps
 	}
 	adj := make(map[string][]string, len(nodes))
 	nodeSet := make(map[string]struct{}, len(nodes))
-	pipe := r.redis.TxPipeline()
-	cmds := make(map[string]*redis.StringSliceCmd, len(nodes))
+	chunkSize := redisAdjacencyReadChunk
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+	pending := make([]string, 0, chunkSize)
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		pipe := r.redis.TxPipeline()
+		cmds := make(map[string]*redis.StringSliceCmd, len(pending))
+		for _, node := range pending {
+			cmds[node] = pipe.SMembers(ctx, keys.runAdjKey(runID, snapshotRef, node))
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("load redis trust adjacency: %w", err)
+		}
+		for node, cmd := range cmds {
+			vals, err := cmd.Result()
+			if err != nil {
+				return fmt.Errorf("load redis trust adjacency for %s: %w", node, err)
+			}
+			neighbors := make([]string, 0, len(vals))
+			for _, v := range vals {
+				v = strings.TrimSpace(v)
+				if v == "" {
+					continue
+				}
+				neighbors = append(neighbors, v)
+				nodeSet[v] = struct{}{}
+			}
+			adj[node] = neighbors
+		}
+		pending = pending[:0]
+		return nil
+	}
 	for _, node := range nodes {
 		node = strings.TrimSpace(node)
 		if node == "" {
 			continue
 		}
 		nodeSet[node] = struct{}{}
-		cmds[node] = pipe.SMembers(ctx, keys.runAdjKey(runID, snapshotRef, node))
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, nil, fmt.Errorf("load redis trust adjacency: %w", err)
-	}
-	for node, cmd := range cmds {
-		vals, err := cmd.Result()
-		if err != nil {
-			return nil, nil, fmt.Errorf("load redis trust adjacency for %s: %w", node, err)
-		}
-		neighbors := make([]string, 0, len(vals))
-		for _, v := range vals {
-			v = strings.TrimSpace(v)
-			if v == "" {
-				continue
+		pending = append(pending, node)
+		if len(pending) >= chunkSize {
+			if err := flush(); err != nil {
+				return nil, nil, err
 			}
-			neighbors = append(neighbors, v)
-			nodeSet[v] = struct{}{}
 		}
-		adj[node] = neighbors
+	}
+	if err := flush(); err != nil {
+		return nil, nil, err
 	}
 	return adj, nodeSet, nil
 }

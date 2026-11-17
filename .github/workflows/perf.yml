@@ -24,11 +24,11 @@ on:
         required: false
         default: ""
       regression_threshold_pct:
-        description: "Regression threshold percent for protected benchmarks"
+        description: "Informational suite-shift marker percent. The fail gate is 1.75× the history median, not this percent."
         required: false
         default: "15"
       fail_on_regression:
-        description: "Fail this run when regressions exceed threshold"
+        description: "Fail when a benchmark is slower than 1.75× its baseline (history median when history is present)"
         required: false
         default: "false"
       include_loadtest:
@@ -36,25 +36,30 @@ on:
         required: false
         default: "false"
       recalibrate_gates:
-        description: "Print advisory gate-threshold recommendations from committed history"
+        description: "Print advisory gate-threshold recommendations from baseline history"
         required: false
         default: "false"
 
-# The protected baseline lives at a fixed path so pull requests always know
-# where to find it. It is regenerated and committed by the baseline job on every
-# push to main, keeping it on the same runner architecture as PR comparisons.
+# Baselines are published as Actions artifacts on every push to main. Pull
+# requests download the latest artifact. The committed main-latest directories
+# are the seed used when that artifact does not exist yet. Nothing in this
+# workflow pushes to main.
 env:
   PROTECTED_BASELINE_DIR: benchmarks/history/protection/main-latest
+  # Informational suite-shift marker only. The fail gate is the history factor
+  # below, not this percent.
   PROTECTED_THRESHOLD_PCT: "15"
-  # Append-only compact history (pruned to the last 90 entries) accumulated
-  # alongside the overwritten main-latest baselines. gate_recalibrate.sh reads
-  # these to recommend tighter thresholds after enough main pushes accrue.
+  # A benchmark fails the pull-request gate when it is slower than this factor
+  # times the median of the last PROTECTED_HISTORY_WINDOW main snapshots.
+  PROTECTED_HISTORY_FACTOR: "1.75"
+  PROTECTED_HISTORY_WINDOW: "40"
+  # Append-only compact history (pruned to the last 90 entries), carried in
+  # the baseline artifact. The committed file seeds the first artifact.
+  # gate_recalibrate.sh reads the artifact copy when one exists.
   PROTECTED_HISTORY_FILE: benchmarks/history/protection/history.ndjson
   LOADTEST_HISTORY_FILE: loadtest/baseline/history.ndjson
-  # The committed WS+API load-harness baseline lives at a fixed path so PRs
-  # always know where to compare. It is regenerated and committed by the
-  # loadtest-baseline job on every push to main, keeping it on the same runner
-  # architecture as PR comparisons.
+  # Seed for the load-harness artifact. The loadtest-baseline job republishes
+  # summary.json; pull requests download that artifact.
   LOADTEST_BASELINE_DIR: loadtest/baseline/main-latest
   # Seeding + harness knobs shared by the baseline and compare jobs so the two
   # runs are byte-for-byte identical in shape.
@@ -67,22 +72,35 @@ env:
 
 jobs:
   baseline:
-    name: Refresh committed protected baseline (main)
+    name: Refresh protected baseline (main)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
           go-version: "1.26.11"
           cache: true
+
+      - name: Seed history from the previous baseline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            protected-baseline "${RUNNER_TEMP}/prev-protected-baseline"
+          prev="${RUNNER_TEMP}/prev-protected-baseline/history.ndjson"
+          if [ -s "${prev}" ]; then
+            cp "${prev}" "${PROTECTED_HISTORY_FILE}"
+            echo "Seeded benchmark history from the previous artifact."
+          else
+            echo "No previous artifact; seeding history from the committed file."
+          fi
 
       - name: Collect protected baseline
         run: |
@@ -100,25 +118,29 @@ jobs:
             "${PROTECTED_BASELINE_DIR}" \
             "${PROTECTED_HISTORY_FILE}"
 
-      - name: Commit updated baseline
+      - name: Stage protected baseline artifact
         run: |
-          # Stage first: `git diff --quiet` ignores untracked files, so checking
-          # before `git add` skipped the very first baseline forever and the PR
-          # compare job never found a committed baseline.
-          git add "${PROTECTED_BASELINE_DIR}" "${PROTECTED_HISTORY_FILE}"
-          if git diff --cached --quiet; then
-            echo "No baseline changes to commit."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(perf): refresh protected benchmark baseline [skip ci]"
-          bash ./scripts/git_push_rebase.sh main
+          stage="${RUNNER_TEMP}/protected-baseline"
+          rm -rf "${stage}"
+          mkdir -p "${stage}"
+          cp -a "${PROTECTED_BASELINE_DIR}" "${stage}/main-latest"
+          cp "${PROTECTED_HISTORY_FILE}" "${stage}/history.ndjson"
+
+      - name: Upload protected baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: protected-baseline
+          path: ${{ runner.temp }}/protected-baseline
+          retention-days: 90
+          if-no-files-found: error
 
   compare:
     name: Compare protected benchmarks (PR)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -137,21 +159,46 @@ jobs:
           PERF_RUN_ID=current \
           bash ./scripts/perf_collect.sh
 
-      - name: Compare against committed baseline
+      - name: Fetch latest protected baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            protected-baseline "${RUNNER_TEMP}/protected-baseline"
+
+      - name: Compare against main baseline
         run: |
           set -euo pipefail
-          if [ ! -d "${PROTECTED_BASELINE_DIR}/benchmarks" ]; then
-            echo "No committed protected baseline yet (${PROTECTED_BASELINE_DIR}); running advisory only."
-            echo "The baseline is created by the first push to main after this workflow lands."
+          fetched="${RUNNER_TEMP}/protected-baseline"
+          baseline="${PROTECTED_BASELINE_DIR}"
+          history="${PROTECTED_HISTORY_FILE}"
+          if [ -d "${fetched}/main-latest/benchmarks" ] && [ -s "${fetched}/history.ndjson" ]; then
+            baseline="${fetched}/main-latest"
+            history="${fetched}/history.ndjson"
+            echo "Using the latest protected-baseline artifact."
+          elif [ -d "${PROTECTED_BASELINE_DIR}/benchmarks" ]; then
+            echo "No protected-baseline artifact yet; using the committed seed ${PROTECTED_BASELINE_DIR}."
+          else
+            echo "No protected baseline yet; running advisory only."
             exit 0
           fi
+          set +e
+          PROTECTED_HISTORY_FILE="${history}" \
+          PROTECTED_HISTORY_FACTOR="${PROTECTED_HISTORY_FACTOR}" \
+          PROTECTED_HISTORY_WINDOW="${PROTECTED_HISTORY_WINDOW}" \
           REGRESSION_THRESHOLD_PCT="${PROTECTED_THRESHOLD_PCT}" \
           ENFORCEMENT_MODE="release_candidate" \
           FAIL_ON_REGRESSION=1 \
           bash ./scripts/perf_protect_compare.sh \
-            "${PROTECTED_BASELINE_DIR}" \
+            "${baseline}" \
             benchmarks/history/ci/current \
             benchmarks/compare
+          status=$?
+          set -e
+          if [ -f benchmarks/compare/protected-summary.md ]; then
+            cat benchmarks/compare/protected-summary.md >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          exit "${status}"
 
       - name: Upload comparison report
         if: always()
@@ -207,6 +254,9 @@ jobs:
           REGRESSION_THRESHOLD_PCT: ${{ inputs.regression_threshold_pct }}
           ENFORCEMENT_MODE: ${{ inputs.enforcement_mode }}
           FAIL_ON_REGRESSION: 0
+          # Ad-hoc runs compare the two chosen snapshots. Leave the history
+          # file unset so the workflow-level seed path is not the fail gate.
+          PROTECTED_HISTORY_FILE: ""
         run: |
           set -euo pipefail
           BASELINE_DIR="$(python3 - <<'PY'
@@ -246,6 +296,9 @@ jobs:
             echo "regression_count=0" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
+          # Empty history file: this ad-hoc compare gates on the chosen snapshot,
+          # not the workflow-level history seed.
+          PROTECTED_HISTORY_FILE= \
           bash ./scripts/perf_protect_compare.sh "${BASELINE_DIR}" "${CURRENT_DIR}" benchmarks/compare
 
       - name: Upload comparison report
@@ -259,7 +312,7 @@ jobs:
       - name: Enforce regression threshold
         if: ${{ inputs.enforcement_mode == 'release_candidate' && inputs.fail_on_regression == 'true' && steps.compare.outputs.comparison_ready == 'true' && steps.compare.outputs.regression_count != '0' }}
         run: |
-          echo "Protected benchmark regressions exceeded threshold."
+          echo "A protected benchmark is slower than ${PROTECTED_HISTORY_FACTOR}× its baseline snapshot."
           echo "See perf-compare artifact for details."
           exit 1
 
@@ -359,11 +412,12 @@ jobs:
           if-no-files-found: warn
 
   loadtest-baseline:
-    name: Refresh committed load-harness baseline (main)
+    name: Refresh load-harness baseline (main)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      actions: read
     services:
       postgres:
         image: postgres:18
@@ -393,8 +447,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -424,6 +476,20 @@ jobs:
         if: always()
         run: bash ./scripts/loadtest_ci_seed.sh stop-api
 
+      - name: Seed history from the previous load-harness artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            loadtest-baseline "${RUNNER_TEMP}/prev-loadtest-baseline"
+          prev="${RUNNER_TEMP}/prev-loadtest-baseline/history.ndjson"
+          if [ -s "${prev}" ]; then
+            cp "${prev}" "${LOADTEST_HISTORY_FILE}"
+            echo "Seeded load-harness history from the previous artifact."
+          else
+            echo "No previous artifact; seeding history from the committed file."
+          fi
+
       - name: Append pruned load-harness history
         run: |
           HISTORY_SHA="${GITHUB_SHA}" \
@@ -431,36 +497,41 @@ jobs:
             "${LOADTEST_BASELINE_DIR}/summary.json" \
             "${LOADTEST_HISTORY_FILE}"
 
-      - name: Commit updated baseline
+      - name: Stage load-harness baseline artifact
         run: |
-          # Stage first: `git diff --quiet` ignores untracked files, so checking
-          # before `git add` skipped the very first baseline forever and the PR
-          # compare job never found a committed baseline.
-          git add "${LOADTEST_BASELINE_DIR}/summary.json" "${LOADTEST_HISTORY_FILE}"
-          if git diff --cached --quiet; then
-            echo "No load-harness baseline changes to commit."
-            exit 0
+          stage="${RUNNER_TEMP}/loadtest-baseline"
+          rm -rf "${stage}"
+          mkdir -p "${stage}/main-latest"
+          cp "${LOADTEST_BASELINE_DIR}/summary.json" "${stage}/main-latest/summary.json"
+          cp "${LOADTEST_HISTORY_FILE}" "${stage}/history.ndjson"
+          if [ -f api-server.log ]; then
+            cp api-server.log "${stage}/api-server.log"
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(loadtest): refresh WS+API harness baseline [skip ci]"
-          bash ./scripts/git_push_rebase.sh main
 
-      - name: Upload baseline artifacts
+      - name: Upload load-harness baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: loadtest-baseline
+          path: ${{ runner.temp }}/loadtest-baseline
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload load-harness log
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: loadtest-baseline-${{ github.run_number }}
-          path: |
-            loadtest/baseline/
-            api-server.log
-          retention-days: 30
-          if-no-files-found: warn
+          name: loadtest-baseline-log-${{ github.run_number }}
+          path: api-server.log
+          retention-days: 14
+          if-no-files-found: ignore
 
   loadtest-compare:
     name: Compare WS + API load harness (PR)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     services:
       postgres:
         image: postgres:18
@@ -517,16 +588,29 @@ jobs:
         if: always()
         run: bash ./scripts/loadtest_ci_seed.sh stop-api
 
-      - name: Compare against committed baseline
+      - name: Fetch latest load-harness baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            loadtest-baseline "${RUNNER_TEMP}/loadtest-baseline"
+
+      - name: Compare against main baseline
         run: |
           set -euo pipefail
-          if [ ! -f "${LOADTEST_BASELINE_DIR}/summary.json" ]; then
-            echo "No committed load-harness baseline yet (${LOADTEST_BASELINE_DIR}/summary.json); running advisory only."
-            echo "The baseline is created by the first push to main after this workflow lands."
+          baseline="${LOADTEST_BASELINE_DIR}/summary.json"
+          fetched="${RUNNER_TEMP}/loadtest-baseline/main-latest/summary.json"
+          if [ -f "${fetched}" ]; then
+            baseline="${fetched}"
+            echo "Using the latest loadtest-baseline artifact."
+          elif [ ! -f "${baseline}" ]; then
+            echo "No load-harness baseline yet; running advisory only."
+          else
+            echo "No loadtest-baseline artifact yet; using the committed seed ${baseline}."
           fi
           FAIL_ON_REGRESSION=1 \
           bash ./scripts/loadtest_compare.sh \
-            "${LOADTEST_BASELINE_DIR}/summary.json" \
+            "${baseline}" \
             loadtest/results/ws-api-summary.json \
             loadtest/compare >> "${GITHUB_STEP_SUMMARY}"
 
@@ -546,18 +630,40 @@ jobs:
     name: Recommend gate thresholds (manual)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.recalibrate_gates == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Recommend thresholds from committed history
+      - name: Fetch latest baseline histories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            protected-baseline "${RUNNER_TEMP}/protected-baseline"
+          bash ./scripts/perf_fetch_baseline_artifact.sh \
+            loadtest-baseline "${RUNNER_TEMP}/loadtest-baseline"
+
+      - name: Recommend thresholds from baseline history
         env:
           # Surface the currently-configured gates so the reducer can print a
           # "vs configured" column. Keep these in sync with the gate defaults.
           LOADTEST_ERROR_RATE_FLOOR: "0.01"
           LOADTEST_ERROR_RATE_FACTOR: "2.0"
           PROTECTED_THRESHOLD_PCT: ${{ env.PROTECTED_THRESHOLD_PCT }}
+          PROTECTED_HISTORY_FACTOR: ${{ env.PROTECTED_HISTORY_FACTOR }}
+          PROTECTED_HISTORY_WINDOW: ${{ env.PROTECTED_HISTORY_WINDOW }}
         run: |
+          bench="${PROTECTED_HISTORY_FILE}"
+          load="${LOADTEST_HISTORY_FILE}"
+          if [ -s "${RUNNER_TEMP}/protected-baseline/history.ndjson" ]; then
+            bench="${RUNNER_TEMP}/protected-baseline/history.ndjson"
+          fi
+          if [ -s "${RUNNER_TEMP}/loadtest-baseline/history.ndjson" ]; then
+            load="${RUNNER_TEMP}/loadtest-baseline/history.ndjson"
+          fi
           bash ./scripts/gate_recalibrate.sh \
-            "${LOADTEST_HISTORY_FILE}" \
-            "${PROTECTED_HISTORY_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+            "${load}" \
+            "${bench}" >> "${GITHUB_STEP_SUMMARY}"

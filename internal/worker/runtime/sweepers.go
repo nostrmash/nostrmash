@@ -120,45 +120,7 @@ func RunMeilisearchSweeperLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// A single sweeper goroutine publishes the backlog/lag SLO gauge so
-			// the N goroutines don't all issue the same aggregate query each tick.
-			if workerIdx == 0 {
-				reportMeilisearchBacklogGauge(ctx, log, handlers)
-			}
-			started := time.Now()
-			processed, err := drainMeilisearchSyncBatch(ctx, handlers, cfg)
-			outcome := "ok"
-			if err != nil {
-				outcome = "error"
-				log.Error(
-					"meilisearch_sweeper_batch_failed",
-					"worker_idx", workerIdx,
-					"processed", processed,
-					"error", err,
-				)
-			}
-			metrics.ObserveMeilisearchSweeperBatch(outcome, processed, time.Since(started))
-			// Drain back-to-back when the queue is hot.
-			for err == nil && processed >= cfg.BatchSize {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				started = time.Now()
-				processed, err = drainMeilisearchSyncBatch(ctx, handlers, cfg)
-				outcome = "ok"
-				if err != nil {
-					outcome = "error"
-					log.Error(
-						"meilisearch_sweeper_batch_failed",
-						"worker_idx", workerIdx,
-						"processed", processed,
-						"error", err,
-					)
-				}
-				metrics.ObserveMeilisearchSweeperBatch(outcome, processed, time.Since(started))
-			}
+			sweepMeilisearchBacklog(ctx, log, handlers, cfg, workerIdx)
 		}
 	}
 }
@@ -244,18 +206,127 @@ func RunMeilisearchIndexRetentionLoop(ctx context.Context, log Logger, client *m
 	}
 }
 
-// drainMeilisearchSyncBatch wraps DrainPendingMeilisearchSyncBatch with a
-// hard per-call deadline (cfg.BatchTimeout) covering the whole claim+sync
-// call, not just the Meilisearch HTTP portion that meili.SyncEventsBatch
-// already bounds internally. See WorkerMeilisearchSweeperConfig's doc
-// comment: without this, a stall anywhere else in the call path (e.g. the
-// claim transaction) has no backstop and can wedge the goroutine
-// indefinitely with no error ever logged. A zero/negative BatchTimeout
-// disables the wrapper (used by tests that don't set it).
-func drainMeilisearchSyncBatch(ctx context.Context, handlers *derivation.Handlers, cfg config.WorkerMeilisearchSweeperConfig) (int, error) {
-	return runWithBatchTimeout(ctx, cfg.BatchTimeout, func(callCtx context.Context) (int, error) {
-		return handlers.DrainPendingMeilisearchSyncBatch(callCtx, cfg.BatchSize)
-	})
+// sweepMeilisearchBacklog drains until neither kind fills a batch.
+// Profiles run every pass. Notes run only when a full note batch is
+// waiting or the oldest note has waited out the sweeper interval: the
+// notes commit costs roughly the same for a few dozen documents as for
+// a full batch, and paying it on every profile pass was most of the lag.
+// The backlog gauge is published between passes. While this loop used to
+// stay inside one ticker firing, the gauge froze for the whole catch-up.
+func sweepMeilisearchBacklog(
+	ctx context.Context,
+	log Logger,
+	handlers *derivation.Handlers,
+	cfg config.WorkerMeilisearchSweeperConfig,
+	workerIdx int,
+) {
+	if workerIdx == 0 {
+		reportMeilisearchBacklogGauge(ctx, log, handlers)
+	}
+	// notesBlocked stops a failed note batch from being retried on every
+	// profile iteration of this pass. The profile queue is the large one;
+	// returning here used to leave both kinds stuck until the next tick.
+	notesBlocked := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		notePicked := 0
+		if !notesBlocked {
+			due, err := handlers.IndexedNoteSyncDue(ctx, cfg.BatchSize, cfg.Interval)
+			if err != nil {
+				log.Error("meilisearch_sweeper_note_stats_failed", "worker_idx", workerIdx, "error", err)
+				notesBlocked = true
+			} else if due {
+				var batchErr error
+				notePicked, batchErr = runMeilisearchBatch(ctx, log, handlers, cfg, workerIdx, true)
+				if batchErr != nil {
+					notePicked = 0
+					notesBlocked = true
+				}
+			}
+		}
+		profilePicked, err := runMeilisearchBatch(ctx, log, handlers, cfg, workerIdx, false)
+		if err != nil {
+			return
+		}
+		if workerIdx == 0 {
+			reportMeilisearchBacklogGauge(ctx, log, handlers)
+		}
+		if profilePicked < cfg.BatchSize && notePicked < cfg.BatchSize {
+			return
+		}
+	}
+}
+
+func runMeilisearchBatch(
+	ctx context.Context,
+	log Logger,
+	handlers *derivation.Handlers,
+	cfg config.WorkerMeilisearchSweeperConfig,
+	workerIdx int,
+	notes bool,
+) (int, error) {
+	kind := "profiles"
+	if notes {
+		kind = "notes"
+	}
+	started := time.Now()
+	synced, picked, err := drainMeilisearchSyncBatch(ctx, handlers, cfg, notes)
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+		log.Error(
+			"meilisearch_sweeper_batch_failed",
+			"worker_idx", workerIdx,
+			"kind", kind,
+			"processed", synced,
+			"error", err,
+		)
+	}
+	metrics.ObserveMeilisearchSweeperBatch(outcome, synced, time.Since(started))
+	return picked, err
+}
+
+// drainMeilisearchSyncBatch wraps one kind's claim+sync with a hard
+// per-call deadline (cfg.BatchTimeout), not just the Meilisearch HTTP
+// portion that meili.SyncEventsBatch already bounds internally. See
+// WorkerMeilisearchSweeperConfig's doc comment: without this, a stall
+// anywhere else in the call path (e.g. the claim transaction) has no
+// backstop and can wedge the goroutine indefinitely with no error ever
+// logged. A zero/negative BatchTimeout disables the wrapper (used by
+// tests that don't set it).
+func drainMeilisearchSyncBatch(ctx context.Context, handlers *derivation.Handlers, cfg config.WorkerMeilisearchSweeperConfig, notes bool) (int, int, error) {
+	type result struct {
+		synced int
+		picked int
+		err    error
+	}
+	call := func(callCtx context.Context) (int, int, error) {
+		if notes {
+			return handlers.DrainPendingNoteMeilisearchSyncBatch(callCtx, cfg.BatchSize)
+		}
+		return handlers.DrainPendingProfileMeilisearchSyncBatch(callCtx, cfg.BatchSize)
+	}
+	if cfg.BatchTimeout <= 0 {
+		return call(ctx)
+	}
+	// Same watchdog as runWithBatchTimeout: the Meilisearch call runs on
+	// its own goroutine so a stuck claim cannot pin the sweeper past the
+	// deadline. The in-flight call is left to finish; its result is dropped.
+	callCtx, cancel := context.WithTimeout(ctx, cfg.BatchTimeout)
+	defer cancel()
+	resCh := make(chan result, 1)
+	go func() {
+		synced, picked, err := call(callCtx)
+		resCh <- result{synced: synced, picked: picked, err: err}
+	}()
+	select {
+	case res := <-resCh:
+		return res.synced, res.picked, res.err
+	case <-callCtx.Done():
+		return 0, 0, fmt.Errorf("meilisearch sweeper batch exceeded %s hard timeout: %w", cfg.BatchTimeout, callCtx.Err())
+	}
 }
 
 // runWithBatchTimeout bounds fn by a real wall-clock timeout when

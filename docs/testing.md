@@ -155,8 +155,8 @@ make perf-protect-compare BASELINE_DIR=benchmarks/history/protection/<older> CUR
 Notes:
 
 - `perf-protect-collect` stores a protected-only benchmark snapshot (`PERF_COLLECT_SCOPE=protected`).
-- `perf-protect-compare` computes median `ns/op` deltas for the protected benchmark set and writes `benchmarks/compare/protected-summary.{md,json}`. A benchmark counts as a regression only when its timing is slower than the suite's own median shift by the threshold (a ratio of the two slowdown factors), so a runner that moves every benchmark together is not a failure.
-- local compare is advisory by default; set `FAIL_ON_REGRESSION=1` to make local compare exit non-zero when threshold is exceeded.
+- `perf-protect-compare` computes median `ns/op` deltas for the protected benchmark set and writes `benchmarks/compare/protected-summary.{md,json}`. The report includes the suite's median shift so a runner-wide move is visible. A benchmark counts as a regression only when it is slower than `PROTECTED_HISTORY_FACTOR` (default 1.75×) the median of the recent history in `PROTECTED_HISTORY_FILE`, or slower than that factor times the baseline snapshot when no history file is set. A benchmark that got faster, or that merely lagged a runner-wide speedup, does not fail.
+- local compare is advisory by default; set `FAIL_ON_REGRESSION=1` to make local compare exit non-zero when the history-band gate fails. Pass `PROTECTED_HISTORY_FILE=benchmarks/history/protection/history.ndjson` to use the committed history seed.
 
 Protected benchmark set currently focuses on:
 

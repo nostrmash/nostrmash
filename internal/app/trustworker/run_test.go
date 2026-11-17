@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/nostrmash/nostrmash/internal/config"
 	"github.com/nostrmash/nostrmash/internal/jobs"
 )
@@ -284,4 +286,20 @@ func TestTrustWorkerModeLabel(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRaiseTrustRedisIOTimeout(t *testing.T) {
+	unset := &redis.Options{}
+	raiseTrustRedisIOTimeout(unset)
+	if unset.ReadTimeout != trustRedisMinIOTimeout || unset.WriteTimeout != trustRedisMinIOTimeout {
+		t.Fatalf("timeouts = read %s write %s, want %s", unset.ReadTimeout, unset.WriteTimeout, trustRedisMinIOTimeout)
+	}
+
+	longer := &redis.Options{ReadTimeout: time.Minute, WriteTimeout: time.Minute}
+	raiseTrustRedisIOTimeout(longer)
+	if longer.ReadTimeout != time.Minute || longer.WriteTimeout != time.Minute {
+		t.Fatalf("longer timeouts were lowered to read %s write %s", longer.ReadTimeout, longer.WriteTimeout)
+	}
+
+	raiseTrustRedisIOTimeout(nil)
 }

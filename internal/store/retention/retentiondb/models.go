@@ -988,6 +988,7 @@ type PendingAuthorAnalyticsRecompute struct {
 type PendingMeilisearchSync struct {
 	EventID  string
 	MarkedAt pgtype.Timestamptz
+	Kind     int32
 }
 
 type PendingProfileStatsRecompute struct {

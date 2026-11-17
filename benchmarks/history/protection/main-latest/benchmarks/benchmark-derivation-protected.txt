@@ -1,11 +1,11 @@
 goos: linux
 goarch: amd64
 pkg: github.com/nostrmash/nostrmash/internal/derivation
-cpu: INTEL(R) XEON(R) PLATINUM 8573C
-BenchmarkDeriveEventReferences-4   	 1678623	       716.0 ns/op	    1424 B/op	       5 allocs/op
-BenchmarkDeriveEventReferences-4   	 1693683	       716.1 ns/op	    1424 B/op	       5 allocs/op
-BenchmarkDeriveEventReferences-4   	 1687970	       717.6 ns/op	    1424 B/op	       5 allocs/op
-BenchmarkDeriveEventReferences-4   	 1695956	       715.7 ns/op	    1424 B/op	       5 allocs/op
-BenchmarkDeriveEventReferences-4   	 1000000	      1057 ns/op	    1424 B/op	       5 allocs/op
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkDeriveEventReferences-4   	 1337359	       781.4 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2103307	       562.7 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2131609	       570.0 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2114426	       561.7 ns/op	    1424 B/op	       5 allocs/op
+BenchmarkDeriveEventReferences-4   	 2166664	       573.4 ns/op	    1424 B/op	       5 allocs/op
 PASS
-ok  	github.com/nostrmash/nostrmash/internal/derivation	8.805s
+ok  	github.com/nostrmash/nostrmash/internal/derivation	9.082s
