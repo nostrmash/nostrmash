@@ -119,36 +119,94 @@ func requestPathTemplate(r *http.Request) string {
 	return pattern
 }
 
+// cloudflareWorkersSubrequestIP is the address Cloudflare stamps on
+// CF-Connecting-IP for a Worker subrequest that enters another zone (or
+// re-enters Cloudflare because the worker fetch is strictly public). Every
+// such subrequest shares this one address, so rate limiting on it collapses
+// the whole website into a single bucket.
+// https://developers.cloudflare.com/fundamentals/reference/http-headers/
+var cloudflareWorkersSubrequestIP = net.ParseIP("2a06:98c0:3600::103")
+
+// websiteVisitorIPHeader carries the page visitor when the connecting address
+// is the shared Worker address above. A normal client cannot set
+// CF-Connecting-IP, and Cloudflare sets CF-Worker to the zone that owns the
+// Worker, so the pair is not spoofable from the public edge.
+const websiteVisitorIPHeader = "X-NostrMash-Visitor-IP"
+
 // requestClientIP returns the best-effort originating client address.
 //
 // Behind Coolify/Traefik the API's RemoteAddr is always the proxy, and the
 // edge nginx sets X-Real-IP to that proxy address. Website renders call the
-// API from a Cloudflare Worker, which forwards the visitor as
-// CF-Connecting-IP. Prefer that when it is present so page traffic is limited
-// per visitor instead of per proxy.
+// API from a Cloudflare Worker. Same-zone subrequests copy X-Real-IP into
+// CF-Connecting-IP. Cross-zone subrequests replace CF-Connecting-IP with the
+// shared Worker address, and the worker sends the visitor separately.
 //
-//  1. CF-Connecting-IP (visitor, when the edge or worker forwarded one)
-//  2. X-Real-IP (Traefik sets this to the connecting client)
-//  3. left-most X-Forwarded-For hop (original client)
-//  4. RemoteAddr host
+//  1. Visitor forwarded by our own Worker, when the connecting address is
+//     the shared Worker subrequest address and CF-Worker is our zone
+//  2. CF-Connecting-IP (visitor, for ordinary edge traffic)
+//  3. X-Real-IP (Traefik sets this to the connecting client)
+//  4. left-most X-Forwarded-For hop (original client)
+//  5. RemoteAddr host
 //
 // Only syntactically valid IPs are accepted from headers so a garbage or
 // spoofed value cannot create unbounded limiter keys.
 func requestClientIP(r *http.Request) string {
-	if ip := parseClientIP(r.Header.Get("CF-Connecting-IP")); ip != "" {
-		return ip
+	cfIP := parseClientIP(r.Header.Get("CF-Connecting-IP"))
+	if isCloudflareWorkersSubrequest(cfIP) && isTrustedWebsiteWorker(r.Header.Get("CF-Worker")) {
+		if ip := workerForwardedVisitor(r); ip != "" {
+			return ip
+		}
+	}
+	if cfIP != "" {
+		return cfIP
 	}
 	if ip := parseClientIP(r.Header.Get("X-Real-IP")); ip != "" {
 		return ip
 	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		for _, part := range strings.Split(xff, ",") {
-			if ip := parseClientIP(part); ip != "" {
-				return ip
-			}
-		}
+	if ip := firstForwardedIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+		return ip
 	}
 	return parseClientIP(r.RemoteAddr)
+}
+
+func isCloudflareWorkersSubrequest(ip string) bool {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	return parsed != nil && cloudflareWorkersSubrequestIP != nil && parsed.Equal(cloudflareWorkersSubrequestIP)
+}
+
+func isTrustedWebsiteWorker(zone string) bool {
+	switch strings.ToLower(strings.TrimSpace(zone)) {
+	case "nostrmash.com":
+		return true
+	default:
+		return false
+	}
+}
+
+// workerForwardedVisitor reads the visitor our website worker attached.
+// The explicit header wins. Otherwise the left-most X-Forwarded-For hop that
+// is not the shared Worker address is the visitor the worker already sends.
+func workerForwardedVisitor(r *http.Request) string {
+	if ip := parseClientIP(r.Header.Get(websiteVisitorIPHeader)); ip != "" && !isCloudflareWorkersSubrequest(ip) {
+		return ip
+	}
+	for _, part := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+		ip := parseClientIP(part)
+		if ip == "" || isCloudflareWorkersSubrequest(ip) {
+			continue
+		}
+		return ip
+	}
+	return ""
+}
+
+func firstForwardedIP(header string) string {
+	for _, part := range strings.Split(header, ",") {
+		if ip := parseClientIP(part); ip != "" {
+			return ip
+		}
+	}
+	return ""
 }
 
 func parseClientIP(value string) string {

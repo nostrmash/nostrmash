@@ -180,6 +180,52 @@ func TestRequestClientIP_PrefersProxyHeaders(t *testing.T) {
 	}
 }
 
+func TestRequestClientIP_WorkerSubrequestUsesVisitor(t *testing.T) {
+	const workerIP = "2a06:98c0:3600::103"
+
+	t.Run("explicit visitor header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery/hashtags/bitcoin/notes", nil)
+		req.Header.Set("CF-Connecting-IP", workerIP)
+		req.Header.Set("CF-Worker", "nostrmash.com")
+		req.Header.Set("X-NostrMash-Visitor-IP", "203.0.113.44")
+		req.Header.Set("X-Forwarded-For", "198.51.100.7, "+workerIP)
+		if got := requestClientIP(req); got != "203.0.113.44" {
+			t.Fatalf("requestClientIP() = %q, want visitor header", got)
+		}
+	})
+
+	t.Run("forwarded for from the current website worker", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery/hashtags/bitcoin/notes", nil)
+		req.Header.Set("CF-Connecting-IP", "2a06:98c0:3600:0:0:0:0:103")
+		req.Header.Set("CF-Worker", "NostrMash.com")
+		req.Header.Set("X-Forwarded-For", "203.0.113.44, "+workerIP)
+		if got := requestClientIP(req); got != "203.0.113.44" {
+			t.Fatalf("requestClientIP() = %q, want forwarded visitor", got)
+		}
+	})
+
+	t.Run("ordinary client cannot spoof the visitor header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery/hashtags/bitcoin/notes", nil)
+		req.Header.Set("CF-Connecting-IP", "203.0.113.10")
+		req.Header.Set("CF-Worker", "nostrmash.com")
+		req.Header.Set("X-NostrMash-Visitor-IP", "198.51.100.8")
+		req.Header.Set("X-Forwarded-For", "198.51.100.9")
+		if got := requestClientIP(req); got != "203.0.113.10" {
+			t.Fatalf("requestClientIP() = %q, want connecting client", got)
+		}
+	})
+
+	t.Run("foreign worker stays on the shared address", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery/hashtags/bitcoin/notes", nil)
+		req.Header.Set("CF-Connecting-IP", workerIP)
+		req.Header.Set("CF-Worker", "evil.example")
+		req.Header.Set("X-NostrMash-Visitor-IP", "198.51.100.8")
+		if got := requestClientIP(req); got != workerIP {
+			t.Fatalf("requestClientIP() = %q, want shared worker address", got)
+		}
+	})
+}
+
 func TestWithHTTPRateLimit_ProxyHeadersSeparateClients(t *testing.T) {
 	limited := WithHTTPRateLimit(HTTPRateLimitOptions{
 		DefaultRPM:   1,
