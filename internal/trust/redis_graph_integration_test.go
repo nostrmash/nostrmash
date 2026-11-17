@@ -136,6 +136,68 @@ func TestSyncGraphToRedis_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadAdjacencyFromRedis_ReadsInChunks(t *testing.T) {
+	ctx := context.Background()
+	redisURL := dbtest.RedisURL(t, "trust-redis-chunks")
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		t.Fatalf("parse redis url: %v", err)
+	}
+	rc := redis.NewClient(opts)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	prev := redisAdjacencyReadChunk
+	redisAdjacencyReadChunk = 2
+	t.Cleanup(func() { redisAdjacencyReadChunk = prev })
+
+	prefix := fmt.Sprintf("nmchunk:%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		for _, key := range scanKeys(t, rc, prefix+"*") {
+			_ = rc.Del(context.Background(), key).Err()
+		}
+	})
+
+	const runID = int64(9)
+	const snapshot = "chunk"
+	keys := newRedisKeyspace(prefix)
+	nodes := []string{"n0", "n1", "n2", "n3", "n4"}
+	members := make([]any, len(nodes))
+	for i, node := range nodes {
+		members[i] = node
+	}
+	if err := rc.SAdd(ctx, keys.runNodesKey(runID, snapshot), members...).Err(); err != nil {
+		t.Fatalf("seed nodes: %v", err)
+	}
+	for i, node := range nodes {
+		neighbor := fmt.Sprintf("f%d", i)
+		if err := rc.SAdd(ctx, keys.runAdjKey(runID, snapshot, node), neighbor).Err(); err != nil {
+			t.Fatalf("seed adj %s: %v", node, err)
+		}
+	}
+
+	rt := NewRuntimeWithRedis(nil, rc, prefix, true, false)
+	adj, nodeSet, err := rt.loadAdjacencyFromRedis(ctx, runID, snapshot)
+	if err != nil {
+		t.Fatalf("load adjacency: %v", err)
+	}
+	if len(adj) != len(nodes) {
+		t.Fatalf("adjacency nodes = %d, want %d", len(adj), len(nodes))
+	}
+	for i, node := range nodes {
+		got := adj[node]
+		want := fmt.Sprintf("f%d", i)
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("adj[%s] = %v, want [%s]", node, got, want)
+		}
+		if _, ok := nodeSet[node]; !ok {
+			t.Fatalf("node set missing %s", node)
+		}
+		if _, ok := nodeSet[want]; !ok {
+			t.Fatalf("node set missing neighbor %s", want)
+		}
+	}
+}
+
 // scanKeys collects every key matching pattern via cursor-based SCAN.
 func scanKeys(t *testing.T, rc *redis.Client, pattern string) []string {
 	t.Helper()

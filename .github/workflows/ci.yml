@@ -50,6 +50,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check protected benchmark gate
+        run: make perf-gate-check
+
       - name: Setup Go
         uses: actions/setup-go@v7
         with:

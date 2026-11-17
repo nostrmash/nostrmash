@@ -18,11 +18,11 @@ func TestPrunePendingMeilisearchSyncs_DeletesOnlyRowsAtOrBeforeCutoff(t *testing
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO pending_meilisearch_syncs (event_id, marked_at) VALUES
-			('old_a', now() - interval '2 hours'),
-			('old_b', now() - interval '1 hour'),
-			('boundary', now()),
-			('new_a', now() + interval '1 hour')
+		INSERT INTO pending_meilisearch_syncs (event_id, marked_at, kind) VALUES
+			('old_a', now() - interval '2 hours', 0),
+			('old_b', now() - interval '1 hour', 0),
+			('boundary', now(), 1),
+			('new_a', now() + interval '1 hour', 1)
 	`); err != nil {
 		t.Fatalf("seed pending rows: %v", err)
 	}

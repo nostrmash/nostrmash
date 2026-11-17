@@ -22,11 +22,12 @@ func (s *Read) SearchDocuments(ctx context.Context, query string, limit int) ([]
 		limit = 100
 	}
 
-	// Each branch is bounded and indexable. OR-ing a leading-wildcard LIKE
-	// with the tsvector match made Postgres scan search_documents, and that
-	// fallback then exceeded the search deadline. Alias and identity
-	// substring matches stay on Meilisearch; this path keeps full-text hits
-	// plus identifier and title prefixes.
+	// Meilisearch serves search. This query is the fallback for when it is
+	// down. The GIN and prefix indexes that used to serve these branches
+	// were dropped (migration 000130): nothing scanned them while
+	// Meilisearch was up, and every search_documents update maintained
+	// them. Each branch stays LIMITed so a fallback cannot return an
+	// unbounded set; without those indexes the scan itself is the cost.
 	rows, err := s.pool.Query(ctx, `
 		WITH params AS (
 			SELECT lower(trim($1)) AS q
