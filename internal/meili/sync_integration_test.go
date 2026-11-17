@@ -122,7 +122,7 @@ func TestNeedsSync_NotesComparesOnlyWithinIndexedWindow(t *testing.T) {
 	// binary (only Postgres gets a fresh schema per test). Clear it first so
 	// documents left behind by other tests can't pollute the ratio this test
 	// computes.
-	notesTask, err := client.service.Index(IndexNotes).DeleteAllDocumentsWithContext(ctx, nil)
+	notesTask, err := client.service.Index(IndexNotes).DeleteAllDocuments(ctx, nil)
 	if err != nil {
 		t.Fatalf("clear notes index: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestFullSync_Smoke(t *testing.T) {
 	var gotTotal int64
 	for _, eventID := range keys(wantIDs) {
 		var doc map[string]any
-		if err := idx.GetDocument(eventID, nil, &doc); err != nil {
+		if err := idx.GetDocument(ctx, eventID, nil, &doc); err != nil {
 			t.Fatalf("get document %s from notes index: %v", eventID, err)
 		}
 		gotTotal++

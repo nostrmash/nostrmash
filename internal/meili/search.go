@@ -157,7 +157,7 @@ func (s *Searcher) SearchNotes(
 	if strings.EqualFold(strings.TrimSpace(sort), "latest") {
 		req.Sort = []string{"created_at:desc"}
 	}
-	resp, err := s.client.service.Index(IndexNotes).SearchWithContext(searchCtx, searchQuery, req)
+	resp, err := s.client.service.Index(IndexNotes).Search(searchCtx, searchQuery, req)
 	if err != nil {
 		s.finishSearch(&outcome, err)
 		return nil, err
@@ -233,7 +233,7 @@ func (s *Searcher) SearchProfiles(
 		},
 	}
 	searchQuery = applyHexPubkeyFilter(req, searchQuery)
-	resp, err := s.client.service.Index(IndexProfiles).SearchWithContext(searchCtx, searchQuery, req)
+	resp, err := s.client.service.Index(IndexProfiles).Search(searchCtx, searchQuery, req)
 	if err != nil {
 		s.finishSearch(&outcome, err)
 		return nil, err
@@ -285,7 +285,7 @@ func (s *Searcher) SuggestProfiles(ctx context.Context, searchQuery string, limi
 		ShowRankingScoreDetails: false,
 	}
 	searchQuery = applyHexPubkeyFilter(req, searchQuery)
-	resp, err := s.client.service.Index(IndexProfiles).SearchWithContext(searchCtx, searchQuery, req)
+	resp, err := s.client.service.Index(IndexProfiles).Search(searchCtx, searchQuery, req)
 	if err != nil {
 		s.finishSearch(&outcome, err)
 		return nil, err
@@ -352,7 +352,7 @@ func (s *Searcher) SearchDocuments(ctx context.Context, searchQuery string, limi
 		}
 		return nil, fmt.Errorf("meilisearch searcher is disabled")
 	}
-	resp, err := s.client.service.Index(IndexDocuments).SearchWithContext(searchCtx, searchQuery, &ms.SearchRequest{
+	resp, err := s.client.service.Index(IndexDocuments).Search(searchCtx, searchQuery, &ms.SearchRequest{
 		Limit:                int64(limit),
 		Offset:               0,
 		AttributesToRetrieve: []string{"id", "entity_type", "entity_id", "title", "body", "aliases", "identity_tokens", "freshness", "popularity", "trust_score"},

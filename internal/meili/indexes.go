@@ -152,8 +152,8 @@ func (c *Client) ensureIndexes(ctx context.Context) error {
 }
 
 func (c *Client) ensureIndex(ctx context.Context, spec indexSpec) error {
-	if _, err := c.service.GetIndexWithContext(ctx, spec.UID); err != nil {
-		task, createErr := c.service.CreateIndexWithContext(ctx, &ms.IndexConfig{
+	if _, err := c.service.GetIndex(ctx, spec.UID); err != nil {
+		task, createErr := c.service.CreateIndex(ctx, &ms.IndexConfig{
 			Uid:        spec.UID,
 			PrimaryKey: spec.PrimaryKey,
 		})
@@ -164,7 +164,7 @@ func (c *Client) ensureIndex(ctx context.Context, spec indexSpec) error {
 			return fmt.Errorf("wait index create task (%s): %w", spec.UID, err)
 		}
 	}
-	task, err := c.service.Index(spec.UID).UpdateSettingsWithContext(ctx, &spec.Settings)
+	task, err := c.service.Index(spec.UID).UpdateSettings(ctx, &spec.Settings)
 	if err != nil {
 		return fmt.Errorf("update meilisearch index settings (%s): %w", spec.UID, err)
 	}

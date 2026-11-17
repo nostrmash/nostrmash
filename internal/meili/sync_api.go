@@ -17,7 +17,7 @@ import (
 // Meilisearch is unhealthy or its task queue is backed up, which in
 // production permanently stalled every live-pool worker as soon as it
 // processed its first kind=0 or kind=1 event (worker goroutines were
-// observed stuck inside WaitForTaskWithContext for 12+ minutes with open
+// observed stuck inside WaitForTask for 12+ minutes with open
 // PG transactions in "idle in transaction" state).
 //
 // 30s is generous enough to cover normal Meilisearch ingestion latency

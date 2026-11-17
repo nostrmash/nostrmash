@@ -141,7 +141,7 @@ func (c *Client) Health(ctx context.Context) error {
 	if !c.Enabled() {
 		return nil
 	}
-	if _, err := c.service.HealthWithContext(ctx); err != nil {
+	if _, err := c.service.Health(ctx); err != nil {
 		return fmt.Errorf("meilisearch health check: %w", err)
 	}
 	return nil
@@ -151,11 +151,11 @@ func (c *Client) Stats(ctx context.Context) (ServiceStats, error) {
 	if !c.Enabled() {
 		return ServiceStats{}, nil
 	}
-	health, err := c.service.HealthWithContext(ctx)
+	health, err := c.service.Health(ctx)
 	if err != nil {
 		return ServiceStats{}, fmt.Errorf("read meilisearch health: %w", err)
 	}
-	stats, err := c.service.GetStatsWithContext(ctx, nil)
+	stats, err := c.service.GetStats(ctx, nil)
 	if err != nil {
 		return ServiceStats{}, fmt.Errorf("read meilisearch stats: %w", err)
 	}
@@ -200,7 +200,7 @@ func (c *Client) NeedsSync(ctx context.Context, pool *pgxpool.Pool) (bool, error
 	const syncThreshold = 0.80
 	minNotesCreatedAt := indexedNotesMinCreatedAt(time.Now())
 	for _, check := range checks {
-		meiliStats, err := c.service.Index(check.index).GetStatsWithContext(ctx, nil)
+		meiliStats, err := c.service.Index(check.index).GetStats(ctx, nil)
 		if err != nil {
 			return false, fmt.Errorf("get stats for index %s: %w", check.index, err)
 		}
@@ -231,7 +231,7 @@ func (c *Client) waitForTask(ctx context.Context, taskUID int64) error {
 	if !c.Enabled() {
 		return nil
 	}
-	task, err := c.service.WaitForTaskWithContext(ctx, taskUID, 250*time.Millisecond)
+	task, err := c.service.WaitForTask(ctx, taskUID, 250*time.Millisecond)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,7 @@ func (c *Client) enqueueNotes(ctx context.Context, docs []NoteDocument) (int64, 
 	for i := range docs {
 		trimNoteDocument(&docs[i])
 	}
-	task, err := c.service.Index(IndexNotes).UpdateDocumentsWithContext(ctx, docs, nil)
+	task, err := c.service.Index(IndexNotes).UpdateDocuments(ctx, docs, nil)
 	if err != nil {
 		return 0, fmt.Errorf("upsert notes in meilisearch: %w", err)
 	}
@@ -291,7 +291,7 @@ func (c *Client) enqueueProfiles(ctx context.Context, docs []ProfileDocument) (i
 	}
 	// Add replaces the document. Update would merge and leave a stale
 	// profile_json key on profiles indexed before that field was dropped.
-	task, err := c.service.Index(IndexProfiles).AddDocumentsWithContext(ctx, docs, nil)
+	task, err := c.service.Index(IndexProfiles).AddDocuments(ctx, docs, nil)
 	if err != nil {
 		return 0, fmt.Errorf("upsert profiles in meilisearch: %w", err)
 	}
@@ -314,7 +314,7 @@ func (c *Client) enqueueDocuments(ctx context.Context, docs []SearchDocument) (i
 	for i := range docs {
 		trimSearchDocument(&docs[i])
 	}
-	task, err := c.service.Index(IndexDocuments).UpdateDocumentsWithContext(ctx, docs, nil)
+	task, err := c.service.Index(IndexDocuments).UpdateDocuments(ctx, docs, nil)
 	if err != nil {
 		return 0, fmt.Errorf("upsert documents in meilisearch: %w", err)
 	}
@@ -402,11 +402,11 @@ func (c *Client) deleteByFilter(ctx context.Context, indexUID, filter, what stri
 	if !c.Enabled() {
 		return 0, nil
 	}
-	taskInfo, err := c.service.Index(indexUID).DeleteDocumentsByFilterWithContext(ctx, filter, nil)
+	taskInfo, err := c.service.Index(indexUID).DeleteDocumentsByFilter(ctx, filter, nil)
 	if err != nil {
 		return 0, fmt.Errorf("delete %s from meilisearch: %w", what, err)
 	}
-	task, err := c.service.WaitForTaskWithContext(ctx, taskInfo.TaskUID, 250*time.Millisecond)
+	task, err := c.service.WaitForTask(ctx, taskInfo.TaskUID, 250*time.Millisecond)
 	if err != nil {
 		return 0, fmt.Errorf("wait for %s delete task: %w", what, err)
 	}
@@ -436,11 +436,11 @@ func (c *Client) deleteDocumentsCounted(ctx context.Context, indexUID string, id
 	if !c.Enabled() || len(ids) == 0 {
 		return 0, nil
 	}
-	taskInfo, err := c.service.Index(indexUID).DeleteDocumentsWithContext(ctx, ids, nil)
+	taskInfo, err := c.service.Index(indexUID).DeleteDocuments(ctx, ids, nil)
 	if err != nil {
 		return 0, fmt.Errorf("delete %s documents from meilisearch: %w", indexUID, err)
 	}
-	task, err := c.service.WaitForTaskWithContext(ctx, taskInfo.TaskUID, 250*time.Millisecond)
+	task, err := c.service.WaitForTask(ctx, taskInfo.TaskUID, 250*time.Millisecond)
 	if err != nil {
 		return 0, fmt.Errorf("wait for %s document delete task: %w", indexUID, err)
 	}
@@ -461,7 +461,7 @@ func (c *Client) ResetIndexes(ctx context.Context) error {
 		return nil
 	}
 	for _, uid := range []string{IndexNotes, IndexProfiles, IndexDocuments} {
-		task, err := c.service.DeleteIndexWithContext(ctx, uid)
+		task, err := c.service.DeleteIndex(ctx, uid)
 		if err != nil {
 			// Missing index is fine during first-time setup / repeated resets.
 			continue
