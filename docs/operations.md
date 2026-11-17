@@ -780,7 +780,7 @@ Alert rules are defined in `observability/alerts/core_workflow_alerts.yml`. Use 
   - Meaning: `event_tags` retention is deleting at a sustained catchup rate for 12h+.
   - Check next: ingest allowlist/`ShouldPersist` regressions, whether new junk tag classes are being written, and `event_tags_retention_*` worker logs.
 - `NostrMashDatabaseGrowthSustained`
-  - Meaning: global database growth rate is elevated for hours.
+  - Meaning: global database growth rate is above 400 MiB/hour for the 6h derivative window. Sustained growth is about 290 MiB/hour.
   - Check next: heavy-table growth (`nostrmash_storage_table_bytes{table}`), retention throughput, and expected ingest/rebuild workload.
 - `NostrMashInvalidEventsGrowthHigh`
   - Meaning: `invalid_events` is growing faster than expected.
