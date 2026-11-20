@@ -17,7 +17,12 @@ NostrMash is a Go-based, Docker-native Nostr ingestion and indexing platform for
 
 The design goal is simple: keep raw Nostr truth durable, inspectable, and replayable, while keeping product-facing state rebuildable and versioned. It is Docker-first so self-hosting stays low-friction, and Primal-compatible at the boundary so clients already shaped around Primal Cache can adopt it without an all-at-once rewrite.
 
-The public explorer is [nostrmash-web](https://github.com/nostrmash/nostrmash-web). SmartFlowSocial's [cache worker](https://github.com/smartflowsocial/smartflowsocial-cache-worker) calls this API before it falls back to Primal.
+The public explorer is [nostrmash-web](https://github.com/nostrmash/nostrmash-web).
+
+NostrMash maintains several standalone Nostr developer utilities. They can be used independently of NostrMash Core.
+
+- [Nostr Read Gateway](https://github.com/nostrmash/nostr-read-gateway)
+- [Nostr Publish Gateway](https://github.com/nostrmash/nostr-publish-gateway) is private while its source provenance is reviewed.
 
 ## At a glance
 
