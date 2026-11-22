@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -621,17 +620,18 @@ func (s *relayHealthSource) Set(fn func() (healthy, tracked int)) {
 	s.mu.Unlock()
 }
 
-func (s *relayHealthSource) Read() (healthy, tracked int) {
+func (s *relayHealthSource) Read() (healthy, tracked int, ok bool) {
 	if s == nil {
-		return 0, 0
+		return 0, 0, false
 	}
 	s.mu.RLock()
 	fn := s.fn
 	s.mu.RUnlock()
 	if fn == nil {
-		return 0, 0
+		return 0, 0, false
 	}
-	return fn()
+	healthy, tracked = fn()
+	return healthy, tracked, true
 }
 
 func runMetricsLogger(
@@ -647,6 +647,7 @@ func runMetricsLogger(
 	}
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
+	processStarted := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -664,12 +665,18 @@ func runMetricsLogger(
 			if emitter == nil {
 				continue
 			}
-			healthy, tracked := health.Read()
-			emitter.Notify(ctx, watchdog.Sample{
-				Progress: strconv.FormatUint(snapshot.Valid, 10),
-				Idle:     tracked == 0 || healthy > 0,
-				LoopAt:   time.Now(),
+			healthy, tracked, known := health.Read()
+			sample, send := watchdog.IngestorSample(watchdog.IngestObservation{
+				ProcessStarted: processStarted,
+				Valid:          snapshot.Valid,
+				Tracked:        tracked,
+				Healthy:        healthy,
+				HealthKnown:    known,
+				ObservedAt:     time.Now(),
 			})
+			if send {
+				emitter.Notify(ctx, sample)
+			}
 		}
 	}
 }
