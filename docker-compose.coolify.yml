@@ -149,6 +149,10 @@ services:
     environment:
       <<: *common-env
       METRICS_ADDR: ${INGESTOR_METRICS_ADDR:-:9090}
+      # Per-service names: a shared WATCHDOG_URL would point both processes at one monitor.
+      # Empty leaves the heartbeat off. A failed send never blocks ingestion.
+      WATCHDOG_URL: ${INGESTOR_WATCHDOG_URL:-}
+      WATCHDOG_HMAC_SECRET: ${INGESTOR_WATCHDOG_HMAC_SECRET:-}
       INGESTOR_MODE: ${INGESTOR_MODE:-live}
       INGESTOR_FILTER_GROUP: ${INGESTOR_FILTER_GROUP:-default_v1}
       INGESTOR_FILTER_GROUPS_JSON: ${INGESTOR_FILTER_GROUPS_JSON:-}
@@ -199,6 +203,9 @@ services:
       <<: *common-env
       METRICS_ADDR: ${WORKER_METRICS_ADDR:-:9090}
       DEBUG_ADDR: ${WORKER_DEBUG_ADDR:-}
+      # Distinct from the ingestor URL. Empty leaves the heartbeat off.
+      WATCHDOG_URL: ${WORKER_WATCHDOG_URL:-}
+      WATCHDOG_HMAC_SECRET: ${WORKER_WATCHDOG_HMAC_SECRET:-}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       # Tight terminal-job retention keeps the jobs indexes from bloating under
       # high churn on the single-server host (heap is tiny; indexes were 4.7 GB).
