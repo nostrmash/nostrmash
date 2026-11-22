@@ -213,6 +213,8 @@ Do not hand-edit this file.
 | `TRUST_WORKER_CONCURRENCY` | `trust_worker` | optional | `2` | Trust worker goroutine concurrency. |
 | `TRUST_WORKER_POLL_INTERVAL` | `trust_worker` | optional | `1s` | Polling interval for trust queue claims. |
 | `TRUST_WORKER_RETRY_DELAY` | `trust_worker` | optional | `5s` | Retry delay when trust jobs fail. |
+| `WATCHDOG_HMAC_SECRET` | `ingestor, worker` | optional | `-` | HMAC secret for WATCHDOG_URL. At least 32 characters. It must match the watchdog HEARTBEAT_KEYS entry for that process's monitor id. Unset disables the heartbeat. |
+| `WATCHDOG_URL` | `ingestor, worker` | optional | `-` | Optional full https URL for this process's Nostr Watchdog heartbeat. Use /v1/heartbeats/nostrmash-worker on the worker and /v1/heartbeats/nostrmash-ingestor on the ingestor. Unset disables the heartbeat. Job processing and ingestion continue when the request fails. |
 | `WORKER_ACCOUNT_STATE_BATCH_SIZE` | `worker` | optional | `500` | Number of accounts recomputed per cycle (oldest-updated first). |
 | `WORKER_ACCOUNT_STATE_ENABLED` | `worker` | optional | `true` | Enable the derived account-state recompute loop (recomputes lifecycle state from trust/observation/profile signals and records transitions). |
 | `WORKER_ACCOUNT_STATE_INTERVAL` | `worker` | optional | `1m0s` | Interval between account-state recompute cycles. |
