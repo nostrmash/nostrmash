@@ -317,5 +317,19 @@ func configEnvDocsShared() []EnvVarDoc {
 			DefaultValue: "2m0s",
 			Description:  "How often the worker storage governor recomputes the pressure level.",
 		},
+		{
+			Name:         "WATCHDOG_URL",
+			Runtimes:     []string{"ingestor", "worker"},
+			Required:     false,
+			DefaultValue: "",
+			Description:  "Optional full https URL for this process's Nostr Watchdog heartbeat. Use /v1/heartbeats/nostrmash-worker on the worker and /v1/heartbeats/nostrmash-ingestor on the ingestor. Unset disables the heartbeat. Job processing and ingestion continue when the request fails.",
+		},
+		{
+			Name:         "WATCHDOG_HMAC_SECRET",
+			Runtimes:     []string{"ingestor", "worker"},
+			Required:     false,
+			DefaultValue: "",
+			Description:  "HMAC secret for WATCHDOG_URL. At least 32 characters. It must match the watchdog HEARTBEAT_KEYS entry for that process's monitor id. Unset disables the heartbeat.",
+		},
 	}
 }

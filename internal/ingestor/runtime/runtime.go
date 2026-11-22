@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/nostrmash/nostrmash/internal/runtimebootstrap"
 	"github.com/nostrmash/nostrmash/internal/store"
 	storetrust "github.com/nostrmash/nostrmash/internal/store/trust"
+	"github.com/nostrmash/nostrmash/internal/watchdog"
 )
 
 type BuildInfo struct {
@@ -220,7 +222,10 @@ func runLifecycle(
 	defer waitLoops()
 
 	runtimebootstrap.StartMetricsEndpoint(ctx, log, cfg.Shared.Observability.MetricsAddr)
-	spawn("metrics_logger", func(c context.Context) { runMetricsLogger(c, log, runner.processor, 30*time.Second) })
+	relayHealth := &relayHealthSource{}
+	spawn("metrics_logger", func(c context.Context) {
+		runMetricsLogger(c, log, runner.processor, 30*time.Second, relayHealth, watchdog.FromEnv())
+	})
 	spawn("trusted_author_refresh", func(c context.Context) {
 		runTrustedAuthorSetRefreshLoop(c, log, runner.trustedSet, runner.eventStore, cfg.TrustGate.Mode, cfg.TrustGate.MaxHops, cfg.TrustGate.RefreshInterval)
 	})
@@ -442,6 +447,7 @@ func runLifecycle(
 			},
 		)
 		spawn("relay_reconciler", reconciler.Run)
+		relayHealth.Set(reconciler.RelayHealth)
 		log.Info("relay_reconciler_started", "fallback_relay_count", len(prioritizedRelays))
 	} else {
 		relayManager, err := relay.NewManager(
@@ -470,6 +476,16 @@ func runLifecycle(
 			return err
 		}
 		spawn("relay_manager", relayManager.Start)
+		relayHealth.Set(func() (int, int) {
+			snap := relayManager.Snapshot()
+			healthy := 0
+			for _, status := range snap {
+				if status.State == relay.StateHealthy {
+					healthy++
+				}
+			}
+			return healthy, len(snap)
+		})
 		log.Info("relay_manager_started", "relay_count", len(prioritizedRelays))
 	}
 
@@ -591,7 +607,41 @@ func runTrustedAuthorSetRefreshLoop(
 	}
 }
 
-func runMetricsLogger(ctx context.Context, log *slog.Logger, processor *live.Processor, every time.Duration) {
+type relayHealthSource struct {
+	mu sync.RWMutex
+	fn func() (healthy, tracked int)
+}
+
+func (s *relayHealthSource) Set(fn func() (healthy, tracked int)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.fn = fn
+	s.mu.Unlock()
+}
+
+func (s *relayHealthSource) Read() (healthy, tracked int) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.RLock()
+	fn := s.fn
+	s.mu.RUnlock()
+	if fn == nil {
+		return 0, 0
+	}
+	return fn()
+}
+
+func runMetricsLogger(
+	ctx context.Context,
+	log *slog.Logger,
+	processor *live.Processor,
+	every time.Duration,
+	health *relayHealthSource,
+	emitter *watchdog.Emitter,
+) {
 	if processor == nil || every <= 0 {
 		return
 	}
@@ -611,6 +661,15 @@ func runMetricsLogger(ctx context.Context, log *slog.Logger, processor *live.Pro
 				"invalid_total", snapshot.Invalid,
 				"gated_total", snapshot.Gated,
 			)
+			if emitter == nil {
+				continue
+			}
+			healthy, tracked := health.Read()
+			emitter.Notify(ctx, watchdog.Sample{
+				Progress: strconv.FormatUint(snapshot.Valid, 10),
+				Idle:     tracked == 0 || healthy > 0,
+				LoopAt:   time.Now(),
+			})
 		}
 	}
 }

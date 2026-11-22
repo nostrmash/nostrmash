@@ -29,6 +29,7 @@ type Reconciler struct {
 	mu           sync.Mutex
 	managers     map[string]*managedRelay
 	fallbackURLs []string
+	healthy      int
 }
 
 type managedRelay struct {
@@ -193,7 +194,9 @@ func (r *Reconciler) runSingleRelay(ctx context.Context, relayURL string) {
 
 		backoff.Reset()
 		r.reportStatus(ctx, relayURL, StateHealthy, "")
+		r.addHealthy(1)
 		r.streamMessages(ctx, relayURL, conn, backoff)
+		r.addHealthy(-1)
 
 		if ctx.Err() != nil {
 			return
@@ -284,6 +287,24 @@ func (r *Reconciler) waitForManagers(managed []*managedRelay) {
 			return
 		}
 	}
+}
+
+// RelayHealth reports connected relays and the number currently managed.
+// A quiet connected relay still counts as healthy.
+func (r *Reconciler) RelayHealth() (healthy, tracked int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	healthy = r.healthy
+	if healthy < 0 {
+		healthy = 0
+	}
+	return healthy, len(r.managers)
+}
+
+func (r *Reconciler) addHealthy(delta int) {
+	r.mu.Lock()
+	r.healthy += delta
+	r.mu.Unlock()
 }
 
 // Snapshot returns currently managed relay URLs.
