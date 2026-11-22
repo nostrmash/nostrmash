@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	urlEnv    = "WATCHDOG_URL"
-	secretEnv = "WATCHDOG_HMAC_SECRET"
+	urlEnv = "WATCHDOG_URL"
+	// Environment variable name. This is not a credential value.
+	secretEnv = "WATCHDOG_HMAC_SECRET" //nolint:gosec // G101: env var name, not a credential
 )
 
 // Sample is the non-sensitive progress report for one monitor.
