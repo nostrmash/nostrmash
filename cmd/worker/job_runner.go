@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,8 +42,13 @@ func runClaimLoop(
 	}
 	var completed atomic.Int64
 	var inflight atomic.Int64
+	var inflightSince atomic.Int64
 	var claimFailed atomic.Bool
+	var claimObserved atomic.Bool
+	var lastClaimOK atomic.Bool
+	var lastClaimCount atomic.Int64
 	var lastLoop atomic.Int64
+	processStarted := time.Now()
 	if beat := watchdog.FromEnv(); beat != nil {
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
@@ -58,11 +62,26 @@ func runClaimLoop(
 					if loopAt == 0 {
 						continue
 					}
-					beat.Notify(ctx, watchdog.Sample{
-						Progress: strconv.FormatInt(completed.Load(), 10),
-						Idle:     !claimFailed.Load() && inflight.Load() == 0,
-						LoopAt:   time.UnixMilli(loopAt),
+					since := inflightSince.Load()
+					var inflightAt time.Time
+					if since != 0 {
+						inflightAt = time.UnixMilli(since)
+					}
+					sample, send := watchdog.WorkerSample(watchdog.WorkerObservation{
+						ProcessStarted: processStarted,
+						Completed:      completed.Load(),
+						Inflight:       inflight.Load(),
+						ClaimFailed:    claimFailed.Load(),
+						LastLoop:       time.UnixMilli(loopAt),
+						ClaimObserved:  claimObserved.Load(),
+						LastClaimOK:    lastClaimOK.Load(),
+						LastClaimCount: int(lastClaimCount.Load()),
+						InflightSince:  inflightAt,
+						Now:            time.Now(),
 					})
+					if send {
+						beat.Notify(ctx, sample)
+					}
 				}
 			}
 		}()
@@ -75,7 +94,7 @@ func runClaimLoop(
 			defer wg.Done()
 			for job := range jobQueue {
 				func() {
-					defer inflight.Add(-1)
+					defer doneInflight(&inflight, &inflightSince)
 					// Drain in-flight jobs even after shutdown signal.
 					workerCtx := context.WithoutCancel(ctx)
 					spanCtx, span := traceutil.StartSpan(workerCtx, "worker.job.execute",
@@ -161,12 +180,17 @@ func runClaimLoop(
 		claimed, err := queue.ClaimAvailableForPool(claimCtx, workerID, workerPool, batchSize)
 		claimSpan.End(err)
 		if err != nil {
+			claimObserved.Store(true)
 			claimFailed.Store(true)
+			lastClaimOK.Store(false)
 			log.Error("job_claim_failed", "error", err)
 			queue.WaitForWork(ctx, pollInterval)
 			continue
 		}
+		claimObserved.Store(true)
 		claimFailed.Store(false)
+		lastClaimOK.Store(true)
+		lastClaimCount.Store(int64(len(claimed)))
 		if len(claimed) == 0 {
 			// Wake on LISTEN/NOTIFY (or the poll-interval safety net) instead
 			// of always sleeping a full second after an empty claim.
@@ -179,9 +203,21 @@ func runClaimLoop(
 			case <-ctx.Done():
 				return
 			case jobQueue <- job:
-				inflight.Add(1)
+				addInflight(&inflight, &inflightSince)
 			}
 		}
+	}
+}
+
+func addInflight(inflight, since *atomic.Int64) {
+	if inflight.Add(1) == 1 {
+		since.CompareAndSwap(0, time.Now().UnixMilli())
+	}
+}
+
+func doneInflight(inflight, since *atomic.Int64) {
+	if inflight.Add(-1) == 0 {
+		since.Store(0)
 	}
 }
 
