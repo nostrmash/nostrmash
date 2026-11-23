@@ -172,6 +172,19 @@ service to cache personalized trust rankings (empty leaves the cache off):
 TRUST_REDIS_URL=<coolify-redis-internal-url>
 ```
 
+Optional Nostr Watchdog heartbeats. Compose maps these onto `WATCHDOG_URL`
+and `WATCHDOG_HMAC_SECRET` inside the matching service only. Leave them unset
+to keep heartbeats off. A failed send does not stop ingestion or job processing.
+The secrets are the watchdog `HEARTBEAT_KEYS` values for `nostrmash-ingestor`
+and `nostrmash-worker` (at least 32 characters). Runtime only.
+
+```bash
+INGESTOR_WATCHDOG_URL=https://<watchdog-host>/v1/heartbeats/nostrmash-ingestor
+INGESTOR_WATCHDOG_HMAC_SECRET=<nostrmash-ingestor heartbeat secret>
+WORKER_WATCHDOG_URL=https://<watchdog-host>/v1/heartbeats/nostrmash-worker
+WORKER_WATCHDOG_HMAC_SECRET=<nostrmash-worker heartbeat secret>
+```
+
 Recommended production defaults:
 
 ```bash
