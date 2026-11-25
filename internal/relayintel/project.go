@@ -26,6 +26,22 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		return nil
 	}
 	head := parsed.Head
+	var locked string
+	err = tx.QueryRow(ctx, `
+		SELECT event_id FROM relay_config_heads
+		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3
+		FOR UPDATE
+	`, head.Pubkey, head.SourceKind, head.DTag).Scan(&locked)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !SchemaMissing(err) {
+		return fmt.Errorf("lock relay config head: %w", err)
+	}
+	blocked, err := deletionBlocks(ctx, tx, head.Pubkey, head.SourceKind, head.DTag, head.EventID, head.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return nil
+	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO relay_config_heads (
 			pubkey, source_kind, d_tag, event_id, created_at,
@@ -49,7 +65,7 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		WHERE EXCLUDED.created_at > relay_config_heads.created_at
 		   OR (
 		       EXCLUDED.created_at = relay_config_heads.created_at
-		       AND EXCLUDED.event_id > relay_config_heads.event_id
+		       AND EXCLUDED.event_id < relay_config_heads.event_id
 		   )
 		   OR EXCLUDED.event_id = relay_config_heads.event_id
 	`, head.Pubkey, head.SourceKind, head.DTag, head.EventID, head.CreatedAt,
@@ -61,10 +77,7 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if tag.RowsAffected() == 0 {
 		return nil
 	}
-	if err := replaceMembers(ctx, tx, head, parsed.Members); err != nil {
-		return err
-	}
-	return nil
+	return replaceMembers(ctx, tx, head, parsed.Members)
 }
 
 // ErrNotReady means the role tables are not in this database yet.
@@ -77,6 +90,36 @@ var ErrInvalidInput = errors.New("invalid relay intelligence input")
 func SchemaMissing(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
+}
+
+func deletionBlocks(ctx context.Context, tx pgx.Tx, pubkey string, kind int, dTag, eventID string, createdAt int64) (bool, error) {
+	var one int
+	err := tx.QueryRow(ctx, `
+		SELECT 1 FROM deletion_events
+		WHERE target_event_id = $1 AND deleter_pubkey = $2
+		LIMIT 1
+	`, eventID, pubkey).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		if SchemaMissing(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check event deletion: %w", err)
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM deletion_addresses
+		WHERE pubkey = $1 AND kind = $2 AND d_tag = $3 AND created_at >= $4
+		LIMIT 1
+	`, pubkey, kind, dTag, createdAt).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) || SchemaMissing(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("check address deletion: %w", err)
 }
 
 func wrapDB(err error) error {

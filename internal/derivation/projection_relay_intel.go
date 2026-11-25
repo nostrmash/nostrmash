@@ -56,6 +56,10 @@ func (h *Handlers) projectRelayIntelEvent(ctx context.Context, eventID string) e
 			metrics.IncRelayIntelProjection(in.Kind, "disabled")
 			return nil
 		}
+		if errors.Is(err, relayintel.ErrInvalidInput) {
+			metrics.IncRelayIntelProjection(in.Kind, "malformed")
+			return nil
+		}
 		metrics.IncRelayIntelProjection(in.Kind, "error")
 		return err
 	}
@@ -75,10 +79,11 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 	}
 	var pubkey string
 	var kind int
+	var createdAt int64
 	var raw string
 	err := h.pool.QueryRow(ctx, `
-		SELECT pubkey, kind, raw_json::text FROM events WHERE id = $1
-	`, eventID).Scan(&pubkey, &kind, &raw)
+		SELECT pubkey, kind, created_at, raw_json::text FROM events WHERE id = $1
+	`, eventID).Scan(&pubkey, &kind, &createdAt, &raw)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -158,8 +163,8 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 	for _, item := range coords {
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM relay_role_memberships
-			WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3
-		`, pubkey, item.kind, item.dTag); err != nil {
+			WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3 AND created_at <= $4
+		`, pubkey, item.kind, item.dTag, createdAt); err != nil {
 			if relayintel.SchemaMissing(err) {
 				return nil
 			}
@@ -167,38 +172,49 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 		}
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM relay_config_heads
-			WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3
-		`, pubkey, item.kind, item.dTag); err != nil {
+			WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3 AND created_at <= $4
+		`, pubkey, item.kind, item.dTag, createdAt); err != nil {
 			if relayintel.SchemaMissing(err) {
 				return nil
 			}
 			return err
 		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO deletion_addresses (event_id, pubkey, kind, d_tag, created_at)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (event_id, kind, d_tag) DO NOTHING
+		`, eventID, pubkey, item.kind, item.dTag, createdAt); err != nil && !relayintel.SchemaMissing(err) {
+			return err
+		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func splitRelayCoordinate(value string) (kind int, pubkey, dTag string, ok bool) {
-	parts := strings.Split(strings.TrimSpace(value), ":")
-	if len(parts) < 2 || len(parts) > 3 {
+	value = strings.TrimSpace(value)
+	kindEnd := strings.IndexByte(value, ':')
+	if kindEnd <= 0 || kindEnd >= len(value)-1 {
 		return 0, "", "", false
 	}
-	kind, err := strconv.Atoi(parts[0])
+	kind, err := strconv.Atoi(value[:kindEnd])
 	if err != nil {
 		return 0, "", "", false
 	}
-	pubkey = strings.ToLower(strings.TrimSpace(parts[1]))
-	if len(pubkey) != 64 {
+	rest := value[kindEnd+1:]
+	pubEnd := strings.IndexByte(rest, ':')
+	if pubEnd == -1 {
+		if len(rest) != 64 {
+			return 0, "", "", false
+		}
+		return kind, strings.ToLower(rest), "", true
+	}
+	if pubEnd != 64 {
 		return 0, "", "", false
 	}
-	if len(parts) == 3 {
-		dTag = parts[2]
-		if len(dTag) > 256 {
-			dTag = dTag[:256]
-		}
+	pubkey = strings.ToLower(rest[:pubEnd])
+	dTag = rest[pubEnd+1:]
+	if len(dTag) > 1024 {
+		return 0, "", "", false
 	}
 	return kind, pubkey, dTag, true
 }

@@ -17,7 +17,7 @@ import (
 )
 
 func TestVerifyTwoRelaysCanSucceedAndOneCannotProveIt(t *testing.T) {
-	raw := signedEvent(t, 1, 1_700_000_000, nil, "hello")
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
 	var event map[string]any
 	if err := json.Unmarshal(raw, &event); err != nil {
 		t.Fatal(err)
@@ -43,12 +43,20 @@ func TestVerifyTwoRelaysCanSucceedAndOneCannotProveIt(t *testing.T) {
 }
 
 func TestVerifyReportsConflictAndDoesNotDialABadSignature(t *testing.T) {
-	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com", "read"}}, "")
+	priv, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := signWith(t, priv, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com", "read"}}, "")
 	var event map[string]any
 	if err := json.Unmarshal(raw, &event); err != nil {
 		t.Fatal(err)
 	}
-	newer := map[string]any{"id": strings.Repeat("ab", 32), "created_at": float64(1_700_000_100)}
+	newerRaw := signWith(t, priv, KindPublicRelayList, 1_700_000_100, [][]string{{"r", "wss://newer.example.com"}}, "")
+	var newer map[string]any
+	if err := json.Unmarshal(newerRaw, &newer); err != nil {
+		t.Fatal(err)
+	}
 	agree := relayServer(t, func(filter map[string]any) map[string]any {
 		if _, ok := filter["ids"]; ok {
 			return event
@@ -88,8 +96,26 @@ func TestVerifyReportsConflictAndDoesNotDialABadSignature(t *testing.T) {
 	}
 }
 
+func TestVerifyIgnoresAForgedMatchingID(t *testing.T) {
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
+	var event map[string]any
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatal(err)
+	}
+	forged := map[string]any{"id": event["id"], "pubkey": event["pubkey"], "kind": float64(KindPublicRelayList), "created_at": float64(1_700_000_000)}
+	server := relayServer(t, func(map[string]any) map[string]any { return forged })
+	defer server.Close()
+	result, err := VerifyEvent(context.Background(), raw, []string{wsURL(server), wsURL(server)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.GlobalSuccess || result.RetrievedCount != 0 {
+		t.Fatalf("forged id was accepted: %+v", result)
+	}
+}
+
 func TestVerifyRejectsInternalTargets(t *testing.T) {
-	raw := signedEvent(t, 1, 1_700_000_000, nil, "hello")
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
 	for _, target := range []string{"wss://169.254.169.254", "wss://metadata.google.internal", "ws://127.0.0.1"} {
 		result, err := VerifyEvent(context.Background(), raw, []string{target, "wss://relay.example.com"}, false)
 		if err != nil {
@@ -118,12 +144,17 @@ func TestVerifyRejectsInternalTargets(t *testing.T) {
 
 func signedEvent(t *testing.T, kind int, created int64, tags [][]string, content string) []byte {
 	t.Helper()
-	if tags == nil {
-		tags = [][]string{}
-	}
 	priv, err := btcec.NewPrivateKey()
 	if err != nil {
 		t.Fatal(err)
+	}
+	return signWith(t, priv, kind, created, tags, content)
+}
+
+func signWith(t *testing.T, priv *btcec.PrivateKey, kind int, created int64, tags [][]string, content string) []byte {
+	t.Helper()
+	if tags == nil {
+		tags = [][]string{}
 	}
 	pub := hex.EncodeToString(schnorr.SerializePubKey(priv.PubKey()))
 	body, err := json.Marshal([]any{0, pub, created, kind, tags, content})

@@ -711,8 +711,9 @@ paths:
         '200':
           description: >
             Static catalog. algorithm is relay-intel-v1. tie_break is
-            higher_event_id, which matches this database's replaceable-event
-            retention and differs from NIP-01's lowest-id tie break. Each role
+            lower_event_id, matching NIP-01 and replaceable-event retention.
+            A locally stored event is not necessarily the latest on the network.
+            Each role
             names its event kinds, default list size, and whether it is a
             positive adoption signal. private_storage is client-side. blocked
             is not a usage signal. The server does not sign or publish events.
@@ -747,7 +748,7 @@ paths:
                 algorithm: relay-intel-v1
                 score_version: relay-score-v1
                 optimizer_version: relay-opt-v1
-                tie_break: higher_event_id
+                tie_break: lower_event_id
                 role: public_outbox
                 positive_adoption: true
                 fallbacks: []
@@ -872,7 +873,7 @@ paths:
                 algorithm: relay-intel-v1
                 score_version: relay-score-v1
                 optimizer_version: relay-opt-v1
-                tie_break: higher_event_id
+                tie_break: lower_event_id
                 preset: balanced
                 constraints_satisfied: true
                 fallbacks: [cohort_only]
@@ -973,7 +974,7 @@ paths:
             application/json:
               example:
                 algorithm: relay-intel-v1
-                tie_break: higher_event_id
+                tie_break: lower_event_id
                 account:
                   pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                   modern_public: present

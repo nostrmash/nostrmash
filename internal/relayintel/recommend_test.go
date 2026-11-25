@@ -49,7 +49,6 @@ func TestScoreWithholdsThinEvidenceAndHardFailures(t *testing.T) {
 	if unsupported.Eligible || unsupported.IneligibleReason != "search_unsupported" {
 		t.Fatalf("search = eligible:%v reason:%s", unsupported.Eligible, unsupported.IneligibleReason)
 	}
-	pinned := unsupported
 	pinnedInput := ScoreInput{
 		Role:   RoleSearch,
 		Pinned: true,
@@ -58,7 +57,7 @@ func TestScoreWithholdsThinEvidenceAndHardFailures(t *testing.T) {
 			Source: "active_probe", ObservedAt: now, SampleCount: 2,
 		}}},
 	}
-	pinned = ScoreRelay(pinnedInput)
+	pinned := ScoreRelay(pinnedInput)
 	if !pinned.Eligible || pinned.Score == nil {
 		t.Fatalf("pinned ineligible relay was dropped: %+v", pinned)
 	}

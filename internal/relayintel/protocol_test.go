@@ -97,11 +97,11 @@ func TestWinsUsesHigherEventID(t *testing.T) {
 	if !wins(20, "b", 10, "c") {
 		t.Fatal("newer created_at must win")
 	}
-	if wins(10, "aa", 10, "bb") {
-		t.Fatal("lower event id must lose a timestamp tie")
+	if wins(10, "bb", 10, "aa") {
+		t.Fatal("higher event id must lose a timestamp tie")
 	}
-	if !wins(10, "bb", 10, "aa") {
-		t.Fatal("higher event id must win a timestamp tie")
+	if !wins(10, "aa", 10, "bb") {
+		t.Fatal("lower event id must win a timestamp tie")
 	}
 	if !wins(10, "aa", 10, "aa") {
 		t.Fatal("replaying the same event must refresh memberships")
@@ -138,9 +138,6 @@ func TestEffectiveConfigDoesNotMergeLegacyIntoModern(t *testing.T) {
 	legacyOutbox, _ := legacyOnly.RoleByName(RolePublicOutbox)
 	if legacyOnly.ModernPublic != AvailabilityMissing || len(legacyOutbox.Relays) != 1 {
 		t.Fatalf("legacy fallback = %+v", legacyOutbox)
-	}
-	if legacyOnly.KeyPackageDiscovery != "kind_10051_legacy" && legacyOnly.KeyPackageDiscovery != "" {
-		// No kind 10051 head, so discovery stays empty even though kind 3 exists.
 	}
 	if legacyOnly.KeyPackageDiscovery != "" {
 		t.Fatalf("kind 3 must not become a keypackage list: %s", legacyOnly.KeyPackageDiscovery)

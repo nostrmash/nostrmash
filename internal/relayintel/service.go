@@ -3,6 +3,7 @@ package relayintel
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,8 @@ type RankingsResponse struct {
 	PositiveAdoption   bool          `json:"positive_adoption"`
 	CoverageDefinition string        `json:"coverage_definition"`
 	Relays             []ScoredRelay `json:"relays"`
+	Ranking            string        `json:"ranking"`
+	CandidatePool      int           `json:"candidate_pool"`
 	Note               string        `json:"note"`
 }
 
@@ -229,9 +232,6 @@ func (s *Service) rankings(ctx context.Context, role string, limit int) (Ranking
 	if err != nil {
 		return RankingsResponse{}, err
 	}
-	if len(stats) > limit {
-		stats = stats[:limit]
-	}
 	keys := make([]string, 0, len(stats))
 	urls := make([]string, 0, len(stats))
 	var maxUsers int64
@@ -297,6 +297,13 @@ func (s *Service) rankings(ctx context.Context, role string, limit int) (Ranking
 		}
 		resp.Relays = append(resp.Relays, relay)
 	}
+	sort.Slice(resp.Relays, func(i, j int) bool { return relayLess(resp.Relays[i], resp.Relays[j]) })
+	resp.CandidatePool = len(resp.Relays)
+	if limit > 0 && len(resp.Relays) > limit {
+		resp.Relays = resp.Relays[:limit]
+	}
+	resp.Ranking = "role_score"
+	resp.Note += " Ordered by role score after the trust-weighted adoption pool is scored. The pool is capped at 80."
 	return resp, nil
 }
 
@@ -356,7 +363,6 @@ func (s *Service) diagnostics(ctx context.Context, pubkey string) (DiagnosticsRe
 	}
 	account := EffectiveConfig(pubkey, heads, members)
 	keys := make([]string, 0)
-	urls := make([]string, 0)
 	seen := map[string]struct{}{}
 	for _, role := range account.Roles {
 		for _, relay := range role.Relays {
@@ -365,7 +371,6 @@ func (s *Service) diagnostics(ctx context.Context, pubkey string) (DiagnosticsRe
 			}
 			seen[relay.URL] = struct{}{}
 			keys = append(keys, relay.URLKey)
-			urls = append(urls, relay.URL)
 		}
 	}
 	registry, err := loadRegistry(ctx, s.pool, keys)

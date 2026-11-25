@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -190,7 +191,7 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 	found, err := fetchEvents(ctx, relayURL, p.allowPrivate, map[string]any{"ids": []string{id}, "limit": 1})
 	if err == nil {
 		for _, item := range found {
-			if got, _ := item["id"].(string); got == id {
+			if item != nil && item.ID == id {
 				_ = storeObservation(ctx, pool, key, CapWriteRetrieve, StatusVerified, 0.85, "probe", "retrieved")
 				metrics.IncRelayIntelProbe("write", "ok")
 				return
@@ -229,18 +230,30 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		typ, _ := frame[0].(string)
 		switch typ {
 		case "EVENT":
-			matched = true
+			if len(frame) >= 3 {
+				if body, ok := frame[2].(map[string]any); ok {
+					content, _ := body["content"].(string)
+					if strings.Contains(content, "nostrmash relay intelligence probe") {
+						matched = true
+					}
+				}
+			}
 		case "EOSE":
 			if matched {
 				_ = storeObservation(ctx, pool, key, CapSearch, StatusVerified, 0.8, "probe", "search_match")
 				metrics.IncRelayIntelProbe("search", "ok")
 			} else {
-				// EOSE with no row is not proof of NIP-50. Leave the capability unverified.
-				metrics.IncRelayIntelProbe("search", "ok")
+				metrics.IncRelayIntelProbe("search", "inconclusive")
 			}
 			return
 		case "CLOSED", "NOTICE":
-			rejected = true
+			text := strings.ToLower(fmt.Sprint(frame))
+			if strings.Contains(text, "unsupported") || strings.Contains(text, "not supported") {
+				rejected = true
+			} else {
+				metrics.IncRelayIntelProbe("search", "restricted")
+				return
+			}
 		}
 		if rejected {
 			break

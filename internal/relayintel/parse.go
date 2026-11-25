@@ -2,6 +2,7 @@ package relayintel
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/nostrmash/nostrmash/internal/relayurl"
@@ -38,7 +39,7 @@ func Parse(in EventInput) (Parsed, error) {
 	case KindBlossomServers:
 		return parseBlossom(in), nil
 	default:
-		return parsePlainList(in), nil
+		return parsePlainList(in)
 	}
 }
 
@@ -189,15 +190,13 @@ func markerRoles(marker string) []string {
 	}
 }
 
-func parsePlainList(in EventInput) Parsed {
+func parsePlainList(in EventInput) (Parsed, error) {
 	role := RoleForKind(in.Kind)
 	dTag := ""
 	title := ""
 	tagName := "relay"
-	if in.Kind == KindRelaySet || in.Kind == KindFavoriteRelays {
-		// Favorite lists and relay sets use "relay". Some historical events
-		// also carry "r". Both are accepted. "a" tags point at sets, not URLs.
-	}
+	// Favorite lists and relay sets use "relay". Some historical events also
+	// carry "r". Both are accepted. "a" tags point at sets, not URLs.
 	var members []Membership
 	var preserved [][]string
 	invalid := 0
@@ -212,7 +211,10 @@ func parsePlainList(in EventInput) Parsed {
 			// Only addressable relay sets are keyed by the d tag.
 			// Replaceable lists ignore it, or two d values would not replace.
 			if in.Kind == KindRelaySet && dTag == "" && len(tag) >= 2 {
-				dTag = clip(strings.TrimSpace(tag[1]), maxDTagLen)
+				dTag = strings.TrimSpace(tag[1])
+				if len(dTag) > 1024 {
+					return Parsed{}, fmt.Errorf("%w: d tag is too long", ErrInvalidInput)
+				}
 			}
 			preserved = append(preserved, append([]string(nil), tag...))
 			continue
@@ -265,7 +267,7 @@ func parsePlainList(in EventInput) Parsed {
 		},
 		Members:       dedupeMembers(members),
 		PreservedTags: preserved,
-	}
+	}, nil
 }
 
 func parseBlossom(in EventInput) Parsed {

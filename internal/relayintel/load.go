@@ -17,7 +17,7 @@ const (
 	maxInteractions = 100
 	maxSecondDegree = 500
 	maxCoverageRows = 20000
-	maxStatsPerRole = 40
+	maxStatsPerRole = 80
 	maxCandidates   = 80
 	maxRankingLimit = 50
 )
@@ -293,14 +293,12 @@ func loadEndpointUsers(ctx context.Context, pool *pgxpool.Pool, keys []string) (
 	return out, rows.Err()
 }
 
-func loadEventTags(ctx context.Context, pool *pgxpool.Pool, ids []string) (map[string][][]string, error) {
-	out := map[string][][]string{}
-	if len(ids) == 0 {
+func loadEventRaw(ctx context.Context, pool *pgxpool.Pool, ids []string) (map[string]json.RawMessage, error) {
+	out := map[string]json.RawMessage{}
+	if len(ids) == 0 || pool == nil {
 		return out, nil
 	}
-	rows, err := pool.Query(ctx, `
-		SELECT id, raw_json::text FROM events WHERE id = ANY($1::text[])
-	`, ids)
+	rows, err := pool.Query(ctx, `SELECT id, raw_json::text FROM events WHERE id = ANY($1::text[])`, ids)
 	if err != nil {
 		return nil, wrapDB(err)
 	}
@@ -310,11 +308,7 @@ func loadEventTags(ctx context.Context, pool *pgxpool.Pool, ids []string) (map[s
 		if err := rows.Scan(&id, &raw); err != nil {
 			return nil, err
 		}
-		tags, err := tagsFromRaw(raw)
-		if err != nil {
-			continue
-		}
-		out[id] = tags
+		out[id] = json.RawMessage(raw)
 	}
 	return out, rows.Err()
 }
@@ -324,6 +318,7 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 	follows, truncated, err := loadTextColumn(ctx, pool, `
 		SELECT followed_pubkey FROM follower_edges
 		WHERE follower_pubkey = $1
+		ORDER BY followed_pubkey ASC
 		LIMIT $2
 	`, pubkey, maxFollows+1)
 	if err != nil {
@@ -339,6 +334,7 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 	followers, followerTruncated, err := loadTextColumn(ctx, pool, `
 		SELECT follower_pubkey FROM follower_edges
 		WHERE followed_pubkey = $1
+		ORDER BY follower_pubkey ASC
 		LIMIT $2
 	`, pubkey, maxFollowers+1)
 	if err != nil {
@@ -354,7 +350,7 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 	if err := loadWeights(ctx, pool, `
 		SELECT dst_pubkey, weight FROM trust_interaction_edge_weights
 		WHERE src_pubkey = $1
-		ORDER BY weight DESC
+		ORDER BY weight DESC, dst_pubkey ASC
 		LIMIT $2
 	`, pubkey, signals.Interaction); err != nil {
 		return signals, err
@@ -362,7 +358,7 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 	if err := loadWeights(ctx, pool, `
 		SELECT src_pubkey, weight FROM trust_interaction_edge_weights
 		WHERE dst_pubkey = $1
-		ORDER BY weight DESC
+		ORDER BY weight DESC, src_pubkey ASC
 		LIMIT $2
 	`, pubkey, signals.Interaction); err != nil {
 		return signals, err
@@ -372,31 +368,15 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 	if len(people) == 0 {
 		return signals, nil
 	}
-	trustRows, err := pool.Query(ctx, `
-		SELECT pubkey, score FROM trust_scores_global WHERE pubkey = ANY($1::text[])
-	`, people)
-	if err != nil {
-		return signals, wrapDB(err)
-	}
-	for trustRows.Next() {
-		var item string
-		var score float64
-		if err := trustRows.Scan(&item, &score); err != nil {
-			trustRows.Close()
-			return signals, err
-		}
-		signals.Trust[item] = score
-		signals.TrustAvailable = true
-	}
-	trustRows.Close()
-	if err := trustRows.Err(); err != nil {
-		return signals, wrapDB(err)
+	if err := loadTrust(ctx, pool, people, signals.Trust); err != nil {
+		return signals, err
 	}
 	seeds := topFollows(signals.Follows, signals.Trust, 20)
 	if len(seeds) > 0 {
 		second, _, err := loadTextColumn(ctx, pool, `
 				SELECT followed_pubkey FROM follower_edges
 				WHERE follower_pubkey = ANY($1::text[])
+				ORDER BY followed_pubkey ASC
 				LIMIT $2
 			`, seeds, maxSecondDegree)
 		if err != nil {
@@ -417,6 +397,12 @@ func loadCohortSignals(ctx context.Context, pool *pgxpool.Pool, pubkey string) (
 		}
 	}
 	people = cleanPubkeys(append(people, signals.SecondDegree...), 1500)
+	if err := loadTrust(ctx, pool, signals.SecondDegree, signals.Trust); err != nil {
+		return signals, err
+	}
+	if len(signals.Trust) > 0 {
+		signals.TrustAvailable = true
+	}
 
 	activeRows, err := pool.Query(ctx, `
 		SELECT DISTINCT pubkey FROM author_activity_daily
@@ -453,8 +439,9 @@ func loadDeclarations(ctx context.Context, pool *pgxpool.Pool, role string, pubk
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT pubkey, endpoint_url
-		FROM relay_role_memberships
-		WHERE public_safe AND role = $1 AND pubkey = ANY($2::text[])
+		FROM relay_effective_memberships
+		WHERE public_safe AND role = $1 AND pubkey = ANY($2::text[]) AND endpoint_url <> ''
+		ORDER BY pubkey, endpoint_url
 		LIMIT $3
 	`, role, pubkeys, maxCoverageRows)
 	if err != nil {
@@ -476,17 +463,46 @@ func loadDeclarations(ctx context.Context, pool *pgxpool.Pool, role string, pubk
 		}
 		set[pubkey] = struct{}{}
 	}
-	return byURL, declared, count >= maxCoverageRows, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, err
+	}
+	known, err := pool.Query(ctx, `
+		SELECT pubkey FROM relay_effective_known
+		WHERE role = $1 AND pubkey = ANY($2::text[])
+		ORDER BY pubkey
+	`, role, pubkeys)
+	if err != nil {
+		return nil, nil, false, wrapDB(err)
+	}
+	defer known.Close()
+	for known.Next() {
+		var pubkey string
+		if err := known.Scan(&pubkey); err != nil {
+			return nil, nil, false, err
+		}
+		declared[pubkey] = struct{}{}
+	}
+	return byURL, declared, count >= maxCoverageRows, known.Err()
 }
 
-func tagsFromRaw(raw string) ([][]string, error) {
-	var payload struct {
-		Tags [][]string `json:"tags"`
+func loadTrust(ctx context.Context, pool *pgxpool.Pool, people []string, dest map[string]float64) error {
+	if len(people) == 0 {
+		return nil
 	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return nil, err
+	rows, err := pool.Query(ctx, `SELECT pubkey, score FROM trust_scores_global WHERE pubkey = ANY($1::text[])`, people)
+	if err != nil {
+		return wrapDB(err)
 	}
-	return payload.Tags, nil
+	defer rows.Close()
+	for rows.Next() {
+		var item string
+		var score float64
+		if err := rows.Scan(&item, &score); err != nil {
+			return err
+		}
+		dest[item] = score
+	}
+	return rows.Err()
 }
 
 func loadTextColumn(ctx context.Context, pool *pgxpool.Pool, sql string, arg any, limit int) ([]string, bool, error) {

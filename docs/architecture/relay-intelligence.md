@@ -39,7 +39,7 @@ Kind 10013 is stored as a head with `client_side_only` and zero URLs. The cipher
 - `relay_config_heads`, one winning event per `(pubkey, source_kind, d_tag)`
 - `relay_role_memberships`, one row per role and normalized URL
 
-The winner is the newer `created_at`. A timestamp tie keeps the higher event id. Replaying that same id refreshes memberships. This matches `enqueue_superseded_replaceable`, which deletes the lower id. It does **not** match NIP-01, which keeps the lowest event id. Responses include `tie_break: higher_event_id` and `tie_break_note` so clients can see the divergence.
+The winner is the newer `created_at`. A timestamp tie keeps the lexicographically lower event id, which is the NIP-01 rule. Replaying that same id refreshes memberships. `enqueue_superseded_replaceable` deletes the higher id on a tie. Responses include `tie_break: lower_event_id`. Events that were deleted under the previous higher-id rule cannot be reconstructed. `repair_replaceable_tie(limit)` can promote a lower id that is still stored; it does not run during migration and does not by itself refresh every projection. Replay the promoted event to refresh derived rows.
 
 A winning event replaces the previous memberships for that address in one transaction. An empty modern list deletes the memberships and keeps an explicitly empty head. A kind 5 `e` tag deletes memberships for that event id when the deleter is the author. A kind 5 `a` tag deletes the current address. Deleting a superseded loser does not remove the head, because the head points at the winner. Foreign keys cascade when the winning event row itself is deleted.
 
@@ -115,7 +115,11 @@ Default sizes, which callers can override:
 
 Presets are `balanced` (default), `creator`, `privacy`, `minimal`, `decentralization`, and `custom`. Privacy does not claim anonymity. It tightens counts and raises the quality bias toward reliability and privacy components. Minimal sets the maximum equal to the minimum. Custom uses caller weights when they are present. An unknown preset name is HTTP 400.
 
-Inbox and outbox proposals are merged into one kind 10002. A URL in both roles is an unmarked `r` tag. Non-`r` tags from the source event are copied. `based_on_event_id` and `based_on_created_at` are the source the client should compare before signing. DM removal and keypackage replacement set `attention_required`. Historical DMs are not migrated. A keypackage replacement does nothing until the client publishes a new KeyPackage.
+Publishable proposals are patches of a complete signed source event. Content, including encrypted NIP-51 entries, is copied and never decrypted. Unknown tags and unknown `r` markers are kept. Optimizing only the inbox leaves the outbox tags in place, and the reverse. Blossom server order is kept for servers that stay. Kind 3 is never emitted. An unchanged list produces no event.
+
+`proposal_safe` is false when the source is missing, truncated, or not authoritative. The response can still contain recommendations, but it omits the replacement. `source_origin` is `indexed`, `client`, `missing`, or `absent_from_index`. Local absence is not a confirmed empty list. The client may pass `source_events` on `POST /api/v1/relays/optimize`. Those events are signature-checked and are not stored, cached, or logged. The client must read the latest source events again immediately before signing. A validated local event is not proof it is the newest on the network.
+
+`based_on_event_id` and `based_on_created_at` identify the source that was patched. DM removal and keypackage replacement set `attention_required`. Historical DMs are not migrated. Modern KeyPackage discovery follows the NIP-65 write relays, so a public-outbox change can affect it. A kind 10051 replacement is emitted only when that legacy list is still the effective source.
 
 The complementary-coverage case is covered by `TestSelectComplementarySetBeatsTopIndividuals`. Two high-scoring relays that cover the same people lose a slot to a lower-scoring relay that covers someone else.
 

@@ -69,6 +69,9 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 		ProbeGlobalPerHour:  perHour,
 		ProbeMinInterval:    probeInterval,
 	}
+	if cfg.GiftwrapProbes {
+		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_GIFTWRAP_PROBES is not implemented; leave it false")
+	}
 	if includeSecret && cfg.ActiveProbes {
 		raw := strings.TrimSpace(os.Getenv("RELAY_INTEL_PROBE_SECRET_KEY"))
 		if raw == "" {

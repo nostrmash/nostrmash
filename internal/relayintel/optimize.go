@@ -177,7 +177,7 @@ func Select(req SelectRequest) SelectResult {
 
 	if req.RetainExisting {
 		for _, relay := range relays {
-			if relay.Current && (relay.Eligible || relay.Pinned || relay.Custom) {
+			if relay.Current && !hardIneligible(relay) && (relay.Eligible || relay.Pinned || relay.Custom || relay.Current) {
 				add(relay)
 			}
 		}
@@ -258,7 +258,10 @@ func bestAddition(selected, relays []ScoredRelay, seen map[string]struct{}, know
 		if _, ok := seen[relay.URL]; ok {
 			continue
 		}
-		if !relay.Eligible && !relay.Pinned && !relay.Custom {
+		if hardIneligible(relay) && !relay.Pinned {
+			continue
+		}
+		if !relay.Eligible && !relay.Pinned && !relay.Custom && !relay.Current {
 			continue
 		}
 		gain := marginal(selected, relay, known, knownWeight, req)
@@ -487,6 +490,15 @@ func coverageDefinition(role string) string {
 		return "Search selection is driven by verified or advertised search behavior, reliability, and latency. Adoption overlap is secondary and is not a coverage promise."
 	default:
 		return "Role-specific declared overlap among neighborhood accounts that published a list for this role. Missing lists are unknown, not unreachable."
+	}
+}
+
+func hardIneligible(relay ScoredRelay) bool {
+	switch relay.IneligibleReason {
+	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected":
+		return true
+	default:
+		return false
 	}
 }
 

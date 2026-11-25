@@ -54,8 +54,8 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 			SELECT url_key, role, min(endpoint_url) AS endpoint_url, min(endpoint_type) AS endpoint_type, pubkey,
 			       bool_or(declaration_source = 'modern') AS modern,
 			       bool_or(declaration_source = 'legacy') AS legacy
-			FROM relay_role_memberships
-			WHERE public_safe
+			FROM relay_effective_memberships
+			WHERE public_safe AND endpoint_url <> ''
 			  AND ($1 = '' OR pubkey <> $1)
 			GROUP BY url_key, role, pubkey
 		) base
@@ -70,8 +70,8 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO relay_endpoint_adoption (url_key, endpoint_url, endpoint_type, distinct_users, computed_at)
 		SELECT url_key, min(endpoint_url), min(endpoint_type), count(DISTINCT pubkey), now()
-		FROM relay_role_memberships
-		WHERE public_safe
+		FROM relay_effective_memberships
+		WHERE public_safe AND endpoint_url <> ''
 		  AND role <> $2
 		  AND ($1 = '' OR pubkey <> $1)
 		GROUP BY url_key
@@ -135,8 +135,8 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 	roleCounts := map[string]int64{}
 	rows, err = tx.Query(ctx, `
 		SELECT role, count(DISTINCT pubkey)
-		FROM relay_role_memberships
-		WHERE public_safe AND ($1 = '' OR pubkey <> $1)
+		FROM relay_effective_memberships
+		WHERE public_safe AND endpoint_url <> '' AND ($1 = '' OR pubkey <> $1)
 		GROUP BY role
 	`, excludePubkey)
 	if err != nil {

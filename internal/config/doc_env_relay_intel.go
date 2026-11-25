@@ -60,7 +60,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_GIFTWRAP_PROBES",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "false",
-			Description:  "Reserved. NIP-44 gift wrap is not implemented, so this flag does not verify DM privacy and does not mark a relay privacy-preserving.",
+			Description:  "Must stay false. Setting it true fails startup. Gift-wrap verification is not available, so this flag cannot mark a relay privacy-preserving.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROBE_GLOBAL_PER_HOUR",

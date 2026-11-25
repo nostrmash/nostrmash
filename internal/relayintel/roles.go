@@ -3,7 +3,11 @@
 // NostrMash's ingest set and it never signs or publishes a user's events.
 package relayintel
 
-import "time"
+import (
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/nostr"
+)
 
 const (
 	// AlgorithmVersion identifies the whole recommendation response shape.
@@ -12,12 +16,10 @@ const (
 	ScoreVersion = "relay-score-v1"
 	// OptimizerVersion is the complementary-set selector.
 	OptimizerVersion = "relay-opt-v1"
-	// TieBreak is the replaceable-event rule used by this projection.
-	// A newer created_at wins. The same created_at keeps the higher event id,
-	// matching replaceable_state so retention cannot delete the projected
-	// winner. NIP-01's "lowest id" sentence is not what this repository stores.
-	TieBreak     = "higher_event_id"
-	TieBreakNote = "Timestamp ties keep the higher event id so the projection matches replaceable_state. NIP-01 says to keep the lower id; this repository does not, because retention deletes the lower id."
+	// TieBreak is the NIP-01 replaceable-event rule.
+	// A newer created_at wins. The same created_at keeps the lower event id.
+	TieBreak     = "lower_event_id"
+	TieBreakNote = "Timestamp ties keep the lexicographically lower event id, per NIP-01. Events that were deleted before this rule was adopted cannot be reconstructed."
 
 	RolePublicInbox  = "public_inbox"
 	RolePublicOutbox = "public_outbox"
@@ -222,13 +224,7 @@ type Membership struct {
 // wins reports whether next should replace the stored declaration.
 // Equal ids are replays and must refresh memberships.
 func wins(newCreated int64, newID string, oldCreated int64, oldID string) bool {
-	if newCreated != oldCreated {
-		return newCreated > oldCreated
-	}
-	if newID == oldID {
-		return true
-	}
-	return newID > oldID
+	return nostr.Supersedes(newCreated, newID, oldCreated, oldID)
 }
 
 // Freshness is how long a measurement stays current.

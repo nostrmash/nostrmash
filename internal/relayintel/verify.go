@@ -14,22 +14,27 @@ import (
 	"github.com/nostrmash/nostrmash/internal/nostr"
 )
 
-// VerifyResult is a read-only propagation check. GlobalSuccess is never true
-// from a single relay.
+// VerifyResult is a read-only propagation check of a sample of relays.
+// SampleVerified means the submitted event was retrieved and, for replaceable
+// events, matched the latest valid version on at least two relays.
+// GlobalSuccess is the deprecated name for that sample. It is not network-wide
+// propagation.
 type VerifyResult struct {
-	SignatureValid bool         `json:"signature_valid"`
-	SignatureError string       `json:"signature_error,omitempty"`
-	EventID        string       `json:"event_id,omitempty"`
-	Pubkey         string       `json:"pubkey,omitempty"`
-	Kind           int          `json:"kind,omitempty"`
-	CreatedAt      int64        `json:"created_at,omitempty"`
-	Relays         []RelayCheck `json:"relays"`
-	RetrievedCount int          `json:"retrieved_count"`
-	Agreement      bool         `json:"latest_agreement"`
-	Partial        bool         `json:"partial"`
-	GlobalSuccess  bool         `json:"global_success"`
-	Reason         string       `json:"reason,omitempty"`
-	Note           string       `json:"note"`
+	SignatureValid  bool         `json:"signature_valid"`
+	SignatureError  string       `json:"signature_error,omitempty"`
+	EventID         string       `json:"event_id,omitempty"`
+	Pubkey          string       `json:"pubkey,omitempty"`
+	Kind            int          `json:"kind,omitempty"`
+	CreatedAt       int64        `json:"created_at,omitempty"`
+	Relays          []RelayCheck `json:"relays"`
+	RetrievedCount  int          `json:"retrieved_count"`
+	Agreement       bool         `json:"latest_agreement"`
+	Partial         bool         `json:"partial"`
+	SampleVerified  bool         `json:"sample_verified"`
+	SampleAgreement bool         `json:"sample_agreement"`
+	GlobalSuccess   bool         `json:"global_success"`
+	Reason          string       `json:"reason,omitempty"`
+	Note            string       `json:"note"`
 }
 
 // RelayCheck is one relay's retrieval result. Error is a short code.
@@ -39,6 +44,9 @@ type RelayCheck struct {
 	RetrievedID     string `json:"retrieved_id,omitempty"`
 	LatestID        string `json:"latest_id,omitempty"`
 	LatestCreatedAt int64  `json:"latest_created_at,omitempty"`
+	Retrieved       bool   `json:"retrieved"`
+	LatestVerified  bool   `json:"latest_verified"`
+	LatestAgrees    bool   `json:"latest_agrees"`
 	Error           string `json:"error,omitempty"`
 }
 
@@ -53,7 +61,7 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 	}
 	result := VerifyResult{
 		Relays: []RelayCheck{},
-		Note:   "This server did not publish the event. A single relay acknowledgement is not global propagation. Authentication challenges are reported as unavailable rather than bypassed.",
+		Note:   "This server did not publish the event. sample_verified means the checked relays agreed. It is not network-wide propagation. global_success is the deprecated name for that sample. Authentication challenges are reported and not bypassed.",
 	}
 	parsed := nostr.ParseAndValidate(eventJSON, nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 32 * 1024})
 	if !parsed.Valid() {
@@ -68,6 +76,18 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 		return result, nil
 	}
 	event := parsed.Event
+	if !HandlesKind(event.Kind) {
+		result.SignatureValid = true
+		result.EventID = event.ID
+		result.Pubkey = event.Pubkey
+		result.Kind = event.Kind
+		result.CreatedAt = event.CreatedAt
+		result.Reason = "unsupported_kind"
+		for _, raw := range relays {
+			result.Relays = append(result.Relays, RelayCheck{URL: strings.TrimSpace(raw), Outcome: "not_queried", Error: "unsupported_kind"})
+		}
+		return result, nil
+	}
 	result.SignatureValid = true
 	result.EventID = event.ID
 	result.Pubkey = event.Pubkey
@@ -137,14 +157,40 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 		result.Reason = "partial_propagation"
 	default:
 		result.Reason = "ok"
+		result.SampleVerified = true
+		result.SampleAgreement = true
 		result.GlobalSuccess = true
 		result.Partial = false
 	}
 	return result, nil
 }
 
+var (
+	verifyGlobal = make(chan struct{}, 16)
+	verifyHostMu sync.Mutex
+	verifyHosts  = map[string]chan struct{}{}
+)
+
 func checkRelay(ctx context.Context, relayURL string, event *nostr.Event, allowPrivate bool) RelayCheck {
 	out := RelayCheck{URL: relayURL, Outcome: "unavailable", Error: "unavailable"}
+	select {
+	case verifyGlobal <- struct{}{}:
+		defer func() { <-verifyGlobal }()
+	case <-ctx.Done():
+		out.Outcome = "timeout"
+		out.Error = "timeout"
+		return out
+	}
+	host := relayHost(relayURL)
+	hostSlot := verifyHostSlot(host)
+	select {
+	case hostSlot <- struct{}{}:
+		defer func() { <-hostSlot }()
+	case <-ctx.Done():
+		out.Outcome = "timeout"
+		out.Error = "timeout"
+		return out
+	}
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	byID, err := fetchEvents(queryCtx, relayURL, allowPrivate, map[string]any{"ids": []string{event.ID}, "limit": 1})
@@ -153,79 +199,121 @@ func checkRelay(ctx context.Context, relayURL string, event *nostr.Event, allowP
 		out.Outcome = outcomeFor(out.Error)
 		return out
 	}
-	var got map[string]any
+	var exact *nostr.Event
 	for _, item := range byID {
-		if id, _ := item["id"].(string); id == event.ID {
-			got = item
+		if item.ID == event.ID && strings.EqualFold(item.Pubkey, event.Pubkey) && item.Kind == event.Kind {
+			exact = item
 			break
 		}
 	}
 	if !replaceableKind(event.Kind) {
-		if got == nil {
+		if exact == nil {
 			out.Outcome = "not_found"
 			out.Error = ""
 			return out
 		}
 		out.Outcome = "retrieved"
+		out.Retrieved = true
 		out.RetrievedID = event.ID
 		out.Error = ""
 		return out
 	}
-	filter := map[string]any{"authors": []string{event.Pubkey}, "kinds": []int{event.Kind}, "limit": 1}
-	if event.Kind >= 30000 && event.Kind < 40000 {
-		if d := firstD(event.Tags); d != "" {
-			filter["#d"] = []string{d}
-		}
-	}
-	latest, err := fetchEvents(queryCtx, relayURL, allowPrivate, filter)
-	if err != nil {
-		if got != nil {
-			out.Outcome = "retrieved"
+	filter := map[string]any{"authors": []string{event.Pubkey}, "kinds": []int{event.Kind}, "limit": 8}
+	latest, latestErr := fetchEvents(queryCtx, relayURL, allowPrivate, filter)
+	winner := newestValid(latest, event.Pubkey, event.Kind, firstD(event.Tags), event.Kind >= 30000 && event.Kind < 40000)
+	if latestErr != nil || winner == nil {
+		if exact != nil {
+			out.Outcome = "retrieved_latest_unknown"
+			out.Retrieved = true
 			out.RetrievedID = event.ID
-			out.Error = ""
+			out.LatestVerified = false
+			if latestErr != nil {
+				out.Error = classifyDial(latestErr)
+			} else {
+				out.Error = "latest_unverified"
+			}
 			return out
 		}
-		out.Error = classifyDial(err)
-		out.Outcome = outcomeFor(out.Error)
-		return out
-	}
-	if len(latest) > 0 {
-		if id, _ := latest[0]["id"].(string); id != "" {
-			out.LatestID = id
+		if latestErr != nil {
+			out.Error = classifyDial(latestErr)
+			out.Outcome = outcomeFor(out.Error)
+			return out
 		}
-		switch created := latest[0]["created_at"].(type) {
-		case float64:
-			out.LatestCreatedAt = int64(created)
-		case int64:
-			out.LatestCreatedAt = created
-		}
-	}
-	if got == nil {
 		out.Outcome = "not_found"
 		out.Error = ""
-		if out.LatestID != "" && out.LatestID != event.ID && out.LatestCreatedAt >= event.CreatedAt {
-			out.Outcome = "conflict"
-			out.Error = "newer_event"
+		return out
+	}
+	out.LatestID = winner.ID
+	out.LatestCreatedAt = winner.CreatedAt
+	out.LatestVerified = true
+	if winner.ID != event.ID && nostr.Supersedes(winner.CreatedAt, winner.ID, event.CreatedAt, event.ID) {
+		out.Outcome = "conflict"
+		out.Error = "newer_event"
+		out.LatestAgrees = false
+		if exact != nil {
+			out.Retrieved = true
+			out.RetrievedID = event.ID
 		}
 		return out
 	}
-	out.RetrievedID = event.ID
-	out.Error = ""
-	if out.LatestID != "" && out.LatestID != event.ID && out.LatestCreatedAt > event.CreatedAt {
-		out.Outcome = "conflict"
-		out.Error = "newer_event"
+	if exact == nil {
+		out.Outcome = "not_found"
+		out.Error = ""
 		return out
 	}
 	out.Outcome = "retrieved"
+	out.Retrieved = true
+	out.RetrievedID = event.ID
+	out.LatestAgrees = winner.ID == event.ID
+	out.Error = ""
 	return out
 }
 
-func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter map[string]any) ([]map[string]any, error) {
+func newestValid(events []*nostr.Event, pubkey string, kind int, dTag string, addressable bool) *nostr.Event {
+	var winner *nostr.Event
+	for _, item := range events {
+		if item == nil || !strings.EqualFold(item.Pubkey, pubkey) || item.Kind != kind {
+			continue
+		}
+		if addressable && firstD(item.Tags) != dTag {
+			continue
+		}
+		if winner == nil || nostr.Supersedes(item.CreatedAt, item.ID, winner.CreatedAt, winner.ID) {
+			winner = item
+		}
+	}
+	return winner
+}
+
+func verifyHostSlot(host string) chan struct{} {
+	verifyHostMu.Lock()
+	defer verifyHostMu.Unlock()
+	if slot, ok := verifyHosts[host]; ok {
+		return slot
+	}
+	if len(verifyHosts) > 1024 {
+		verifyHosts = map[string]chan struct{}{}
+	}
+	slot := make(chan struct{}, 2)
+	verifyHosts[host] = slot
+	return slot
+}
+
+func relayHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter map[string]any) ([]*nostr.Event, error) {
 	conn, err := dialRelay(ctx, relayURL, allowPrivate, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	conn.SetReadLimit(64 * 1024)
 	sub := "nm-verify"
 	req, err := json.Marshal([]any{"REQ", sub, filter})
 	if err != nil {
@@ -235,16 +323,21 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
 		return nil, err
 	}
-	var events []map[string]any
+	var events []*nostr.Event
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(5 * time.Second)
 	}
-	for len(events) < 5 {
+	total := 0
+	for messages := 0; messages < 12 && len(events) < 8; messages++ {
 		_ = conn.SetReadDeadline(deadline)
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
 			return events, err
+		}
+		total += len(payload)
+		if total > 256*1024 {
+			return events, errString("oversized")
 		}
 		var frame []json.RawMessage
 		if err := json.Unmarshal(payload, &frame); err != nil || len(frame) == 0 {
@@ -259,17 +352,27 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 			if len(frame) < 3 {
 				continue
 			}
-			var event map[string]any
-			if err := json.Unmarshal(frame[2], &event); err != nil {
+			var subID string
+			if json.Unmarshal(frame[1], &subID) != nil || subID != sub {
 				continue
 			}
-			events = append(events, event)
+			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 32 * 1024})
+			if !parsed.Valid() || parsed.Event == nil {
+				continue
+			}
+			events = append(events, parsed.Event)
 		case "EOSE":
+			var subID string
+			if len(frame) > 1 && json.Unmarshal(frame[1], &subID) == nil && subID != sub {
+				continue
+			}
 			return events, nil
 		case "CLOSED":
 			return events, errClosed
 		case "AUTH":
 			return events, errAuth
+		case "NOTICE":
+			continue
 		}
 	}
 	return events, nil

@@ -134,7 +134,7 @@ Do not hand-edit this file.
 | `RELAY_INTEL_BACKFILL_ENABLED` | `worker` | optional | `true` | Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. |
 | `RELAY_INTEL_BACKFILL_INTERVAL` | `worker` | optional | `5s` | Delay between backfill batches. |
 | `RELAY_INTEL_ENABLED` | `api, worker` | optional | `true` | Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Apply migration 000133 before running a binary that projects role rows. |
-| `RELAY_INTEL_GIFTWRAP_PROBES` | `worker` | optional | `false` | Reserved. NIP-44 gift wrap is not implemented, so this flag does not verify DM privacy and does not mark a relay privacy-preserving. |
+| `RELAY_INTEL_GIFTWRAP_PROBES` | `worker` | optional | `false` | Must stay false. Setting it true fails startup. Gift-wrap verification is not available, so this flag cannot mark a relay privacy-preserving. |
 | `RELAY_INTEL_PROBE_GLOBAL_PER_HOUR` | `worker` | optional | `20` | Maximum active probes per worker process per hour, capped at 60. |
 | `RELAY_INTEL_PROBE_MIN_INTERVAL` | `worker` | optional | `24h0m0s` | Minimum time before the same relay is actively probed again. |
 | `RELAY_INTEL_PROBE_SECRET_KEY` | `worker` | optional | `-` | 32-byte hex secp256k1 key for synthetic probes. The API never reads this variable. Do not use a real account. The pubkey is excluded from role statistics. Leave empty unless active probes are on. |

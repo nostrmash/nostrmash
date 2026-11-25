@@ -101,32 +101,14 @@ func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
 			return nil, input("pubkey must be 64 hex characters or an npub")
 		}
 		req := relayintel.PlanRequest{
-			Pubkey:   pubkey,
-			Preset:   body.Preset,
-			Roles:    body.Roles,
-			Supplied: make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
+			Pubkey:       pubkey,
+			Preset:       body.Preset,
+			Roles:        body.Roles,
+			Supplied:     make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
+			SourceEvents: body.SourceEvents,
 		}
 		if body.Constraints != nil {
-			req.Constraints = relayintel.Constraints{
-				Max:                     body.Constraints.Max,
-				Min:                     body.Constraints.Min,
-				Pinned:                  body.Constraints.Pinned,
-				Excluded:                body.Constraints.Excluded,
-				Preferred:               body.Constraints.Preferred,
-				Custom:                  body.Constraints.Custom,
-				PaidAccess:              body.Constraints.PaidAccess,
-				FreeOnly:                body.Constraints.FreeOnly,
-				AuthRead:                body.Constraints.AuthRead,
-				AuthWrite:               body.Constraints.AuthWrite,
-				MinReliability:          body.Constraints.MinReliability,
-				MinCapabilityConfidence: body.Constraints.MinCapabilityConfidence,
-				Diversity:               body.Constraints.Diversity,
-				RetainExisting:          body.Constraints.RetainExisting,
-			}
-			if body.Constraints.Weights != nil {
-				req.Constraints.Weights = *body.Constraints.Weights
-				req.Constraints.HasWeights = true
-			}
+			req.Constraints = constraintFromRequest(*body.Constraints)
 		}
 		for _, item := range body.Supplied {
 			req.Supplied = append(req.Supplied, relayintel.SuppliedRelay{Role: item.Role, URL: item.URL})
@@ -152,29 +134,121 @@ func (h Handlers) PostRelayVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 type relayOptimizeRequest struct {
-	Pubkey      string                  `json:"pubkey"`
-	Preset      string                  `json:"preset"`
-	Roles       []string                `json:"roles"`
-	Constraints *relayConstraintRequest `json:"constraints"`
-	Supplied    []relaySuppliedRequest  `json:"supplied_relays"`
+	Pubkey       string                  `json:"pubkey"`
+	Preset       string                  `json:"preset"`
+	Roles        []string                `json:"roles"`
+	Constraints  *relayConstraintRequest `json:"constraints"`
+	Supplied     []relaySuppliedRequest  `json:"supplied_relays"`
+	SourceEvents []json.RawMessage       `json:"source_events"`
 }
 
 type relayConstraintRequest struct {
-	Max                     map[string]int      `json:"max"`
-	Min                     map[string]int      `json:"min"`
-	Pinned                  []string            `json:"pinned"`
-	Excluded                []string            `json:"excluded"`
-	Preferred               []string            `json:"preferred"`
-	Custom                  []string            `json:"custom"`
-	PaidAccess              []string            `json:"paid_access"`
-	FreeOnly                bool                `json:"free_only"`
+	Max                     map[string]int                 `json:"max"`
+	Min                     map[string]int                 `json:"min"`
+	Pinned                  []string                       `json:"pinned"`
+	Excluded                []string                       `json:"excluded"`
+	Preferred               []string                       `json:"preferred"`
+	Custom                  []string                       `json:"custom"`
+	PaidAccess              []string                       `json:"paid_access"`
+	FreeOnly                bool                           `json:"free_only"`
+	AuthRead                string                         `json:"auth_read"`
+	AuthWrite               string                         `json:"auth_write"`
+	MinReliability          float64                        `json:"min_reliability"`
+	MinCapabilityConfidence float64                        `json:"min_capability_confidence"`
+	Diversity               *float64                       `json:"diversity"`
+	RetainExisting          *bool                          `json:"retain_existing"`
+	Weights                 *relayintel.Weights            `json:"weights"`
+	Global                  *relayConstraintRequest        `json:"global"`
+	ByRole                  map[string]relayRoleConstraint `json:"by_role"`
+}
+
+type relayRoleConstraint struct {
+	Max                     *int                `json:"max"`
+	Min                     *int                `json:"min"`
+	Pinned                  *[]string           `json:"pinned"`
+	Excluded                *[]string           `json:"excluded"`
+	Preferred               *[]string           `json:"preferred"`
+	Custom                  *[]string           `json:"custom"`
+	PaidAccess              *[]string           `json:"paid_access"`
+	FreeOnly                *bool               `json:"free_only"`
 	AuthRead                string              `json:"auth_read"`
 	AuthWrite               string              `json:"auth_write"`
-	MinReliability          float64             `json:"min_reliability"`
-	MinCapabilityConfidence float64             `json:"min_capability_confidence"`
+	MinReliability          *float64            `json:"min_reliability"`
+	MinCapabilityConfidence *float64            `json:"min_capability_confidence"`
 	Diversity               *float64            `json:"diversity"`
 	RetainExisting          *bool               `json:"retain_existing"`
 	Weights                 *relayintel.Weights `json:"weights"`
+}
+
+func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
+	if body.Global != nil {
+		merged := *body.Global
+		if merged.Max == nil {
+			merged.Max = body.Max
+		}
+		if merged.Min == nil {
+			merged.Min = body.Min
+		}
+		if merged.Pinned == nil {
+			merged.Pinned = body.Pinned
+		}
+		if merged.Excluded == nil {
+			merged.Excluded = body.Excluded
+		}
+		if merged.Preferred == nil {
+			merged.Preferred = body.Preferred
+		}
+		if merged.Custom == nil {
+			merged.Custom = body.Custom
+		}
+		if merged.PaidAccess == nil {
+			merged.PaidAccess = body.PaidAccess
+		}
+		if body.FreeOnly {
+			merged.FreeOnly = true
+		}
+		if merged.AuthRead == "" {
+			merged.AuthRead = body.AuthRead
+		}
+		if merged.AuthWrite == "" {
+			merged.AuthWrite = body.AuthWrite
+		}
+		merged.ByRole = body.ByRole
+		body = merged
+	}
+	out := relayintel.Constraints{
+		Max:                     body.Max,
+		Min:                     body.Min,
+		Pinned:                  body.Pinned,
+		Excluded:                body.Excluded,
+		Preferred:               body.Preferred,
+		Custom:                  body.Custom,
+		PaidAccess:              body.PaidAccess,
+		FreeOnly:                body.FreeOnly,
+		AuthRead:                body.AuthRead,
+		AuthWrite:               body.AuthWrite,
+		MinReliability:          body.MinReliability,
+		MinCapabilityConfidence: body.MinCapabilityConfidence,
+		Diversity:               body.Diversity,
+		RetainExisting:          body.RetainExisting,
+	}
+	if body.Weights != nil {
+		out.Weights = *body.Weights
+		out.HasWeights = true
+	}
+	if len(body.ByRole) > 0 {
+		out.ByRole = map[string]relayintel.RoleConstraints{}
+		for role, item := range body.ByRole {
+			out.ByRole[role] = relayintel.RoleConstraints{
+				Max: item.Max, Min: item.Min, Pinned: item.Pinned, Excluded: item.Excluded,
+				Preferred: item.Preferred, Custom: item.Custom, PaidAccess: item.PaidAccess,
+				FreeOnly: item.FreeOnly, AuthRead: item.AuthRead, AuthWrite: item.AuthWrite,
+				MinReliability: item.MinReliability, MinCapabilityConfidence: item.MinCapabilityConfidence,
+				Diversity: item.Diversity, RetainExisting: item.RetainExisting, Weights: item.Weights,
+			}
+		}
+	}
+	return out
 }
 
 type relaySuppliedRequest struct {

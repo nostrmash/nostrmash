@@ -74,22 +74,26 @@ func BuildRecommendations(role string, current []DeclaredRelay, selected []Selec
 	}
 	sort.Strings(removed)
 	sort.Strings(added)
+	marginal := map[string]float64{}
+	for _, item := range selected {
+		marginal[item.URL] = item.MarginalCoverage
+	}
 	usedAdd := map[string]struct{}{}
 	var out []Recommendation
 	for _, url := range removed {
 		if sustainedDown[url] {
 			if partner := bestPartner(url, added, usedAdd, scored); partner != "" {
 				usedAdd[partner] = struct{}{}
-				out = append(out, action(ActionReplace, role, url, partner, scored, "Sustained read failures plus overlapping coverage support a replacement."))
+				out = append(out, action(ActionReplace, role, url, partner, scored, "Sustained read failures plus overlapping coverage support a replacement.", marginal[partner]))
 				continue
 			}
 		}
 		if !sustainedDown[url] && needsLook(scored[url]) {
-			item := action(ActionInvestigate, role, url, "", scored, "Health looks uncertain. The relay stays until the failure is sustained.")
+			item := action(ActionInvestigate, role, url, "", scored, "Health looks uncertain. The relay stays until the failure is sustained.", 0)
 			out = append(out, item)
 			continue
 		}
-		item := action(ActionRemove, role, url, "", scored, "The proposed set no longer needs this relay.")
+		item := action(ActionRemove, role, url, "", scored, "The proposed set no longer needs this relay.", 0)
 		if role == RoleDMInbox || role == RoleKeyPackage {
 			item.Attention = true
 			item.Limitations = append(item.Limitations, attentionLimit(role))
@@ -100,7 +104,7 @@ func BuildRecommendations(role string, current []DeclaredRelay, selected []Selec
 		if _, ok := usedAdd[url]; ok {
 			continue
 		}
-		item := action(ActionAdd, role, "", url, scored, "This relay adds coverage or capability the current set is missing.")
+		item := action(ActionAdd, role, "", url, scored, "This relay adds coverage or capability the current set is missing.", marginal[url])
 		if role == RoleBlossom {
 			item.Action = ActionInvestigate
 			item.Attention = true
@@ -117,11 +121,11 @@ func BuildRecommendations(role string, current []DeclaredRelay, selected []Selec
 	}
 	sort.Strings(retained)
 	for _, url := range retained {
-		if sustainedDown[url] {
-			out = append(out, action(ActionInvestigate, role, url, "", scored, "This relay is still in the set, and its read probes have been failing. It was not removed automatically."))
+		if sustainedDown[url] || needsLook(scored[url]) {
+			out = append(out, action(ActionInvestigate, role, url, "", scored, "This relay is still in the set, and its health is not established. It was not removed automatically.", 0))
 			continue
 		}
-		out = append(out, action(ActionRetain, role, url, url, scored, "This relay stays."))
+		out = append(out, action(ActionRetain, role, url, url, scored, "This relay stays.", 0))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Action != out[j].Action {
@@ -170,7 +174,7 @@ func bestPartner(removed string, added []string, used map[string]struct{}, score
 	return best
 }
 
-func action(kind, role, current, suggested string, scored map[string]ScoredRelay, text string) Recommendation {
+func action(kind, role, current, suggested string, scored map[string]ScoredRelay, text string, benefit float64) Recommendation {
 	ref := suggested
 	if ref == "" {
 		ref = current
@@ -187,10 +191,6 @@ func action(kind, role, current, suggested string, scored map[string]ScoredRelay
 	label := relay.ConfidenceLabel
 	if label == "" {
 		label = confidenceLabel(conf)
-	}
-	benefit := 0.0
-	if relay.Score != nil {
-		benefit = *relay.Score
 	}
 	return Recommendation{
 		Action: kind, Role: role, Current: current, Suggested: suggested,
