@@ -150,7 +150,7 @@ BEGIN
       AND e.id <> winner_id
       AND (
           e.created_at < winner_created
-          OR (e.created_at = winner_created AND e.id < winner_id)
+          OR (e.created_at = winner_created AND e.id > winner_id)
       )
       AND (
           p_d_tag = ''

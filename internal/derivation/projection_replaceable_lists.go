@@ -59,7 +59,7 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				WHERE EXCLUDED.created_at > contact_lists_latest.created_at
 				   OR (
 				       EXCLUDED.created_at = contact_lists_latest.created_at
-				       AND EXCLUDED.event_id >= contact_lists_latest.event_id
+				       AND EXCLUDED.event_id < contact_lists_latest.event_id
 				   )
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
@@ -230,7 +230,7 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 				WHERE EXCLUDED.created_at > relay_lists_latest.created_at
 				   OR (
 				       EXCLUDED.created_at = relay_lists_latest.created_at
-				       AND EXCLUDED.event_id >= relay_lists_latest.event_id
+				       AND EXCLUDED.event_id < relay_lists_latest.event_id
 				   )
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {

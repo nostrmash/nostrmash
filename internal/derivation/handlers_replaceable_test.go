@@ -68,7 +68,7 @@ func TestUpdateReplaceableState_TieBreakByEventID(t *testing.T) {
 	if err := handlers.UpdateReplaceableState(ctx, "bbbbbbbb"); err != nil {
 		t.Fatalf("derive replaceable state b: %v", err)
 	}
-	// Lower event id with same created_at should not replace bbbbbbbb.
+	// NIP-01 keeps the lower event id when created_at ties.
 	if err := handlers.UpdateReplaceableState(ctx, "aaaaaaaa"); err != nil {
 		t.Fatalf("derive replaceable state a again: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestUpdateReplaceableState_TieBreakByEventID(t *testing.T) {
 	`, "pub_replaceable", 0).Scan(&winnerID, &winnerCreatedAt); err != nil {
 		t.Fatalf("query replaceable winner after tie: %v", err)
 	}
-	if winnerID != "bbbbbbbb" || winnerCreatedAt != 1000 {
+	if winnerID != "aaaaaaaa" || winnerCreatedAt != 1000 {
 		t.Fatalf("unexpected winner after tie-break: id=%s created_at=%d", winnerID, winnerCreatedAt)
 	}
 

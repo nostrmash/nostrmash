@@ -247,12 +247,12 @@ func TestFetchProfilesByPubkeys_TieBreaksByEventID(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected winner for requested pubkey")
 	}
-	expectedWinnerID := maxString(a["id"].(string), b["id"].(string))
+	expectedWinnerID := minString(a["id"].(string), b["id"].(string))
 	if winner.MetadataCreatedAt != createdAt {
 		t.Fatalf("expected tied created_at to be preserved, got %d", winner.MetadataCreatedAt)
 	}
 	if winner.MetadataEventID != expectedWinnerID {
-		t.Fatalf("expected lexical larger event id to win tie-break; got %s want %s", winner.MetadataEventID, expectedWinnerID)
+		t.Fatalf("expected lexical smaller event id to win tie-break; got %s want %s", winner.MetadataEventID, expectedWinnerID)
 	}
 }
 
@@ -370,8 +370,8 @@ func mustDecodeJSONMap(t *testing.T, raw json.RawMessage) map[string]any {
 	return out
 }
 
-func maxString(a, b string) string {
-	if a >= b {
+func minString(a, b string) string {
+	if a <= b {
 		return a
 	}
 	return b

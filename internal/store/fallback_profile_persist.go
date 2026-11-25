@@ -81,7 +81,7 @@ func (s *PostgresStore) PersistFallbackProfile(ctx context.Context, pp ProfilePr
 		    updated_at          = now()
 		WHERE EXCLUDED.metadata_created_at > profiles_latest.metadata_created_at
 		   OR (EXCLUDED.metadata_created_at = profiles_latest.metadata_created_at
-		       AND EXCLUDED.metadata_event_id > profiles_latest.metadata_event_id)
+		       AND EXCLUDED.metadata_event_id < profiles_latest.metadata_event_id)
 	`, pubkey, eventID, pp.MetadataCreatedAt, profileJSON,
 		name, displayName, about, nip05)
 	if err != nil {

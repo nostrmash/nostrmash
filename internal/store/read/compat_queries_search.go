@@ -302,9 +302,9 @@ func (s *Read) SearchProfilesWithOptions(
 			  AND (
 				profiles_latest.pubkey IS NULL
 				OR events.created_at > profiles_latest.metadata_created_at
-				OR (events.created_at = profiles_latest.metadata_created_at AND events.id > profiles_latest.metadata_event_id)
+				OR (events.created_at = profiles_latest.metadata_created_at AND events.id < profiles_latest.metadata_event_id)
 			  )
-			ORDER BY events.pubkey, events.created_at DESC, events.id DESC
+			ORDER BY events.pubkey, events.created_at DESC, events.id ASC
 		),
 		-- Filters directly on profiles_latest columns/expressions (not a
 		-- derived CTE) so the planner can use the existing GIN indexes:
@@ -423,9 +423,9 @@ func (s *Read) SuggestProfiles(ctx context.Context, query string, limit int) ([]
 			  AND (
 				profiles_latest.pubkey IS NULL
 				OR events.created_at > profiles_latest.metadata_created_at
-				OR (events.created_at = profiles_latest.metadata_created_at AND events.id > profiles_latest.metadata_event_id)
+				OR (events.created_at = profiles_latest.metadata_created_at AND events.id < profiles_latest.metadata_event_id)
 			  )
-			ORDER BY events.pubkey, events.created_at DESC, events.id DESC
+			ORDER BY events.pubkey, events.created_at DESC, events.id ASC
 		),
 		-- See SearchProfilesWithOptions: filters directly on profiles_latest
 		-- so the planner can use idx_profiles_latest_pubkey_trgm and
