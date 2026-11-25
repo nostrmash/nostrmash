@@ -703,6 +703,350 @@ paths:
             name, icon, auth_required, and payment_required are included.
             auth_required and payment_required are omitted when the relay did
             not say. They are the relay's claim, not a probe result.
+  /api/v1/relays/roles:
+    get:
+      tags: [public]
+      summary: Relay roles this server understands
+      responses:
+        '200':
+          description: >
+            Static catalog. algorithm is relay-intel-v1. tie_break is
+            higher_event_id, which matches this database's replaceable-event
+            retention and differs from NIP-01's lowest-id tie break. Each role
+            names its event kinds, default list size, and whether it is a
+            positive adoption signal. private_storage is client-side. blocked
+            is not a usage signal. The server does not sign or publish events.
+        '404':
+          description: Relay intelligence is disabled. The body uses the standard error envelope with code feature_disabled.
+  /api/v1/relays/rankings:
+    get:
+      tags: [public]
+      summary: Global role-specific relay rankings
+      parameters:
+        - in: query
+          name: role
+          required: true
+          schema:
+            type: string
+            enum: [public_inbox, public_outbox, dm_inbox, search, favorite, keypackage, blossom, wiki, blocked]
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+      responses:
+        '200':
+          description: >
+            Precomputed public-safe adoption for one role. distinct_users counts
+            a pubkey once for that role. Blocked-relay references are not
+            adoption. A relay absent from NostrMash's ingest set can still rank.
+            score is omitted when evidence is thin. fallbacks includes
+            stats_not_ready until the worker's first aggregate refresh. An empty
+            relays array is success. Admission state does not exclude a relay.
+          content:
+            application/json:
+              example:
+                algorithm: relay-intel-v1
+                score_version: relay-score-v1
+                optimizer_version: relay-opt-v1
+                tie_break: higher_event_id
+                role: public_outbox
+                positive_adoption: true
+                fallbacks: []
+                relays:
+                  - url: wss://relay.example.com
+                    role: public_outbox
+                    distinct_users: 1200
+                    trust_weighted: 340.5
+                    active_users: 180
+                    modern_users: 1100
+                    legacy_users: 100
+                    score: 0.72
+                    confidence: 0.61
+                    confidence_label: medium
+                    eligible: true
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
+  /api/v1/relays/capabilities:
+    get:
+      tags: [public]
+      summary: Stored capability evidence for one relay
+      parameters:
+        - in: query
+          name: relay_url
+          required: true
+          schema: { type: string }
+          description: Websocket or Blossom URL. It is not dialed by this request.
+      responses:
+        '200':
+          description: >
+            Advertised, observed, verified, unsupported, unknown, stale, and
+            restricted capabilities. A successful kind-0 EOSE is read_subscription
+            only. NIP-11 support for NIP-17, NIP-42, or NIP-50 is advertised,
+            not verified. This request performs no network I/O.
+          content:
+            application/json:
+              example:
+                relay_url: wss://relay.example.com
+                capabilities:
+                  read_subscription: { status: observed, confidence: 0.68, source: read_probe }
+                  search: { status: advertised, confidence: 0.4, source: nip11, detail: "NIP-50 is advertised and has not been verified" }
+                  giftwrap: { status: unknown, confidence: 0.15, source: none }
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
+  /api/v1/relays/optimize:
+    post:
+      tags: [public]
+      summary: Propose a complementary relay configuration
+      description: >
+        Returns an unsigned preview. The server never signs or publishes it.
+        Request bodies are not cached and private URLs in the body are not logged.
+        An unknown preset is 400. Conflicting constraints return 200 with
+        constraints_satisfied false and unsatisfied_constraints filled in.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pubkey]
+              properties:
+                pubkey: { type: string, description: 64 hex characters or an npub }
+                preset:
+                  type: string
+                  enum: [balanced, creator, privacy, minimal, decentralization, custom]
+                roles:
+                  type: array
+                  items: { type: string }
+                constraints:
+                  type: object
+                  properties:
+                    max: { type: object, additionalProperties: { type: integer } }
+                    min: { type: object, additionalProperties: { type: integer } }
+                    pinned: { type: array, items: { type: string } }
+                    excluded: { type: array, items: { type: string } }
+                    preferred: { type: array, items: { type: string } }
+                    custom: { type: array, items: { type: string } }
+                    paid_access: { type: array, items: { type: string } }
+                    free_only: { type: boolean }
+                    auth_read: { type: string, enum: [allow, prefer_without, require, reject] }
+                    auth_write: { type: string, enum: [allow, prefer_without, require, reject] }
+                    min_reliability: { type: number }
+                    min_capability_confidence: { type: number }
+                    diversity: { type: number }
+                    retain_existing: { type: boolean }
+                supplied_relays:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string }
+                      url: { type: string }
+            example:
+              pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              preset: balanced
+              constraints:
+                max: { public_inbox: 3, public_outbox: 3, dm_inbox: 2 }
+                pinned: ["wss://self.example.com"]
+                free_only: true
+                retain_existing: true
+      responses:
+        '200':
+          description: >
+            algorithm, score_version, and optimizer_version identify the model.
+            coverage is the share of cohort members with a stored declaration
+            whose matching role includes the relay. Accounts with no stored
+            declaration are unknown_weight, not unreachable. public_relays is
+            one unsigned kind 10002 covering inbox and outbox. based_on_event_id
+            is the source the client should compare before signing. Kind 3 is
+            never proposed.
+          content:
+            application/json:
+              example:
+                algorithm: relay-intel-v1
+                score_version: relay-score-v1
+                optimizer_version: relay-opt-v1
+                tie_break: higher_event_id
+                preset: balanced
+                constraints_satisfied: true
+                fallbacks: [cohort_only]
+                cohort: { size: 40, truncated: false, trust_data: true, used: personalized }
+                proposal:
+                  note: Unsigned preview. The client must sign and publish.
+                  public_relays:
+                    kind: 10002
+                    content: ""
+                    based_on_event_id: abcdef
+                    based_on_created_at: 1700000000
+                    tags:
+                      - ["r", "wss://in.example.com", "read"]
+                      - ["r", "wss://out.example.com", "write"]
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
+  /api/v1/relays/verify:
+    post:
+      tags: [public]
+      summary: Read a published event back from named relays
+      description: >
+        Read-only. The server does not publish the event and does not treat
+        one relay as global success. global_success requires a valid signature,
+        retrieval from at least two relays, agreement on the latest replaceable
+        version, and no timeout, conflict, or unavailable result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, relays]
+              properties:
+                event: { type: object, description: A signed Nostr event }
+                relays:
+                  type: array
+                  maxItems: 8
+                  items: { type: string }
+            example:
+              event:
+                id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                created_at: 1700000000
+                kind: 10002
+                tags: [["r", "wss://relay.example.com"]]
+                content: ""
+                sig: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              relays: ["wss://relay.example.com", "wss://other.example.com"]
+      responses:
+        '200':
+          description: >
+            signature_valid false returns 200 and does not dial. Outcomes are
+            retrieved, not_found, conflict, timeout, unavailable, rejected, and
+            not_queried. reason is ok, insufficient_relay_sample, conflict,
+            timeout, partial_propagation, or signature_invalid.
+          content:
+            application/json:
+              example:
+                signature_valid: true
+                retrieved_count: 2
+                agreement: true
+                partial: false
+                global_success: true
+                reason: ok
+                relays:
+                  - { relay_url: wss://relay.example.com, outcome: retrieved }
+                  - { relay_url: wss://other.example.com, outcome: retrieved }
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+  /api/v1/profiles/{pubkey}/relay-config:
+    get:
+      tags: [public]
+      summary: Effective public relay configuration for one account
+      parameters:
+        - in: query
+          name: pubkey
+          schema: { type: string }
+          description: Ignored. The pubkey is the path value, hex or npub.
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Unknown pubkeys return 200 with availability missing, not 404.
+            An explicit empty kind 10002 stays empty and does not fall back to
+            kind 3. A missing kind 10002 uses kind 3. kind 10013 is reported as
+            client_side with no URLs. Public URLs the account published are
+            returned even when public_safe is false; they stay out of rankings.
+          content:
+            application/json:
+              example:
+                algorithm: relay-intel-v1
+                tie_break: higher_event_id
+                account:
+                  pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                  modern_public: present
+                  legacy_public: missing
+                  keypackage_discovery: nip65_outbox
+                  roles:
+                    - role: public_inbox
+                      availability: present
+                      relays:
+                        - url: wss://in.example.com
+                          marker: read
+                          public_safe: true
+                          source_kind: 10002
+                note: Kind 10013 contents are not decrypted. Private URLs in public events are returned here and excluded from rankings.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
+  /api/v1/profiles/{pubkey}/relay-diagnostics:
+    get:
+      tags: [public]
+      summary: Account relay configuration findings
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: >
+            Findings use severity critical, warning, suggestion, or info.
+            One failed probe is info. Repeated failures are a warning, not a
+            removal. Codes include missing_modern_config, explicit_empty_config,
+            obsolete_legacy_config, unreachable, repeated_connection_failures,
+            blocked_relay_in_active_config, dm_privacy_unverified, and
+            private_config_client_side.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
+  /api/v1/profiles/{pubkey}/relay-recommendations:
+    get:
+      tags: [public]
+      summary: Personalized or global relay recommendations
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema: { type: string }
+        - in: query
+          name: role
+          schema: { type: string }
+        - in: query
+          name: preset
+          schema: { type: string, enum: [balanced, creator, privacy, minimal, decentralization, custom] }
+      responses:
+        '200':
+          description: >
+            Uses the account's public follows, followers, interactions, and
+            trust scores when they exist. fallbacks names global_fallback,
+            cohort_only, stats_not_ready, sparse_declarations, or
+            insufficient_evidence. No authentication and no private key.
+            Actions are add, remove, replace, retain, and investigate.
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          description: Relay intelligence is disabled.
+        '503':
+          description: Migration 000133 has not been applied.
   /api/v1/relays/catalog:
     get:
       tags: [public]

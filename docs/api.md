@@ -106,6 +106,9 @@ Representative implemented native routes include:
 - `GET /api/v1/notes/{event_id}/summary`
 - `GET /api/v1/notes/{event_id}/related`
 - `GET /api/v1/relays/catalog` and `GET /api/v1/relays/info`
+- `GET /api/v1/relays/roles`, `GET /api/v1/relays/rankings`, and `GET /api/v1/relays/capabilities` (role-aware catalog, precomputed rankings, and stored capability evidence; no live dial)
+- `GET /api/v1/profiles/{pubkey}/relay-config`, `GET /api/v1/profiles/{pubkey}/relay-diagnostics`, and `GET /api/v1/profiles/{pubkey}/relay-recommendations`
+- `POST /api/v1/relays/optimize` and `POST /api/v1/relays/verify` (unsigned proposals and read-only propagation checks; the server does not sign or publish)
 - `GET /api/v1/users/{pubkey}/summary`
 - `GET /api/v1/users/{pubkey}/mute-list`
 - `GET /api/v1/users/{pubkey}/muted-by`

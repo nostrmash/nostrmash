@@ -29,6 +29,9 @@ type APIConfig struct {
 	DiscoveryEngagement WorkerDiscoveryEngagementConfig
 	// Personalized ranks discovery lists toward accounts the viewer follows.
 	Personalized PersonalizedDiscoveryConfig
+	// RelayIntel serves role-aware relay recommendations. The API copy of this
+	// config never contains the probe secret.
+	RelayIntel RelayIntelConfig
 }
 
 // PersonalizedDiscoveryConfig controls viewer-scoped discovery rankings.
@@ -357,6 +360,11 @@ func LoadAPI() (APIConfig, error) {
 		return APIConfig{}, err
 	}
 	cfg.DiscoveryEngagement = discoveryEngagement
+	relayIntel, err := LoadRelayIntel(false)
+	if err != nil {
+		return APIConfig{}, err
+	}
+	cfg.RelayIntel = relayIntel
 	if err := validateAPIConfig(cfg); err != nil {
 		return APIConfig{}, err
 	}

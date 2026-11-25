@@ -8,5 +8,6 @@ func ConfigEnvDocs() []EnvVarDoc {
 	docs = append(docs, configEnvDocsIngestor()...)
 	docs = append(docs, configEnvDocsWorker()...)
 	docs = append(docs, configEnvDocsTrustWorker()...)
+	docs = append(docs, configEnvDocsRelayIntel()...)
 	return docs
 }

@@ -37,6 +37,7 @@ type WorkerConfig struct {
 	Hydration                  HydrationConfig
 	Meilisearch                MeilisearchConfig
 	RelayRegistry              RelayRegistryConfig
+	RelayIntel                 RelayIntelConfig
 	NIP05                      WorkerNIP05Config
 	ExpiredEventRetention      WorkerExpiredEventRetentionConfig
 	BridgedEventRetention      WorkerBridgedEventRetentionConfig
@@ -510,6 +511,11 @@ func LoadWorker() (WorkerConfig, error) {
 		return WorkerConfig{}, err
 	}
 	cfg.RelayRegistry = relayRegistryCfg
+	relayIntelCfg, err := LoadRelayIntel(true)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	cfg.RelayIntel = relayIntelCfg
 
 	if err := validateWorkerConfig(cfg); err != nil {
 		return WorkerConfig{}, err
