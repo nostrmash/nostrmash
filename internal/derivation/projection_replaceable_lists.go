@@ -14,7 +14,7 @@ func (h *Handlers) ProjectContactListsLatest(ctx context.Context, eventID string
 }
 
 func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		3,
@@ -174,7 +174,10 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) error {
@@ -182,7 +185,7 @@ func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) 
 }
 
 func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		10002,
@@ -235,7 +238,12 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	// Markers are stored in relay_role_memberships. relays_json stays a URL
+	// array so existing discovery and API readers keep their contract.
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 type replaceableListPayloadBuilder func(tags [][]string) json.RawMessage

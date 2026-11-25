@@ -654,6 +654,9 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit extended lists: %w", err)
 	}
+	if kind == 10050 {
+		return h.projectRelayIntelEvent(ctx, eventID)
+	}
 	return nil
 }
 

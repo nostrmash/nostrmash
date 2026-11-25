@@ -66,6 +66,7 @@ func ensureRegistered() {
 	registerIngestorLoopMetrics()
 	registerMeiliMetrics()
 	registerRelayRegistryMetrics()
+	registerRelayIntelMetrics()
 	registerAccountMetrics()
 	registerHydrationMetrics()
 	registerAPIMetrics()
