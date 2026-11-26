@@ -162,7 +162,8 @@ func registerSyntheticIdentity(ctx context.Context, pool *pgxpool.Pool, pubkey s
 }
 
 // registerSyntheticIdentityUntil records a probe pubkey. A zero expiry is durable.
-// A positive expiry is for an ephemeral gift-wrap author and is deleted later.
+// Gift-wrap authors use a durable row: raw events and later replay outlive a
+// short expiry, and deleting the row would let those events into public analytics.
 func registerSyntheticIdentityUntil(ctx context.Context, pool *pgxpool.Pool, pubkey string, expires time.Time) error {
 	pubkey = strings.ToLower(strings.TrimSpace(pubkey))
 	if len(pubkey) != 64 {

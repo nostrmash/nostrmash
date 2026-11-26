@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -355,9 +356,17 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_followups
 			SET status = 'pending', lease_token = '', deferrals = deferrals + 1,
-			    check_after = clock_timestamp() + interval '30 seconds'
+			    check_after = GREATEST(
+			        clock_timestamp() + interval '30 seconds',
+			        COALESCE((
+			            SELECT max(started_at) + make_interval(secs => $2::int)
+			            FROM relay_probe_attempts
+			            WHERE url_key = $3 AND capability = $4
+			              AND started_at > clock_timestamp() - make_interval(secs => $2::int)
+			        ), clock_timestamp() + interval '30 seconds')
+			    )
 			WHERE id = $1 AND status = 'claimed' AND finished_at IS NULL
-		`, id); err != nil {
+		`, id, seconds, key, CapRetention); err != nil {
 			return false, err
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -432,13 +441,13 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 			followResult = "retry_exhausted"
 		}
 	}
-	err = commitProbeResult(ctx, pool, key, token, probeCompletion{
+	err = commitProbeResult(ctx, pool, key, token, stampEvidence(probeCompletion{
 		AttemptStatus: result, FollowupID: id, FollowStatus: followStatus, FollowResult: followResult,
 		Elapsed: elapsed, Endpoint: relayURL, FollowCapability: followCapability,
 		Writes: []observationWrite{{
 			Capability: CapRetention, Status: obsStatus, Detail: result, Confidence: confidence,
 		}},
-	})
+	}))
 	if errors.Is(err, errProbeAlreadyCompleted) {
 		return true, nil
 	}
@@ -568,6 +577,7 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 }
 
 func (p *probeState) publishProbe(ctx context.Context, pool *pgxpool.Pool, metric, key, token string, completion probeCompletion) error {
+	completion = stampEvidence(completion)
 	err := commitProbeResult(ctx, pool, key, token, completion)
 	if errors.Is(err, errProbeAlreadyCompleted) {
 		metrics.IncRelayIntelProbe(metric, completion.Metric)
@@ -1143,6 +1153,7 @@ type observationWrite struct {
 	Retrieved       *bool
 	Unauthenticated *bool
 	Authenticated   *bool
+	ObservedAt      time.Time
 }
 
 type scheduledRetention struct {
@@ -1162,6 +1173,7 @@ type probeCompletion struct {
 	Writes           []observationWrite
 	Retention        *scheduledRetention
 	Metric           string
+	ObservedAt       time.Time
 }
 
 var errProbeAlreadyCompleted = errors.New("probe result already recorded")
@@ -1171,11 +1183,11 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 	if attemptID != 0 {
 		var sampleID int64
 		err := tx.QueryRow(ctx, `
-			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail, attempt_id)
-			VALUES ($1, $2, $3, $4, 'probe', $5, $6)
+			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail, attempt_id, observed_at)
+			VALUES ($1, $2, $3, $4, 'probe', $5, $6, COALESCE($7::timestamptz, clock_timestamp()))
 			ON CONFLICT (attempt_id, capability, status, detail) WHERE attempt_id IS NOT NULL DO NOTHING
 			RETURNING id
-		`, key, item.Capability, item.Status, item.Confidence, item.Detail, attemptID).Scan(&sampleID)
+		`, key, item.Capability, item.Status, item.Confidence, item.Detail, attemptID, observedArg(item.ObservedAt)).Scan(&sampleID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
@@ -1185,9 +1197,9 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		inserted = true
 	} else {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail)
-			VALUES ($1, $2, $3, $4, 'probe', $5)
-		`, key, item.Capability, item.Status, item.Confidence, item.Detail); err != nil {
+			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail, observed_at)
+			VALUES ($1, $2, $3, $4, 'probe', $5, COALESCE($6::timestamptz, clock_timestamp()))
+		`, key, item.Capability, item.Status, item.Confidence, item.Detail, observedArg(item.ObservedAt)); err != nil {
 			return false, err
 		}
 		inserted = true
@@ -1233,13 +1245,14 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 				'retrieved', $13::boolean,
 				'unauthenticated', $14::boolean,
 				'authenticated', $15::boolean,
-				'last_attempt_at', clock_timestamp(),
-				'last_conclusive_at', CASE WHEN $12::bool THEN clock_timestamp() ELSE NULL END,
-				'last_success_at', CASE WHEN $3 = 'verified' THEN clock_timestamp() ELSE NULL END,
-				'last_negative_at', CASE WHEN $3 IN ('unsupported', 'restricted') THEN clock_timestamp() ELSE NULL END,
+				'last_attempt_at', COALESCE($16::timestamptz, clock_timestamp()),
+				'last_conclusive_at', CASE WHEN $12::bool THEN COALESCE($16::timestamptz, clock_timestamp()) ELSE NULL END,
+				'last_success_at', CASE WHEN $3 = 'verified' THEN COALESCE($16::timestamptz, clock_timestamp()) ELSE NULL END,
+				'last_negative_at', CASE WHEN $3 IN ('unsupported', 'restricted') THEN COALESCE($16::timestamptz, clock_timestamp()) ELSE NULL END,
+				'recorded_at', clock_timestamp(),
 				'conclusive_status', CASE WHEN $12::bool THEN $3 ELSE NULL END,
 				'conclusive_confidence', CASE WHEN $12::bool THEN $4::float8 ELSE NULL END
-			)), 1, clock_timestamp()
+			)), 1, COALESCE($16::timestamptz, clock_timestamp())
 		)
 		ON CONFLICT (url_key, capability) DO UPDATE
 		SET status = CASE
@@ -1249,6 +1262,10 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
 		            AND relay_capability_observations.status = 'verified'
 		            AND $3 = 'verified'
+		        ) OR (
+		            $16::timestamptz IS NOT NULL
+		            AND relay_capability_observations.observed_at > $16::timestamptz
+		            AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
 		        )
 		        THEN relay_capability_observations.status
 		        ELSE EXCLUDED.status
@@ -1260,6 +1277,10 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
 		            AND relay_capability_observations.status = 'verified'
 		            AND $3 = 'verified'
+		        ) OR (
+		            $16::timestamptz IS NOT NULL
+		            AND relay_capability_observations.observed_at > $16::timestamptz
+		            AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
 		        )
 		        THEN relay_capability_observations.confidence
 		        ELSE EXCLUDED.confidence
@@ -1271,6 +1292,10 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
 		            AND relay_capability_observations.status = 'verified'
 		            AND $3 = 'verified'
+		        ) OR (
+		            $16::timestamptz IS NOT NULL
+		            AND relay_capability_observations.observed_at > $16::timestamptz
+		            AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
 		        )
 		        THEN relay_capability_observations.source
 		        ELSE EXCLUDED.source
@@ -1282,6 +1307,10 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
 		            AND relay_capability_observations.status = 'verified'
 		            AND $3 = 'verified'
+		        ) OR (
+		            $16::timestamptz IS NOT NULL
+		            AND relay_capability_observations.observed_at > $16::timestamptz
+		            AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
 		        )
 		        THEN relay_capability_observations.detail
 		            || jsonb_build_object(
@@ -1289,7 +1318,12 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		                'recent_window', $7::int,
 		                'recent_successes', $10::int,
 		                'recent_inconclusive', $11::int,
-		                'last_attempt_at', clock_timestamp()
+		                'last_attempt_at', CASE
+		                    WHEN $16::timestamptz IS NULL THEN clock_timestamp()
+		                    WHEN relay_capability_observations.detail->>'last_attempt_at' IS NULL THEN $16::timestamptz
+		                    WHEN $16::timestamptz > (relay_capability_observations.detail->>'last_attempt_at')::timestamptz THEN $16::timestamptz
+		                    ELSE (relay_capability_observations.detail->>'last_attempt_at')::timestamptz
+		                END
 		            )
 		        ELSE EXCLUDED.detail
 		    END,
@@ -1301,11 +1335,15 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
 		            AND relay_capability_observations.status = 'verified'
 		            AND $3 = 'verified'
+		        ) OR (
+		            $16::timestamptz IS NOT NULL
+		            AND relay_capability_observations.observed_at > $16::timestamptz
+		            AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
 		        )
 		        THEN relay_capability_observations.observed_at
-		        ELSE clock_timestamp()
+		        ELSE COALESCE($16::timestamptz, clock_timestamp())
 		    END
-	`, key, item.Capability, item.Status, item.Confidence, item.Detail, recentFailures, recentWindow, provisional, item.EvidenceVersion, recentSuccesses, recentInconclusive, conclusive, item.Retrieved, item.Unauthenticated, item.Authenticated)
+	`, key, item.Capability, item.Status, item.Confidence, item.Detail, recentFailures, recentWindow, provisional, item.EvidenceVersion, recentSuccesses, recentInconclusive, conclusive, item.Retrieved, item.Unauthenticated, item.Authenticated, observedArg(item.ObservedAt))
 	return err == nil, err
 }
 
@@ -1313,25 +1351,35 @@ func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token strin
 	if completion.AttemptStatus == "" {
 		completion.AttemptStatus = "incomplete"
 	}
+	submitted := completion
+	if completion.ObservedAt.IsZero() {
+		completion.ObservedAt = time.Now().UTC()
+	}
+	for i := range completion.Writes {
+		if completion.Writes[i].ObservedAt.IsZero() {
+			completion.Writes[i].ObservedAt = completion.ObservedAt
+		}
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var leasedURL, leasedCap, attemptURL, attemptCap, storedStatus string
+	var leasedURL, leasedCap, attemptURL, attemptCap, storedStatus, storedDigest string
 	var current, attemptOpen bool
 	var attemptID int64
 	err = tx.QueryRow(ctx, `
 		SELECT l.url_key, l.capability, l.expires_at > clock_timestamp(),
-		       a.id, a.url_key, a.capability, a.status, a.finished_at IS NULL
+		       a.id, a.url_key, a.capability, a.status, a.finished_at IS NULL,
+		       COALESCE(a.result_digest, '')
 		FROM relay_probe_leases l
 		JOIN relay_probe_attempts a ON a.lease_token = l.lease_token
 		WHERE l.lease_token = $1
 		FOR UPDATE OF l
-	`, token).Scan(&leasedURL, &leasedCap, &current, &attemptID, &attemptURL, &attemptCap, &storedStatus, &attemptOpen)
+	`, token).Scan(&leasedURL, &leasedCap, &current, &attemptID, &attemptURL, &attemptCap, &storedStatus, &attemptOpen, &storedDigest)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return recognizeFinishedAttempt(ctx, tx, key, token, completion.AttemptStatus)
+			return recognizeFinishedAttempt(ctx, tx, key, token, submitted)
 		}
 		return err
 	}
@@ -1346,8 +1394,9 @@ func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token strin
 	if !current || !stillCurrent || leasedURL != key || attemptURL != key || attemptCap != leasedCap {
 		return fmt.Errorf("probe lease %s cannot publish evidence", token)
 	}
+	digest := resultDigest(attemptID, key, leasedCap, submitted)
 	if !attemptOpen {
-		if storedStatus == completion.AttemptStatus {
+		if sameCompletion(storedStatus, storedDigest, completion.AttemptStatus, digest) {
 			return errProbeAlreadyCompleted
 		}
 		return fmt.Errorf("conflicting probe result for %s: stored %s", token, storedStatus)
@@ -1376,9 +1425,9 @@ func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token strin
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE relay_probe_attempts
-		SET finished_at = clock_timestamp(), status = $2
+		SET finished_at = clock_timestamp(), status = $2, result_digest = $6
 		WHERE id = $1 AND lease_token = $3 AND url_key = $4 AND capability = $5 AND finished_at IS NULL
-	`, attemptID, completion.AttemptStatus, token, key, leasedCap)
+	`, attemptID, completion.AttemptStatus, token, key, leasedCap, digest)
 	if err != nil {
 		return err
 	}
@@ -1441,24 +1490,142 @@ func releaseOwnedAttempt(ctx context.Context, pool *pgxpool.Pool, key, token, st
 	_, _ = pool.Exec(ctx, `DELETE FROM relay_probe_leases WHERE lease_token = $1 AND url_key = $2`, token, key)
 }
 
-func recognizeFinishedAttempt(ctx context.Context, tx pgx.Tx, key, token, attemptStatus string) error {
-	var storedKey, storedStatus string
+func recognizeFinishedAttempt(ctx context.Context, tx pgx.Tx, key, token string, completion probeCompletion) error {
+	var storedKey, storedCapability, storedStatus, storedDigest string
+	var attemptID int64
 	var finished bool
 	err := tx.QueryRow(ctx, `
-		SELECT url_key, status, finished_at IS NOT NULL
+		SELECT url_key, capability, status, COALESCE(result_digest, ''), id, finished_at IS NOT NULL
 		FROM relay_probe_attempts
 		WHERE lease_token = $1
 		ORDER BY id DESC
 		LIMIT 1
-	`, token).Scan(&storedKey, &storedStatus, &finished)
+	`, token).Scan(&storedKey, &storedCapability, &storedStatus, &storedDigest, &attemptID, &finished)
 	if err != nil {
 		return fmt.Errorf("probe lease %s cannot publish evidence", token)
 	}
 	if storedKey != key || !finished {
 		return fmt.Errorf("probe lease %s cannot publish evidence", token)
 	}
-	if storedStatus == attemptStatus {
+	digest := resultDigest(attemptID, key, storedCapability, completion)
+	if sameCompletion(storedStatus, storedDigest, completion.AttemptStatus, digest) {
 		return errProbeAlreadyCompleted
 	}
 	return fmt.Errorf("conflicting probe result for %s: stored %s", token, storedStatus)
+}
+
+func sameCompletion(storedStatus, storedDigest, status, digest string) bool {
+	return storedDigest != "" && storedStatus == status && storedDigest == digest
+}
+
+func observedArg(at time.Time) any {
+	if at.IsZero() {
+		return nil
+	}
+	return at.UTC()
+}
+
+func resultDigest(attemptID int64, urlKey, capability string, completion probeCompletion) string {
+	observations := make([]digestObservation, 0, len(completion.Writes))
+	for _, item := range completion.Writes {
+		observations = append(observations, digestObservation{
+			Capability: item.Capability, Status: item.Status, Detail: item.Detail,
+			Confidence: item.Confidence, EvidenceVersion: item.EvidenceVersion,
+			Retrieved: item.Retrieved, Unauthenticated: item.Unauthenticated, Authenticated: item.Authenticated,
+			ObservedAt: stamp(item.ObservedAt),
+		})
+	}
+	sort.Slice(observations, func(i, j int) bool {
+		if observations[i].Capability != observations[j].Capability {
+			return observations[i].Capability < observations[j].Capability
+		}
+		if observations[i].Status != observations[j].Status {
+			return observations[i].Status < observations[j].Status
+		}
+		if observations[i].Detail != observations[j].Detail {
+			return observations[i].Detail < observations[j].Detail
+		}
+		return observations[i].ObservedAt < observations[j].ObservedAt
+	})
+	payload := digestPayload{
+		AttemptID: attemptID, URLKey: urlKey, Capability: capability,
+		Status: completion.AttemptStatus, Endpoint: completion.Endpoint,
+		ObservedAt: stamp(completion.ObservedAt), Observations: observations,
+	}
+	if completion.Retention != nil {
+		payload.Retention = &digestRetention{
+			RelayURL: completion.Retention.RelayURL, EventID: completion.Retention.EventID,
+			Published: stamp(completion.Retention.Published),
+		}
+	}
+	if completion.FollowupID > 0 {
+		payload.Followup = &digestFollowup{
+			ID: completion.FollowupID, Status: completion.FollowStatus, Result: completion.FollowResult,
+			Elapsed: completion.Elapsed, Endpoint: completion.Endpoint, Capability: completion.FollowCapability,
+		}
+	}
+	raw, _ := json.Marshal(payload)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func stamp(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// stampEvidence records when the network operation established the result.
+// The same value is part of the completion digest, so a later identical
+// submission matches and a different observation time does not.
+func stampEvidence(completion probeCompletion) probeCompletion {
+	if completion.ObservedAt.IsZero() {
+		completion.ObservedAt = time.Now().UTC()
+	}
+	for i := range completion.Writes {
+		if completion.Writes[i].ObservedAt.IsZero() {
+			completion.Writes[i].ObservedAt = completion.ObservedAt
+		}
+	}
+	return completion
+}
+
+type digestPayload struct {
+	AttemptID    int64               `json:"attempt_id"`
+	URLKey       string              `json:"url_key"`
+	Capability   string              `json:"capability"`
+	Status       string              `json:"status"`
+	Endpoint     string              `json:"endpoint"`
+	ObservedAt   string              `json:"observed_at"`
+	Observations []digestObservation `json:"observations"`
+	Retention    *digestRetention    `json:"retention,omitempty"`
+	Followup     *digestFollowup     `json:"followup,omitempty"`
+}
+
+type digestObservation struct {
+	Capability      string  `json:"capability"`
+	Status          string  `json:"status"`
+	Detail          string  `json:"detail"`
+	Confidence      float64 `json:"confidence"`
+	EvidenceVersion int     `json:"evidence_version"`
+	Retrieved       *bool   `json:"retrieved"`
+	Unauthenticated *bool   `json:"unauthenticated"`
+	Authenticated   *bool   `json:"authenticated"`
+	ObservedAt      string  `json:"observed_at"`
+}
+
+type digestRetention struct {
+	RelayURL  string `json:"relay_url"`
+	EventID   string `json:"event_id"`
+	Published string `json:"published"`
+}
+
+type digestFollowup struct {
+	ID         int64  `json:"id"`
+	Status     string `json:"status"`
+	Result     string `json:"result"`
+	Elapsed    int    `json:"elapsed"`
+	Endpoint   string `json:"endpoint"`
+	Capability string `json:"capability"`
 }

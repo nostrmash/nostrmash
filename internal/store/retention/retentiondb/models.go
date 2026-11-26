@@ -1505,15 +1505,16 @@ type RelayPreferenceListsLatest struct {
 }
 
 type RelayProbeAttempt struct {
-	ID         int64
-	UrlKey     string
-	Capability string
-	Host       string
-	WorkerID   string
-	LeaseToken string
-	StartedAt  pgtype.Timestamptz
-	FinishedAt pgtype.Timestamptz
-	Status     string
+	ID           int64
+	UrlKey       string
+	Capability   string
+	Host         string
+	WorkerID     string
+	LeaseToken   string
+	StartedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
+	Status       string
+	ResultDigest string
 }
 
 type RelayProbeFollowup struct {

@@ -790,6 +790,10 @@ paths:
             after the recipient exact-id and recipient-tag subscriptions
             retrieve the event while authenticated and the observer and
             anonymous paths do not. A nil privacy boolean is unknown, not false.
+            A timeout, rate limit, payment restriction, or incomplete authentication
+            leaves the affected exposure field null. Verified false requires every
+            applicable path to finish without a retrieval. Confidence, freshness,
+            and evidence version come from the capability that decides the assessment.
             giftwrap_accept, giftwrap_private, and giftwrap_public are separate.
             A kind 1 write does not verify keypackage. This request performs no network I/O.
           content:
@@ -811,7 +815,6 @@ paths:
                   stale: false
                   confidence: 0.8
                   freshness: fresh
-                  evidence_version: 2
                   recipient_exact_verified: true
                   recipient_tag_verified: true
                   unauthenticated_exposure: true
@@ -867,14 +870,6 @@ paths:
                     diversity: { type: number, description: Soft operator-diversity preference. It does not block signing. }
                     require_operator_diversity: { type: boolean, description: "Mandatory operator diversity. The selected configuration must use more than one known operator. It stays unsatisfied when the list is a single operator, operator ownership is unknown, or no eligible alternative exists. It is not waived because no diverse relay is available. Omit it, or leave it false, for the soft diversity preference." }
                     require_verified_privacy: { type: boolean, description: "When set on dm_inbox, every selected DM relay must have a comprehensive recipient-only gift-wrap result. Acceptance, advertisements, unknown evidence, and an unresolved exposure do not satisfy it." }
-                    by_role:
-                      type: object
-                      additionalProperties:
-                        type: object
-                        properties:
-                          require_verified_privacy: { type: boolean }
-                          min_capability_confidence: { type: number }
-                          require_operator_diversity: { type: boolean }
                     retain_existing: { type: boolean }
                     weights:
                       type: object
@@ -885,7 +880,7 @@ paths:
                     by_role:
                       type: object
                       additionalProperties: true
-                      description: Per-role overrides of the same constraint fields.
+                      description: Per-role overrides of the same constraint fields. A role may set require_verified_privacy, min_capability_confidence, or require_operator_diversity.
                 supplied_relays:
                   type: array
                   items:

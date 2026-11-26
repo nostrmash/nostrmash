@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,6 +163,125 @@ func relayScript(t *testing.T, onReq func(conn *websocket.Conn, sub string)) *ht
 			}
 		}
 	}))
+}
+
+func TestIncompleteExposureIsNotVerifiedNegative(t *testing.T) {
+	timeout := accessResult{Status: "timeout", AuthAttempted: true}
+	completeMiss := accessResult{Status: "complete", Authenticated: true, SubscriptionComplete: true, AuthAttempted: true}
+	anonMiss := accessResult{Status: "complete"}
+	preAuth := accessResult{Status: "incomplete", SeenBeforeAuth: true, RetrievedUnauthenticated: true, Hit: true, AuthAttempted: true}
+	both := accessResult{Status: "complete", Authenticated: true, HitAfterAuth: true, SeenBeforeAuth: true, RetrievedUnauthenticated: true, Hit: true, SubscriptionComplete: true, AuthAttempted: true, AuthIdentity: "recipient"}
+
+	writes := giftWrapPathWrites(giftWrapEvidence{
+		Checked: true, Accept: "accepted",
+		RecipientExact: completeMiss, RecipientTag: completeMiss,
+		ObserverExact: timeout, ObserverTag: completeMiss,
+		AnonExact: anonMiss, AnonTag: accessResult{Status: "auth_required"},
+	})
+	auth := findWrite(t, writes, CapGiftWrapAuthExposure)
+	unauth := findWrite(t, writes, CapGiftWrapUnauthExposure)
+	if auth.Status != "inconclusive" || auth.Retrieved != nil || unauth.Status != "inconclusive" || unauth.Retrieved != nil {
+		t.Fatalf("incomplete observer produced negative exposure: auth=%+v unauth=%+v", auth, unauth)
+	}
+	exact := findWrite(t, writes, CapGiftWrapRecipientExact)
+	if exact.Retrieved == nil || *exact.Retrieved || exact.Status != StatusVerified {
+		t.Fatalf("completed authenticated miss = %+v", exact)
+	}
+
+	anonTimeout := giftWrapPathWrites(giftWrapEvidence{
+		Checked:        true,
+		RecipientExact: completeMiss, RecipientTag: completeMiss,
+		ObserverExact: completeMiss, ObserverTag: completeMiss,
+		AnonExact: accessResult{Status: "timeout"}, AnonTag: anonMiss,
+	})
+	if findWrite(t, anonTimeout, CapGiftWrapUnauthExposure).Status != "inconclusive" {
+		t.Fatal("an incomplete anonymous query verified that nothing was exposed")
+	}
+
+	partialRecipient := giftWrapPathWrites(giftWrapEvidence{
+		Checked:        true,
+		RecipientExact: completeMiss, RecipientTag: timeout,
+		ObserverExact: completeMiss, ObserverTag: completeMiss,
+		AnonExact: anonMiss, AnonTag: accessResult{Status: "auth_required"},
+	})
+	if _, ok := writeByCapability(partialRecipient, CapGiftWrapRecipient); ok {
+		t.Fatal("one completed recipient path established aggregate retrieval")
+	}
+	if findWrite(t, partialRecipient, CapGiftWrapRecipientTag).Status != "inconclusive" {
+		t.Fatal("an incomplete recipient-tag query was verified")
+	}
+
+	hitThenTimeout := giftWrapPathWrites(giftWrapEvidence{
+		Checked:        true,
+		RecipientExact: preAuth,
+		ObserverExact:  timeout,
+	})
+	exposed := findWrite(t, hitThenTimeout, CapGiftWrapUnauthExposure)
+	if exposed.Status != StatusVerified || exposed.Retrieved == nil || !*exposed.Retrieved {
+		t.Fatalf("unauthorized hit followed by timeout = %+v", exposed)
+	}
+	if findWrite(t, hitThenTimeout, CapGiftWrapRecipientExact).Retrieved != nil {
+		t.Fatal("pre-authentication retrieval counted as authenticated recipient delivery")
+	}
+
+	followed := giftWrapPathWrites(giftWrapEvidence{
+		Checked:        true,
+		RecipientExact: both, RecipientTag: completeMiss,
+		ObserverExact: completeMiss, ObserverTag: completeMiss,
+		AnonExact: anonMiss, AnonTag: accessResult{Status: "auth_required"},
+	})
+	if findWrite(t, followed, CapGiftWrapRecipientExact).Retrieved == nil || !*findWrite(t, followed, CapGiftWrapRecipientExact).Retrieved {
+		t.Fatal("authenticated retrieval after exposure was dropped")
+	}
+	if findWrite(t, followed, CapGiftWrapUnauthExposure).Retrieved == nil || !*findWrite(t, followed, CapGiftWrapUnauthExposure).Retrieved {
+		t.Fatal("pre-authentication exposure was cleared by the later authenticated retrieval")
+	}
+
+	negative := giftWrapPathWrites(giftWrapEvidence{
+		Checked:        true,
+		RecipientExact: completeMiss, RecipientTag: completeMiss,
+		ObserverExact: completeMiss, ObserverTag: completeMiss,
+		AnonExact: anonMiss, AnonTag: accessResult{Status: "auth_required"},
+	})
+	if got := findWrite(t, negative, CapGiftWrapUnauthExposure); got.Status != StatusVerified || got.Retrieved == nil || *got.Retrieved {
+		t.Fatalf("complete negative observer tests = %+v", got)
+	}
+	if got := findWrite(t, negative, CapGiftWrapAuthExposure); got.Status != StatusVerified || got.Retrieved == nil || *got.Retrieved {
+		t.Fatalf("complete negative authenticated observer tests = %+v", got)
+	}
+
+	closed := relayScript(t, func(conn *websocket.Conn, sub string) {
+		_ = conn.Close()
+	})
+	defer closed.Close()
+	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
+	state := &probeState{key: sender, pubkey: pubOf(sender), allowPrivate: true, recipientKey: recipient, recipientPub: pubOf(recipient), observerKey: observer, observerPub: pubOf(observer)}
+	live := state.readGiftWrap(t.Context(), wsURL(closed), strings.Repeat("ab", 32), observer, pubOf(observer), pubOf(recipient), false, true)
+	if live.Status == "complete" || live.Hit || live.HitAfterAuth {
+		t.Fatalf("closed observer query = %+v", live)
+	}
+	liveWrites := giftWrapPathWrites(giftWrapEvidence{Checked: true, ObserverExact: live, ObserverTag: completeMiss})
+	if findWrite(t, liveWrites, CapGiftWrapAuthExposure).Status == StatusVerified {
+		t.Fatal("a closed authenticated observer query became verified negative evidence")
+	}
+}
+
+func findWrite(t *testing.T, writes []observationWrite, capability string) observationWrite {
+	t.Helper()
+	write, ok := writeByCapability(writes, capability)
+	if !ok {
+		t.Fatalf("missing %s", capability)
+	}
+	return write
+}
+
+func writeByCapability(writes []observationWrite, capability string) (observationWrite, bool) {
+	for _, write := range writes {
+		if write.Capability == capability {
+			return write, true
+		}
+	}
+	return observationWrite{}, false
 }
 
 func TestPrivacyFieldsStayIndependent(t *testing.T) {
