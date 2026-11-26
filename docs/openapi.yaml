@@ -843,6 +843,16 @@ paths:
                     diversity: { type: number, description: Soft operator-diversity preference. It does not block signing. }
                     require_operator_diversity: { type: boolean, description: "Mandatory operator diversity. The selected configuration must use more than one known operator. It stays unsatisfied when the list is a single operator, operator ownership is unknown, or no eligible alternative exists. It is not waived because no diverse relay is available. Omit it, or leave it false, for the soft diversity preference." }
                     retain_existing: { type: boolean }
+                    weights:
+                      type: object
+                      additionalProperties: { type: number }
+                    global:
+                      type: object
+                      additionalProperties: true
+                    by_role:
+                      type: object
+                      additionalProperties: true
+                      description: Per-role overrides of the same constraint fields.
                 supplied_relays:
                   type: array
                   items:
@@ -850,6 +860,12 @@ paths:
                     properties:
                       role: { type: string }
                       url: { type: string }
+                source_events:
+                  type: array
+                  description: Signed events supplied by the client for this request. They are not stored.
+                  items: { type: object, additionalProperties: true }
+                allow_create: { type: boolean, description: Allow an unsigned list when this index has no source event. }
+                allow_recreate: { type: boolean, description: Allow an unsigned list when the indexed source was deleted. }
             example:
               pubkey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
               preset: balanced
@@ -870,6 +886,8 @@ paths:
             never proposed.
           content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/RelayOptimizeResponse'
               example:
                 algorithm: relay-intel-v1
                 score_version: relay-score-v1
@@ -3386,6 +3404,228 @@ components:
       scheme: bearer
       bearerFormat: OpaqueToken
   schemas:
+    RelayOptimizeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - algorithm
+        - score_version
+        - optimizer_version
+        - tie_break
+        - tie_break_note
+        - generated_at
+        - pubkey
+        - preset
+        - preset_version
+        - cohort
+        - roles
+        - proposal
+        - constraints_satisfied
+      properties:
+        algorithm: { type: string, enum: [relay-intel-v1] }
+        score_version: { type: string, enum: [relay-score-v1] }
+        optimizer_version: { type: string, enum: [relay-opt-v3] }
+        tie_break: { type: string, enum: [lower_event_id] }
+        tie_break_note: { type: string }
+        generated_at: { type: string, format: date-time }
+        stats_computed_at: { type: string, format: date-time, nullable: true }
+        fallbacks: { type: array, items: { type: string }, nullable: true }
+        pubkey: { type: string }
+        preset: { type: string, enum: [balanced, creator, privacy, minimal, decentralization, custom] }
+        preset_version: { type: string }
+        cohort:
+          $ref: '#/components/schemas/RelayOptimizeCohort'
+        sources:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeSource' }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/RelayOptimizeRole' }
+        proposal:
+          $ref: '#/components/schemas/RelayOptimizeProposal'
+        constraints_satisfied: { type: boolean }
+        unsatisfied_constraints:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeReason' }
+        shared_configuration:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeSharedRole' }
+    RelayOptimizeCohort:
+      type: object
+      additionalProperties: false
+      required: [size, truncated, trust_data, used]
+      properties:
+        size: { type: integer }
+        truncated: { type: boolean }
+        trust_data: { type: boolean }
+        used: { type: string, enum: [personalized, global_fallback] }
+    RelayOptimizeSource:
+      type: object
+      additionalProperties: false
+      required: [kind, status, requires_refresh]
+      properties:
+        kind: { type: integer }
+        d_tag: { type: string }
+        projection_event_id: { type: string }
+        canonical_event_id: { type: string }
+        status: { type: string, enum: [current, stale, missing, deleted, too_large, unreadable, stale_client] }
+        requires_refresh: { type: boolean }
+        note: { type: string }
+    RelayOptimizeRole:
+      type: object
+      additionalProperties: false
+      required: [role, availability, selection, recommendations]
+      properties:
+        role:
+          type: string
+          enum: [public_inbox, public_outbox, dm_inbox, search, blocked, favorite, relay_set, keypackage, blossom, wiki, private_storage]
+        availability: { type: string, enum: [missing, empty, present, client_side] }
+        fallback: { type: string }
+        selection: { $ref: '#/components/schemas/RelayOptimizeSelection' }
+        recommendations:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeRecommendation' }
+        ranking:
+          type: array
+          nullable: true
+          items: { type: object, additionalProperties: true }
+        candidate_limit: { type: integer }
+        candidates_truncated: { type: boolean }
+    RelayOptimizeSelection:
+      type: object
+      additionalProperties: false
+      required:
+        - selected
+        - current_coverage
+        - proposed_coverage
+        - improvement
+        - unknown_weight
+        - known_weight
+        - distinct_endpoints
+        - operator_count
+        - max_operator_share
+        - concentration_basis
+        - redundancy
+        - constraints_satisfied
+        - independently_satisfied
+        - coverage_definition
+      properties:
+        selected:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeSelectedRelay' }
+        current_coverage: { type: number }
+        proposed_coverage: { type: number }
+        improvement: { type: number }
+        unknown_weight: { type: number }
+        known_weight: { type: number }
+        distinct_endpoints: { type: integer }
+        operator_count: { type: integer }
+        max_operator_share: { type: number }
+        concentration_basis: { type: string }
+        redundancy: { type: number }
+        constraints_satisfied: { type: boolean }
+        independently_satisfied: { type: boolean }
+        qualifications:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeReason' }
+        unsatisfied_constraints:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeReason' }
+        coverage_definition: { type: string }
+    RelayOptimizeSelectedRelay:
+      type: object
+      additionalProperties: false
+      required: [url, marginal_coverage, unique_coverage]
+      properties:
+        url: { type: string }
+        marginal_coverage: { type: number }
+        unique_coverage: { type: number }
+        operator_key: { type: string }
+        pinned: { type: boolean }
+        current: { type: boolean }
+    RelayOptimizeReason:
+      type: object
+      additionalProperties: false
+      required: [code, text]
+      properties:
+        code: { type: string }
+        text: { type: string }
+    RelayOptimizeRecommendation:
+      type: object
+      additionalProperties: false
+      required: [action, role, reason_codes, text, confidence, confidence_label, attention_required]
+      properties:
+        action: { type: string, enum: [add, remove, replace, retain, investigate] }
+        role: { type: string }
+        current: { type: string }
+        suggested: { type: string }
+        reason_codes: { type: array, nullable: true, items: { type: string } }
+        text: { type: string }
+        estimated_benefit: { type: number }
+        confidence: { type: number }
+        confidence_label: { type: string, enum: [high, medium, low, insufficient] }
+        attention_required: { type: boolean }
+        limitations: { type: array, nullable: true, items: { type: string } }
+    RelayOptimizeProposal:
+      type: object
+      additionalProperties: false
+      required: [note, proposal_safe, source_complete, requires_refresh, requires_review, ready_to_sign]
+      properties:
+        public_relays: { $ref: '#/components/schemas/RelayOptimizeEvent' }
+        lists:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeEvent' }
+        note: { type: string }
+        proposal_safe: { type: boolean }
+        source_complete: { type: boolean }
+        source_origin: { type: string }
+        source_event_id: { type: string }
+        source_created_at: { type: integer }
+        requires_refresh: { type: boolean }
+        requires_review: { type: boolean }
+        ready_to_sign: { type: boolean }
+        warnings:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeReason' }
+        blocking_reasons:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/RelayOptimizeReason' }
+    RelayOptimizeEvent:
+      type: object
+      additionalProperties: false
+      required: [kind, pubkey, content, tags, proposal_safe, note]
+      properties:
+        kind: { type: integer }
+        pubkey: { type: string }
+        content: { type: string }
+        tags:
+          type: array
+          nullable: true
+          items: { type: array, items: { type: string } }
+        based_on_event_id: { type: string }
+        based_on_created_at: { type: integer }
+        proposal_safe: { type: boolean }
+        source_origin: { type: string }
+        change: { type: string, enum: [replacement, creation, recreation] }
+        note: { type: string }
+    RelayOptimizeSharedRole:
+      type: object
+      additionalProperties: false
+      required: [roles, kind, note]
+      properties:
+        roles: { type: array, items: { type: string } }
+        kind: { type: integer }
+        note: { type: string }
     DiscoveryEvidence:
       type: object
       properties:
