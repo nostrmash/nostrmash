@@ -183,7 +183,7 @@ func TestPopulatedRelayIntelCost(t *testing.T) {
 		LEFT JOIN relay_config_heads h
 		  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
 		WHERE rs.kind = ANY(ARRAY[3, 10002, 10006, 10007, 10012, 10013, 10050, 10051, 10063, 10102, 30002]::int[])
-		  AND (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay)
+		  AND (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay OR h.membership_count = -1)
 		ORDER BY rs.kind, rs.pubkey, rs.d_tag
 		LIMIT 200
 	`)
