@@ -62,6 +62,26 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				       AND EXCLUDED.event_id < contact_lists_latest.event_id
 				   )
 				   OR EXCLUDED.event_id = contact_lists_latest.event_id
+				   OR (
+				       EXISTS (
+				           SELECT 1 FROM replaceable_state rs
+				           WHERE rs.pubkey = EXCLUDED.pubkey AND rs.kind = 3 AND rs.d_tag = ''
+				             AND rs.event_id = EXCLUDED.event_id
+				       )
+				       AND (
+				           EXISTS (
+				               SELECT 1 FROM deletion_events de
+				               WHERE de.target_event_id = contact_lists_latest.event_id
+				                 AND de.deleter_pubkey = contact_lists_latest.pubkey
+				           )
+				           OR EXISTS (
+				               SELECT 1 FROM deletion_addresses da
+				               WHERE da.pubkey = contact_lists_latest.pubkey
+				                 AND da.kind = 3
+				                 AND da.created_at >= contact_lists_latest.created_at
+				           )
+				       )
+				   )
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert contact_lists_latest: %w", err)
@@ -232,6 +252,27 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 				   OR (
 				       EXCLUDED.created_at = relay_lists_latest.created_at
 				       AND EXCLUDED.event_id < relay_lists_latest.event_id
+				   )
+				   OR EXCLUDED.event_id = relay_lists_latest.event_id
+				   OR (
+				       EXISTS (
+				           SELECT 1 FROM replaceable_state rs
+				           WHERE rs.pubkey = EXCLUDED.pubkey AND rs.kind = 10002 AND rs.d_tag = ''
+				             AND rs.event_id = EXCLUDED.event_id
+				       )
+				       AND (
+				           EXISTS (
+				               SELECT 1 FROM deletion_events de
+				               WHERE de.target_event_id = relay_lists_latest.event_id
+				                 AND de.deleter_pubkey = relay_lists_latest.pubkey
+				           )
+				           OR EXISTS (
+				               SELECT 1 FROM deletion_addresses da
+				               WHERE da.pubkey = relay_lists_latest.pubkey
+				                 AND da.kind = 10002
+				                 AND da.created_at >= relay_lists_latest.created_at
+				           )
+				       )
 				   )
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {

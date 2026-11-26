@@ -602,6 +602,9 @@ func markerFor(read, write bool) string {
 func setMarker(tag []string, marker string) []string {
 	next := append([]string(nil), tag...)
 	if marker == "" {
+		if len(next) == 3 && (next[2] == "read" || next[2] == "write" || strings.TrimSpace(next[2]) == "") {
+			return next[:2]
+		}
 		if len(next) >= 3 && (next[2] == "read" || next[2] == "write") {
 			next[2] = ""
 		}

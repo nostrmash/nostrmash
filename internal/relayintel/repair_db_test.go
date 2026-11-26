@@ -755,8 +755,515 @@ func TestDeletedRepairUsesTheRemainingCanonicalEvent(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
+	if status != "queued" {
+		t.Fatalf("replacement repair status before derivation = %s", status)
+	}
+	finishDerivation(t, ctx, pool, third)
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
 	if status != "deleted" {
 		t.Fatalf("deleted repair status = %s", status)
+	}
+	var head string
+	if err := pool.QueryRow(ctx, `SELECT event_id FROM relay_config_heads WHERE pubkey = $1 AND source_kind = 10002`, pubkey).Scan(&head); err != nil {
+		t.Fatal(err)
+	}
+	if head != third {
+		t.Fatalf("head = %s", head)
+	}
+}
+
+func TestDeletedWinnerProjectionReconciliation(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	next := 100
+	id := func() string {
+		next++
+		return fmt.Sprintf("%064x", next)
+	}
+	pubkey := func() string { return id() }
+
+	seed := func(t *testing.T, owner, winner, other string, winnerAt, otherAt int64) {
+		t.Helper()
+		insertStoredEvent(t, ctx, pool, storedEvent{
+			id: winner, pubkey: owner, kind: relayintel.KindPublicRelayList, created: winnerAt,
+			tags: [][]string{{"r", "wss://deleted.example"}},
+		})
+		insertStoredEvent(t, ctx, pool, storedEvent{
+			id: other, pubkey: owner, kind: relayintel.KindPublicRelayList, created: otherAt,
+			tags: [][]string{{"r", "wss://kept.example"}},
+		})
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+			VALUES ($1, 10002, '', $2, $3, 1)
+		`, owner, winner, winnerAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO relay_config_heads (
+				pubkey, source_kind, d_tag, event_id, created_at, declaration_source
+			) VALUES ($1, 10002, '', $2, $3, 'modern')
+		`, owner, winner, winnerAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO relay_role_memberships (
+				pubkey, role, url_key, source_kind, d_tag, endpoint_url, endpoint_type,
+				source_event_id, created_at, declaration_source, public_safe
+			) VALUES ($1, 'public_outbox', 'deleted', 10002, '', 'wss://deleted.example', 'nostr_relay', $2, $3, 'modern', true)
+		`, owner, winner, winnerAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleteEvent := func(t *testing.T, owner, target string, created int64) {
+		t.Helper()
+		tomb := id()
+		insertStoredEvent(t, ctx, pool, storedEvent{id: tomb, pubkey: owner, kind: 5, created: created})
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO deletion_events (event_id, deleter_pubkey, target_event_id, created_at, derivation_version)
+			VALUES ($1, $2, $3, $4, 1)
+		`, tomb, owner, target, created); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settle := func(t *testing.T, owner, winner, replacement string) {
+		t.Helper()
+		callRepair(t, ctx, pool)
+		if got := stateWinner(t, ctx, pool, owner, 10002, ""); got != replacement {
+			t.Fatalf("canonical event = %s, want %s", got, replacement)
+		}
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "deleted" || status == "completed" {
+			t.Fatalf("repair finished before the replacement was derived: %s", status)
+		}
+		finishDerivation(t, ctx, pool, replacement)
+		callRepair(t, ctx, pool)
+		if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "deleted" {
+			t.Fatalf("repair status = %s", status)
+		}
+		var head, list string
+		var replay bool
+		if err := pool.QueryRow(ctx, `
+			SELECT event_id, needs_replay FROM relay_config_heads
+			WHERE pubkey = $1 AND source_kind = 10002 AND d_tag = ''
+		`, owner).Scan(&head, &replay); err != nil {
+			t.Fatal(err)
+		}
+		if head != replacement || replay {
+			t.Fatalf("head=%s replay=%v", head, replay)
+		}
+		if err := pool.QueryRow(ctx, `SELECT event_id FROM relay_lists_latest WHERE pubkey = $1`, owner).Scan(&list); err != nil {
+			t.Fatal(err)
+		}
+		if list != replacement {
+			t.Fatalf("relay list = %s", list)
+		}
+		var stale int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM relay_role_memberships
+			WHERE pubkey = $1 AND source_event_id IS DISTINCT FROM $2
+		`, owner, replacement).Scan(&stale); err != nil {
+			t.Fatal(err)
+		}
+		if stale != 0 {
+			t.Fatal("a membership still cites another event")
+		}
+		var keptURL string
+		if err := pool.QueryRow(ctx, `
+			SELECT endpoint_url FROM relay_role_memberships WHERE pubkey = $1 AND role = 'public_outbox'
+		`, owner).Scan(&keptURL); err != nil {
+			t.Fatal(err)
+		}
+		if keptURL != "wss://kept.example" {
+			t.Fatalf("outbox = %s", keptURL)
+		}
+		var tomb int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM deletion_events WHERE target_event_id = $1 AND deleter_pubkey = $2
+		`, winner, owner).Scan(&tomb); err != nil {
+			t.Fatal(err)
+		}
+		if tomb != 1 {
+			t.Fatal("deletion tombstone was removed")
+		}
+	}
+
+	t.Run("newer remaining candidate", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 10, 30)
+		deleteEvent(t, owner, winner, 40)
+		settle(t, owner, winner, other)
+	})
+	t.Run("older remaining candidate", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 30, 10)
+		deleteEvent(t, owner, winner, 40)
+		settle(t, owner, winner, other)
+	})
+	t.Run("same timestamp higher id", func(t *testing.T) {
+		owner := pubkey()
+		winner := fmt.Sprintf("%064x", 1)
+		other := fmt.Sprintf("%064x", 2)
+		seed(t, owner, winner, other, 10, 10)
+		deleteEvent(t, owner, winner, 40)
+		settle(t, owner, winner, other)
+	})
+	t.Run("address deletion covers every candidate", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 20, 10)
+		tomb := id()
+		insertStoredEvent(t, ctx, pool, storedEvent{id: tomb, pubkey: owner, kind: 5, created: 50})
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO deletion_addresses (event_id, pubkey, kind, d_tag, created_at)
+			VALUES ($1, $2, 10002, '', 50)
+		`, tomb, owner); err != nil {
+			t.Fatal(err)
+		}
+		callRepair(t, ctx, pool)
+		var stateCount, headCount, memberCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM replaceable_state WHERE pubkey = $1 AND kind = 10002`, owner).Scan(&stateCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_config_heads WHERE pubkey = $1 AND source_kind = 10002`, owner).Scan(&headCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_role_memberships WHERE pubkey = $1`, owner).Scan(&memberCount); err != nil {
+			t.Fatal(err)
+		}
+		if stateCount != 0 || headCount != 0 || memberCount != 0 {
+			t.Fatalf("state=%d head=%d memberships=%d", stateCount, headCount, memberCount)
+		}
+		var addresses int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM deletion_addresses WHERE pubkey = $1 AND kind = 10002`, owner).Scan(&addresses); err != nil {
+			t.Fatal(err)
+		}
+		if addresses != 1 {
+			t.Fatal("address tombstone was removed")
+		}
+	})
+	t.Run("no remaining candidate", func(t *testing.T) {
+		owner, winner := pubkey(), id()
+		insertStoredEvent(t, ctx, pool, storedEvent{
+			id: winner, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 10,
+			tags: [][]string{{"r", "wss://only.example"}},
+		})
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+			VALUES ($1, 10002, '', $2, 10, 1)
+		`, owner, winner); err != nil {
+			t.Fatal(err)
+		}
+		deleteEvent(t, owner, winner, 20)
+		callRepair(t, ctx, pool)
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM replaceable_state WHERE pubkey = $1`, owner).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatal("deleted coordinate still has canonical state")
+		}
+	})
+	t.Run("concurrent newer event", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 20, 10)
+		deleteEvent(t, owner, winner, 30)
+		callRepair(t, ctx, pool)
+		if stateWinner(t, ctx, pool, owner, 10002, "") != other {
+			t.Fatal("replacement was not selected")
+		}
+		newer := id()
+		insertStoredEvent(t, ctx, pool, storedEvent{
+			id: newer, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 50,
+			tags: [][]string{{"r", "wss://newer.example"}},
+		})
+		finishDerivation(t, ctx, pool, newer)
+		callRepair(t, ctx, pool)
+		if stateWinner(t, ctx, pool, owner, 10002, "") != newer {
+			t.Fatal("concurrent event did not become canonical")
+		}
+		var status, head string
+		if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "deleted" && status != "superseded" {
+			t.Fatalf("status = %s", status)
+		}
+		if err := pool.QueryRow(ctx, `SELECT event_id FROM relay_config_heads WHERE pubkey = $1 AND source_kind = 10002`, owner).Scan(&head); err != nil {
+			t.Fatal(err)
+		}
+		if head != newer {
+			t.Fatalf("head = %s", head)
+		}
+	})
+	t.Run("concurrent deletion of the replacement", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 20, 10)
+		deleteEvent(t, owner, winner, 30)
+		callRepair(t, ctx, pool)
+		deleteEvent(t, owner, other, 40)
+		callRepair(t, ctx, pool)
+		var stateCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM replaceable_state WHERE pubkey = $1 AND kind = 10002`, owner).Scan(&stateCount); err != nil {
+			t.Fatal(err)
+		}
+		if stateCount != 0 {
+			t.Fatal("a deleted replacement stayed canonical")
+		}
+	})
+	t.Run("replay after restart", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 30, 10)
+		deleteEvent(t, owner, winner, 40)
+		callRepair(t, ctx, pool)
+		callRepair(t, ctx, pool)
+		if jobsFor(t, ctx, pool, other) != 1 {
+			t.Fatal("restart created another replacement job")
+		}
+		if stateWinner(t, ctx, pool, owner, 10002, "") != other {
+			t.Fatal("restart moved canonical state")
+		}
+		finishDerivation(t, ctx, pool, other)
+		callRepair(t, ctx, pool)
+		callRepair(t, ctx, pool)
+		var status, head string
+		if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "deleted" {
+			t.Fatalf("status = %s", status)
+		}
+		if err := pool.QueryRow(ctx, `SELECT event_id FROM relay_config_heads WHERE pubkey = $1 AND source_kind = 10002`, owner).Scan(&head); err != nil {
+			t.Fatal(err)
+		}
+		if head != other {
+			t.Fatalf("head = %s", head)
+		}
+	})
+	t.Run("retention keeps the replacement", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 30, 10)
+		deleteEvent(t, owner, winner, 40)
+		callRepair(t, ctx, pool)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO replaceable_event_purge (event_id, created_at) VALUES ($1, 10)
+			ON CONFLICT (event_id) DO NOTHING
+		`, other); err != nil {
+			t.Fatal(err)
+		}
+		deleted, err := store.NewPostgresStore(pool).Retention.PurgeSupersededReplaceableEvents(
+			ctx, time.Now().Add(time.Hour), time.Now().Add(-time.Hour), 50,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deleted != 0 {
+			t.Fatalf("purged events during reconciliation: %d", deleted)
+		}
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM events WHERE id = $1)`, other).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Fatal("retention deleted the canonical replacement")
+		}
+		finishDerivation(t, ctx, pool, other)
+		callRepair(t, ctx, pool)
+	})
+	t.Run("inspection diagnostics and optimization agree", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 30, 10)
+		deleteEvent(t, owner, winner, 40)
+		settle(t, owner, winner, other)
+		svc := relayintel.NewService(pool, relayintel.Options{})
+		cfg, err := svc.Config(ctx, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Account.ModernEventID != other {
+			t.Fatalf("config event = %s", cfg.Account.ModernEventID)
+		}
+		diag, err := svc.Diagnostics(ctx, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := svc.Optimize(ctx, relayintel.PlanRequest{Pubkey: owner})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, report := range append(append([]relayintel.SourceReport{}, cfg.Sources...), append(diag.Sources, plan.Sources...)...) {
+			if report.Kind == relayintel.KindPublicRelayList && report.CanonicalEventID != other {
+				t.Fatalf("source canonical = %s status=%s", report.CanonicalEventID, report.Status)
+			}
+			if report.ProjectionEventID == winner || report.CanonicalEventID == winner {
+				t.Fatalf("deleted winner still reported: %+v", report)
+			}
+		}
+	})
+	t.Run("ordinary older replay does not replace a live head", func(t *testing.T) {
+		owner, winner, other := pubkey(), id(), id()
+		seed(t, owner, winner, other, 30, 10)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := relayintel.Project(ctx, tx, relayintel.EventInput{
+			Pubkey: owner, EventID: other, Kind: relayintel.KindPublicRelayList, CreatedAt: 10,
+			Tags: [][]string{{"r", "wss://kept.example"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var head string
+		if err := pool.QueryRow(ctx, `SELECT event_id FROM relay_config_heads WHERE pubkey = $1 AND source_kind = 10002`, owner).Scan(&head); err != nil {
+			t.Fatal(err)
+		}
+		if head != winner {
+			t.Fatalf("live head changed to %s", head)
+		}
+	})
+}
+
+func TestNonRelayRepairChecksDependentProjections(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	owner := fmt.Sprintf("%064x", 80)
+	newer := fmt.Sprintf("%064x", 81)
+	older := fmt.Sprintf("%064x", 82)
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: newer, pubkey: owner, kind: 0, created: 30, content: `{"name":"new"}`,
+	})
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: older, pubkey: owner, kind: 0, created: 10, content: `{"name":"old"}`,
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+		VALUES ($1, 0, '', $2, 30, 1)
+	`, owner, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO profiles_latest (
+			pubkey, metadata_event_id, metadata_created_at, name, profile_json, derivation_version
+		) VALUES ($1, $2, 30, 'new', '{"name":"new"}', 1)
+	`, owner, newer); err != nil {
+		t.Fatal(err)
+	}
+	tomb := fmt.Sprintf("%064x", 83)
+	insertStoredEvent(t, ctx, pool, storedEvent{id: tomb, pubkey: owner, kind: 5, created: 40})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO deletion_events (event_id, deleter_pubkey, target_event_id, created_at, derivation_version)
+		VALUES ($1, $2, $3, 40, 1)
+	`, tomb, owner, newer); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	if stateWinner(t, ctx, pool, owner, 0, "") != older {
+		t.Fatal("profile canonical state did not move to the remaining event")
+	}
+	var profile string
+	if err := pool.QueryRow(ctx, `SELECT metadata_event_id FROM profiles_latest WHERE pubkey = $1`, owner).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile == older {
+		t.Fatal("profile projection changed before derivation")
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, newer).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "deleted" || status == "completed" {
+		t.Fatalf("profile repair completed with a stale projection: %s", status)
+	}
+	callRepair(t, ctx, pool)
+	if jobsFor(t, ctx, pool, older) != 1 {
+		t.Fatal("interrupted profile repair created another job")
+	}
+	finishDerivation(t, ctx, pool, older)
+	if err := pool.QueryRow(ctx, `SELECT metadata_event_id FROM profiles_latest WHERE pubkey = $1`, owner).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile != older {
+		t.Fatalf("profile projection = %s", profile)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE profiles_latest SET metadata_event_id = $2 WHERE pubkey = $1`, owner, newer); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, newer).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "deleted" || status == "completed" {
+		t.Fatal("stale profile projection was accepted")
+	}
+	finishDerivation(t, ctx, pool, older)
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, newer).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deleted" {
+		t.Fatalf("profile repair status = %s", status)
+	}
+
+	contactOwner := fmt.Sprintf("%064x", 90)
+	contactNew := fmt.Sprintf("%064x", 91)
+	contactOld := fmt.Sprintf("%064x", 92)
+	follow := fmt.Sprintf("%064x", 93)
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: contactNew, pubkey: contactOwner, kind: 3, created: 30,
+		tags: [][]string{{"p", follow}},
+	})
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: contactOld, pubkey: contactOwner, kind: 3, created: 10,
+		tags: [][]string{{"p", follow}, {"r", "wss://legacy.example"}},
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+		VALUES ($1, 3, '', $2, 30, 1)
+	`, contactOwner, contactNew); err != nil {
+		t.Fatal(err)
+	}
+	contactTomb := fmt.Sprintf("%064x", 94)
+	insertStoredEvent(t, ctx, pool, storedEvent{id: contactTomb, pubkey: contactOwner, kind: 5, created: 40})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO deletion_events (event_id, deleter_pubkey, target_event_id, created_at, derivation_version)
+		VALUES ($1, $2, $3, 40, 1)
+	`, contactTomb, contactOwner, contactNew); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	finishDerivation(t, ctx, pool, contactOld)
+	callRepair(t, ctx, pool)
+	var contactEvent string
+	if err := pool.QueryRow(ctx, `SELECT event_id FROM contact_lists_latest WHERE pubkey = $1`, contactOwner).Scan(&contactEvent); err != nil {
+		t.Fatal(err)
+	}
+	if contactEvent != contactOld {
+		t.Fatalf("contact list = %s", contactEvent)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, contactNew).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deleted" {
+		t.Fatalf("contact repair status = %s", status)
+	}
+
+	live := fmt.Sprintf("%064x", 95)
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: live, pubkey: owner, kind: 0, created: 60, content: `{"name":"live"}`,
+	})
+	finishDerivation(t, ctx, pool, live)
+	if stateWinner(t, ctx, pool, owner, 0, "") != live {
+		t.Fatal("a newer profile did not supersede the repaired event")
 	}
 }
 
@@ -795,6 +1302,7 @@ type storedEvent struct {
 	id, pubkey string
 	kind       int
 	created    int64
+	content    string
 	tags       [][]string
 }
 
@@ -811,14 +1319,14 @@ func insertStoredEvent(t *testing.T, ctx context.Context, pool *pgxpool.Pool, it
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"id": item.id, "pubkey": item.pubkey, "created_at": item.created, "kind": item.kind,
-		"tags": item.tags, "content": "", "sig": strings.Repeat("c", 128),
+		"tags": item.tags, "content": item.content, "sig": strings.Repeat("c", 128),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	event := model.Event{
 		ID: item.id, Pubkey: item.pubkey, CreatedAt: item.created, Kind: item.kind,
-		Sig: strings.Repeat("c", 128), Content: "", RawJSON: raw,
+		Sig: strings.Repeat("c", 128), Content: item.content, RawJSON: raw,
 		FirstSeenAt: time.Now().UTC(), InsertedAt: time.Now().UTC(),
 	}
 	if err := store.NewPostgresStore(pool).InsertCanonicalEvent(ctx, event, item.tags, "wss://relay.example", time.Now().UTC()); err != nil {
