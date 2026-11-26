@@ -546,29 +546,31 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			relay.Custom = isCustom
 			relay.Covers = covers
 			if rc.MinReliability > 0 && relay.Components.Reliability < rc.MinReliability {
-				if relay.IneligibleReason == "" {
-					relay.IneligibleReason = "min_reliability"
-				}
-				if !isPinned {
-					relay.Eligible = false
-				}
+				relay.Violations = append(relay.Violations, Violation{
+					Code: "min_reliability", Role: role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+					Text: "Reliability is below the requested minimum.",
+				})
 			}
 			if rc.MinCapabilityConfidence > 0 && capabilityConfidence(role, relay.Capabilities) < rc.MinCapabilityConfidence {
-				if relay.IneligibleReason == "" {
-					relay.IneligibleReason = "min_capability_confidence"
-				}
-				if !isPinned {
-					relay.Eligible = false
-				}
+				relay.Violations = append(relay.Violations, Violation{
+					Code: "min_capability_confidence", Role: role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+					Text: "Capability confidence is below the requested minimum.",
+				})
 			}
 			if _, banned := excluded[item.URL]; banned && isPinned {
 				out.ConstraintsSatisfied = false
 				out.Unsatisfied = append(out.Unsatisfied, Reason{Code: "pinned_excluded", Text: "A relay is both pinned and excluded. The pin was kept."})
 			}
-			if _, banned := excluded[item.URL]; banned && !isPinned {
-				relay.Eligible = false
-				if relay.IneligibleReason == "" {
-					relay.IneligibleReason = "excluded"
+			if _, banned := excluded[item.URL]; banned {
+				relay.Violations = append(relay.Violations, Violation{
+					Code: "excluded", Role: role, Severity: "exclusion", Hard: true, ManualRetention: true, BlocksSigning: true,
+					Text: "The request excludes this relay.",
+				})
+			}
+			if len(relay.Violations) > 0 {
+				relay.IneligibleReason = primaryReason(relay.Violations)
+				if absoluteProhibition(relay) || !isPinned {
+					relay.Eligible = false
 				}
 			}
 			if relay.Score == nil {
@@ -647,6 +649,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		}}
 	}
 	out.Proposal.ReadyToSign = out.Proposal.Safe && out.Proposal.SourceComplete && out.ConstraintsSatisfied &&
+		len(out.Proposal.Blocking) == 0 &&
 		!out.Proposal.RequiresRefresh && !out.Proposal.RequiresReview &&
 		(out.Proposal.PublicRelays != nil || len(out.Proposal.Lists) > 0)
 	if len(out.Fallbacks) == 0 && out.Cohort.Used == "personalized" {
@@ -681,6 +684,10 @@ func buildProposal(account AccountConfig, roles []builtRole, resolved map[string
 	}
 	for _, item := range notes {
 		if _, ok := keys[sourceKey(item.kind, item.dTag)]; !ok {
+			continue
+		}
+		if item.reason.Code == "projection_stale" || item.reason.Code == "projection_missing" {
+			proposal.Warnings = append(proposal.Warnings, item.reason)
 			continue
 		}
 		proposal.Blocking = append(proposal.Blocking, item.reason)
@@ -1073,7 +1080,7 @@ func reconcileSelection(selection SelectResult, scored map[string]ScoredRelay, m
 		if !ok {
 			continue
 		}
-		if relay.IneligibleReason == "blocked_by_account" || (hardIneligible(relay) && !relay.Pinned) {
+		if absoluteProhibition(relay) || (hardIneligible(relay) && !relay.Pinned) {
 			selection.ConstraintsSatisfied = false
 			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: relay.IneligibleReason, Text: "A prohibited relay was removed from the final list."})
 			continue
@@ -1314,7 +1321,7 @@ func keepInvestigations(selected []SelectedRelay, recs []Recommendation, scored 
 			continue
 		}
 		// Uncertain health is not permission to keep an excluded or blocked relay.
-		if relay.IneligibleReason == "excluded" || relay.IneligibleReason == "blocked_by_account" {
+		if absoluteProhibition(relay) || hasViolation(relay, "excluded") {
 			continue
 		}
 		if hardIneligible(relay) && !relay.Pinned {

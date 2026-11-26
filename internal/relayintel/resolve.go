@@ -48,6 +48,11 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[
 	if err != nil {
 		return AccountConfig{}, nil, nil, err
 	}
+	winners, err := loadCanonical(ctx, tx, pubkey)
+	if err != nil {
+		return AccountConfig{}, nil, nil, err
+	}
+	heads, canonNotes := preferCanonical(heads, winners)
 	ids := make([]string, 0, len(heads)+len(client))
 	for _, head := range heads {
 		if head.EventID != "" {
@@ -71,7 +76,75 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[
 		return AccountConfig{}, nil, nil, err
 	}
 	account, resolved, notes := applyAuthoritative(pubkey, heads, members, indexed, client, deleted)
+	notes = append(notes, canonNotes...)
 	return account, resolved, notes, nil
+}
+
+type canonicalWinner struct {
+	Kind      int
+	DTag      string
+	EventID   string
+	CreatedAt int64
+}
+
+func loadCanonical(ctx context.Context, pool dbQuery, pubkey string) ([]canonicalWinner, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT kind, d_tag, event_id, created_at
+		FROM replaceable_state
+		WHERE pubkey = $1
+	`, pubkey)
+	if err != nil {
+		if SchemaMissing(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	var out []canonicalWinner
+	for rows.Next() {
+		var row canonicalWinner
+		if err := rows.Scan(&row.Kind, &row.DTag, &row.EventID, &row.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// preferCanonical replaces a relay projection head when canonical replaceable
+// state has a newer winner. It does not downgrade a newer projection.
+func preferCanonical(heads []Head, winners []canonicalWinner) ([]Head, []sourceNote) {
+	index := map[string]int{}
+	for i, head := range heads {
+		index[sourceKey(head.SourceKind, head.DTag)] = i
+	}
+	var notes []sourceNote
+	for _, winner := range winners {
+		if winner.EventID == "" || !HandlesKind(winner.Kind) {
+			continue
+		}
+		key := sourceKey(winner.Kind, winner.DTag)
+		position, ok := index[key]
+		if !ok {
+			heads = append(heads, Head{
+				SourceKind: winner.Kind, DTag: winner.DTag, EventID: winner.EventID, CreatedAt: winner.CreatedAt,
+				DeclarationSource: SourceModern,
+			})
+			index[key] = len(heads) - 1
+			notes = append(notes, sourceNote{kind: winner.Kind, dTag: winner.DTag, reason: Reason{Code: "projection_missing", Text: "Canonical replaceable state has a winner that the relay projection has not stored yet."}})
+			continue
+		}
+		head := heads[position]
+		if head.EventID == winner.EventID {
+			continue
+		}
+		if nostr.Supersedes(winner.CreatedAt, winner.EventID, head.CreatedAt, head.EventID) {
+			heads[position].EventID = winner.EventID
+			heads[position].CreatedAt = winner.CreatedAt
+			notes = append(notes, sourceNote{kind: winner.Kind, dTag: winner.DTag, reason: Reason{Code: "projection_stale", Text: "The relay projection is older than the canonical replaceable winner. The canonical event was used."}})
+		}
+	}
+	return heads, notes
 }
 
 func loadDeletions(ctx context.Context, pool dbQuery, pubkey string, ids []string) (deletionView, error) {
@@ -384,6 +457,31 @@ func mergeKeyPackageConstraints(c *Constraints) []Reason {
 	if kp.MinCapabilityConfidence != nil && (ob.MinCapabilityConfidence == nil || *kp.MinCapabilityConfidence > *ob.MinCapabilityConfidence) {
 		value := *kp.MinCapabilityConfidence
 		ob.MinCapabilityConfidence = &value
+	}
+	if kp.MinReliability != nil && (ob.MinReliability == nil || *kp.MinReliability > *ob.MinReliability) {
+		value := *kp.MinReliability
+		ob.MinReliability = &value
+	}
+	if preferred := unionStrings(derefStrings(ob.Preferred), derefStrings(kp.Preferred)); ob.Preferred != nil || kp.Preferred != nil {
+		ob.Preferred = &preferred
+	}
+	if custom := unionStrings(derefStrings(ob.Custom), derefStrings(kp.Custom)); ob.Custom != nil || kp.Custom != nil {
+		ob.Custom = &custom
+	}
+	if paid := unionStrings(derefStrings(ob.PaidAccess), derefStrings(kp.PaidAccess)); ob.PaidAccess != nil || kp.PaidAccess != nil {
+		ob.PaidAccess = &paid
+	}
+	if kp.FreeOnly != nil && (ob.FreeOnly == nil || *kp.FreeOnly) {
+		value := *kp.FreeOnly
+		ob.FreeOnly = &value
+	}
+	if kp.Diversity != nil && (ob.Diversity == nil || *kp.Diversity < *ob.Diversity) {
+		value := *kp.Diversity
+		ob.Diversity = &value
+	}
+	if kp.RetainExisting != nil && (ob.RetainExisting == nil || *kp.RetainExisting) {
+		value := *kp.RetainExisting
+		ob.RetainExisting = &value
 	}
 	if ob.AuthRead == "" {
 		ob.AuthRead = kp.AuthRead

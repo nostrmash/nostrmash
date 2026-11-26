@@ -173,20 +173,95 @@ func confirmProposal(result PatchResult, in PatchInput) PatchResult {
 	if err != nil || parsed.Head.Truncated {
 		return rejectProposal(result)
 	}
+	var source struct {
+		Content string     `json:"content"`
+		Tags    [][]string `json:"tags"`
+	}
+	if len(in.Source) > 0 && json.Unmarshal(in.Source, &source) != nil {
+		return rejectProposal(result)
+	}
+	if result.Event.Content != source.Content {
+		return rejectProposal(result)
+	}
+	if in.ExpectedKind == KindRelaySet && firstD(result.Event.Tags) != firstD(source.Tags) {
+		return rejectProposal(result)
+	}
+	if !sameUnmanagedTags(source.Tags, result.Event.Tags, in) {
+		return rejectProposal(result)
+	}
+	blossom := in.TagName == "server" || in.ExpectedKind == KindBlossomServers
 	switch {
 	case in.InboxOptimized || in.OutboxOptimized:
-		if in.InboxOptimized && !sameRelaySet(urlsForRole(parsed, RolePublicInbox), in.Inbox) {
+		sourceParsed, sourceErr := Parse(EventInput{
+			Pubkey: result.Event.Pubkey, EventID: eventID, Kind: result.Event.Kind, Content: source.Content,
+			Tags: source.Tags, EndpointLimit: maxAuthoritativeEndpoints,
+		})
+		if sourceErr != nil {
 			return rejectProposal(result)
 		}
-		if in.OutboxOptimized && !sameRelaySet(urlsForRole(parsed, RolePublicOutbox), in.Outbox) {
+		if in.InboxOptimized && !sameEndpoints(urlsForRole(parsed, RolePublicInbox), in.Inbox, false) {
+			return rejectProposal(result)
+		}
+		if !in.InboxOptimized && !sameEndpoints(urlsForRole(parsed, RolePublicInbox), urlsForRole(sourceParsed, RolePublicInbox), false) {
+			return rejectProposal(result)
+		}
+		if in.OutboxOptimized && !sameEndpoints(urlsForRole(parsed, RolePublicOutbox), in.Outbox, false) {
+			return rejectProposal(result)
+		}
+		if !in.OutboxOptimized && !sameEndpoints(urlsForRole(parsed, RolePublicOutbox), urlsForRole(sourceParsed, RolePublicOutbox), false) {
+			return rejectProposal(result)
+		}
+	case in.ListOptimized && blossom:
+		if !sameOrderedEndpoints(urlsForRole(parsed, ""), in.Desired, true) {
 			return rejectProposal(result)
 		}
 	case in.ListOptimized:
-		if !sameRelaySet(urlsForRole(parsed, ""), in.Desired) {
+		if !sameEndpoints(urlsForRole(parsed, ""), in.Desired, false) {
 			return rejectProposal(result)
 		}
 	}
 	return result
+}
+
+func sameUnmanagedTags(source, next [][]string, in PatchInput) bool {
+	left := unmanagedTags(source, in)
+	right := unmanagedTags(next, in)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if len(left[i]) != len(right[i]) {
+			return false
+		}
+		for j := range left[i] {
+			if left[i][j] != right[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func unmanagedTags(tags [][]string, in PatchInput) [][]string {
+	out := make([][]string, 0)
+	for _, tag := range tags {
+		if len(tag) == 0 {
+			continue
+		}
+		if in.InboxOptimized || in.OutboxOptimized {
+			if tag[0] == "r" {
+				if _, known := knownMarker(tag); known {
+					continue
+				}
+			}
+		} else if in.ListOptimized && managedTag(tag[0], in.TagName) {
+			if _, known := knownMarker(tag); known || tag[0] != "r" {
+				continue
+			}
+		}
+		out = append(out, tag)
+	}
+	return out
 }
 
 func rejectProposal(result PatchResult) PatchResult {
@@ -210,26 +285,51 @@ func urlsForRole(parsed Parsed, role string) []string {
 }
 
 func sameRelaySet(got, want []string) bool {
-	left, right := map[string]struct{}{}, map[string]struct{}{}
+	return sameEndpoints(got, want, false)
+}
+
+func sameEndpoints(got, want []string, blossom bool) bool {
+	left, right := map[string]int{}, map[string]int{}
 	for _, raw := range got {
-		if norm, ok := canonicalRelay(raw); ok {
-			left[norm] = struct{}{}
-		}
+		left[endpointKey(raw, blossom)]++
 	}
 	for _, raw := range want {
-		if norm, ok := canonicalRelay(raw); ok {
-			right[norm] = struct{}{}
-		}
+		right[endpointKey(raw, blossom)]++
 	}
 	if len(left) != len(right) {
 		return false
 	}
-	for item := range left {
-		if _, ok := right[item]; !ok {
+	for item, count := range left {
+		if right[item] != count {
 			return false
 		}
 	}
 	return true
+}
+
+func sameOrderedEndpoints(got, want []string, blossom bool) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if endpointKey(got[i], blossom) != endpointKey(want[i], blossom) {
+			return false
+		}
+	}
+	return true
+}
+
+func endpointKey(raw string, blossom bool) string {
+	if blossom {
+		if normalized, err := NormalizeBlossomURL(raw); err == nil {
+			return normalized
+		}
+		return raw
+	}
+	if normalized, ok := canonicalRelay(raw); ok {
+		return normalized
+	}
+	return raw
 }
 
 type relayMark struct {
