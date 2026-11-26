@@ -122,7 +122,10 @@ func (p *probeState) exchangeGiftWrap(ctx context.Context, pool *pgxpool.Pool, r
 		return giftWrapEvidence{Outcome: "error"}
 	}
 	author, _ := event["pubkey"].(string)
-	if err := registerSyntheticIdentityUntil(ctx, pool, author, time.Now().Add(30*24*time.Hour)); err != nil {
+	// Durable registration. Raw events and search documents can outlive a
+	// 30-day expiry, and an expired row would let a later replay treat the
+	// author as ordinary.
+	if err := registerSyntheticIdentity(ctx, pool, author); err != nil {
 		metrics.IncRelayIntelProbe("giftwrap", "error")
 		return giftWrapEvidence{Outcome: "error"}
 	}
@@ -261,7 +264,7 @@ func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key,
 		}
 		metrics.IncRelayIntelProbe("giftwrap", "inconclusive")
 	}
-	return commitProbeResult(ctx, pool, key, token, probeCompletion{AttemptStatus: attemptStatus, Writes: writes})
+	return commitProbeResult(ctx, pool, key, token, stampEvidence(probeCompletion{AttemptStatus: attemptStatus, Writes: writes}))
 }
 
 func giftWrapPathWrites(evidence giftWrapEvidence) []observationWrite {
@@ -297,31 +300,143 @@ func giftWrapPathWrites(evidence giftWrapEvidence) []observationWrite {
 	} else if evidence.Checked && evidence.RecipientExact.Authenticated && evidence.RecipientTag.Authenticated && evidence.RecipientExact.SubscriptionComplete && evidence.RecipientTag.SubscriptionComplete {
 		writes = append(writes, observationWrite{Capability: CapGiftWrapRecipient, Status: StatusVerified, Detail: "authenticated_recipient_miss", Confidence: 0.6, Retrieved: boolPtr(false)})
 	}
-	unauth := unauthenticatedExposure(evidence)
-	authExposure := evidence.ObserverExact.HitAfterAuth || evidence.ObserverTag.HitAfterAuth || evidence.AnonExact.HitAfterAuth || evidence.AnonTag.HitAfterAuth
-	if evidence.Checked || unauth || authExposure {
-		writes = append(writes,
-			observationWrite{Capability: CapGiftWrapUnauthExposure, Status: StatusVerified, Detail: "unauthenticated_exposure", Confidence: 0.8, Retrieved: boolPtr(unauth), Unauthenticated: boolPtr(unauth)},
-			observationWrite{Capability: CapGiftWrapAuthExposure, Status: StatusVerified, Detail: "authenticated_observer_exposure", Confidence: 0.8, Retrieved: boolPtr(authExposure), Authenticated: boolPtr(authExposure)},
-		)
+	if status, retrieved, ok := aggregateUnauthenticatedExposure(evidence); ok {
+		writes = append(writes, observationWrite{
+			Capability: CapGiftWrapUnauthExposure, Status: status, Detail: "unauthenticated_exposure",
+			Confidence: exposureConfidence(status), Retrieved: retrieved, Unauthenticated: retrieved,
+		})
+	}
+	if status, retrieved, ok := aggregateAuthenticatedExposure(evidence); ok {
+		writes = append(writes, observationWrite{
+			Capability: CapGiftWrapAuthExposure, Status: status, Detail: "authenticated_observer_exposure",
+			Confidence: exposureConfidence(status), Retrieved: retrieved, Authenticated: retrieved,
+		})
 	}
 	return writes
 }
 
+func exposureConfidence(status string) float64 {
+	if status == StatusVerified {
+		return 0.8
+	}
+	return 0.35
+}
+
+func aggregateUnauthenticatedExposure(evidence giftWrapEvidence) (string, *bool, bool) {
+	paths := []accessResult{
+		evidence.RecipientExact, evidence.RecipientTag, evidence.ObserverExact, evidence.ObserverTag, evidence.AnonExact, evidence.AnonTag,
+	}
+	return aggregateExposure(paths, unauthenticatedHit, negativeUnauthenticated)
+}
+
+func aggregateAuthenticatedExposure(evidence giftWrapEvidence) (string, *bool, bool) {
+	if authenticatedObserverHit(evidence.AnonExact) || authenticatedObserverHit(evidence.AnonTag) {
+		return StatusVerified, boolPtr(true), true
+	}
+	return aggregateExposure(
+		[]accessResult{evidence.ObserverExact, evidence.ObserverTag},
+		authenticatedObserverHit, negativeAuthenticatedObserver,
+	)
+}
+
+func aggregateExposure(paths []accessResult, positive, negative func(accessResult) bool) (string, *bool, bool) {
+	seen := false
+	for _, path := range paths {
+		if path.Status != "" || positive(path) {
+			seen = true
+		}
+		if positive(path) {
+			return StatusVerified, boolPtr(true), true
+		}
+	}
+	if !seen {
+		return "", nil, false
+	}
+	for _, path := range paths {
+		if !negative(path) {
+			return "inconclusive", nil, true
+		}
+	}
+	return StatusVerified, boolPtr(false), true
+}
+
+func unauthenticatedHit(result accessResult) bool {
+	return result.RetrievedUnauthenticated || result.SeenBeforeAuth || (result.Hit && !result.Authenticated)
+}
+
+func authenticatedObserverHit(result accessResult) bool {
+	return result.Authenticated && result.HitAfterAuth
+}
+
+func negativeUnauthenticated(result accessResult) bool {
+	if unauthenticatedHit(result) {
+		return false
+	}
+	switch result.Status {
+	case "complete", "denied", "unauthorized", "auth_required":
+		return true
+	default:
+		return false
+	}
+}
+
+func negativeAuthenticatedObserver(result accessResult) bool {
+	if authenticatedObserverHit(result) || result.Hit || result.SeenBeforeAuth || result.RetrievedUnauthenticated {
+		return false
+	}
+	if result.Status == "denied" || result.Status == "unauthorized" {
+		return true
+	}
+	return result.Authenticated && result.Status == "complete"
+}
+
 func pathWrite(capability string, result accessResult) (observationWrite, bool) {
-	if result.Status == "" && !result.Hit && !result.SeenBeforeAuth && !result.RetrievedUnauthenticated {
+	if result.Status == "" && !result.Hit && !result.HitAfterAuth && !result.SeenBeforeAuth && !result.RetrievedUnauthenticated {
 		return observationWrite{}, false
 	}
-	retrieved := result.Hit || result.HitAfterAuth || result.RetrievedUnauthenticated || result.SeenBeforeAuth
+	recipient := capability == CapGiftWrapRecipientExact || capability == CapGiftWrapRecipientTag
+	unauth := unauthenticatedHit(result)
+	authenticatedRetrieval := result.Authenticated && result.HitAfterAuth && result.Status == "complete"
 	write := observationWrite{
-		Capability: capability, Status: StatusVerified, Detail: result.Status, Confidence: 0.7,
-		Retrieved: boolPtr(retrieved), Unauthenticated: boolPtr(result.RetrievedUnauthenticated || result.SeenBeforeAuth),
-		Authenticated: boolPtr(result.Authenticated),
+		Capability: capability, Detail: result.Status,
+		Unauthenticated: boolPtr(unauth),
 	}
-	if result.Status != "complete" && result.Status != "denied" && result.Status != "auth_required" && result.Status != "unauthorized" && !retrieved {
+	if result.AuthAttempted || result.Authenticated {
+		write.Authenticated = boolPtr(result.Authenticated)
+	}
+	if recipient {
+		if authenticatedRetrieval {
+			write.Status = StatusVerified
+			write.Confidence = 0.8
+			write.Retrieved = boolPtr(true)
+			return write, true
+		}
+		if !unauth && result.Authenticated && result.Status == "complete" {
+			write.Status = StatusVerified
+			write.Confidence = 0.6
+			write.Retrieved = boolPtr(false)
+			return write, true
+		}
 		write.Status = "inconclusive"
 		write.Confidence = 0.35
+		return write, true
 	}
+	if unauth || result.Hit || result.HitAfterAuth {
+		write.Status = StatusVerified
+		write.Confidence = 0.8
+		write.Retrieved = boolPtr(true)
+		return write, true
+	}
+	if result.Status == "denied" || result.Status == "unauthorized" ||
+		(result.Status == "complete" && (!result.AuthAttempted || result.Authenticated)) ||
+		(result.Status == "auth_required" && !result.AuthAttempted) {
+		write.Status = StatusVerified
+		write.Confidence = 0.6
+		write.Retrieved = boolPtr(false)
+		return write, true
+	}
+	write.Status = "inconclusive"
+	write.Confidence = 0.35
 	return write, true
 }
 
@@ -351,17 +466,6 @@ func classifyGiftWrap(evidence giftWrapEvidence) string {
 		return "retrieved_privacy_unknown"
 	}
 	return "accepted_only"
-}
-
-func unauthenticatedExposure(evidence giftWrapEvidence) bool {
-	for _, result := range []accessResult{
-		evidence.RecipientExact, evidence.RecipientTag, evidence.ObserverExact, evidence.ObserverTag, evidence.AnonExact, evidence.AnonTag,
-	} {
-		if result.RetrievedUnauthenticated || result.SeenBeforeAuth || (result.Hit && !result.Authenticated) {
-			return true
-		}
-	}
-	return false
 }
 
 func unauthorizedRetrieval(evidence giftWrapEvidence) bool {

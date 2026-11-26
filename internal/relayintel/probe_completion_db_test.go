@@ -2,6 +2,7 @@ package relayintel
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -413,5 +414,159 @@ func TestConcurrentCleanupLeavesExecutingWork(t *testing.T) {
 	}
 	if status != "running" || token != "running-token" {
 		t.Fatalf("concurrent cleanup terminated active work: status=%s token=%s", status, token)
+	}
+}
+
+func TestSameStatusWithDifferentEvidenceIsNotIdentical(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "probe digest"), "probedigest")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	token := claimToken(t, ctx, pool, "wss://digest.example", CapGiftWrapPrivate, "digest.example", "worker-a", 20, 1)
+	when := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	first := probeCompletion{
+		AttemptStatus: "verified", ObservedAt: when, Endpoint: "wss://digest.example",
+		Writes: []observationWrite{{
+			Capability: CapGiftWrapPrivate, Status: StatusVerified, Detail: "recipient_only",
+			Confidence: 0.8, EvidenceVersion: ComprehensivePrivacyVersion, ObservedAt: when,
+		}},
+		Retention: &scheduledRetention{RelayURL: "wss://digest.example", EventID: strings.Repeat("a1", 32), Published: when.Add(-time.Hour)},
+	}
+	if err := commitProbeResult(ctx, pool, "wss://digest.example", token, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitProbeResult(ctx, pool, "wss://digest.example", token, first); err != errProbeAlreadyCompleted {
+		t.Fatalf("identical result err=%v", err)
+	}
+	different := first
+	different.Writes = []observationWrite{{
+		Capability: CapGiftWrapPublic, Status: StatusVerified, Detail: "retrieved_while_unauthenticated",
+		Confidence: 0.8, Retrieved: boolPtr(true), ObservedAt: when,
+	}}
+	different.Retention = &scheduledRetention{RelayURL: "wss://digest.example", EventID: strings.Repeat("b2", 32), Published: when}
+	if err := commitProbeResult(ctx, pool, "wss://digest.example", token, different); err == nil || errors.Is(err, errProbeAlreadyCompleted) {
+		t.Fatalf("different evidence was treated as the same completion: %v", err)
+	}
+	var samples, firstFollow, secondFollow int
+	var detail string
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_capability_samples WHERE url_key = 'wss://digest.example'`).Scan(&samples); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_followups WHERE event_id = $1`, strings.Repeat("a1", 32)).Scan(&firstFollow); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_followups WHERE event_id = $1`, strings.Repeat("b2", 32)).Scan(&secondFollow); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT detail->>'text' FROM relay_capability_observations WHERE url_key = 'wss://digest.example' AND capability = $1`, CapGiftWrapPrivate).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if samples != 1 || firstFollow != 1 || secondFollow != 0 || detail != "recipient_only" {
+		t.Fatalf("samples=%d first=%d second=%d detail=%s", samples, firstFollow, secondFollow, detail)
+	}
+}
+
+func TestOlderCompletionDoesNotReplaceNewerEvidence(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "probe time"), "probetime")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	newer := time.Now().UTC().Add(-time.Minute)
+	older := newer.Add(-2 * time.Hour)
+	token := claimToken(t, ctx, pool, "wss://time.example", CapGiftWrapPrivate, "time.example", "worker-a", 20, 1)
+	if err := commitProbeResult(ctx, pool, "wss://time.example", token, probeCompletion{
+		AttemptStatus: "verified", ObservedAt: newer,
+		Writes: []observationWrite{{
+			Capability: CapGiftWrapPublic, Status: StatusVerified, Detail: "exposed", Confidence: 0.8,
+			Retrieved: boolPtr(true), ObservedAt: newer,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE relay_probe_attempts SET started_at = now() - interval '2 minutes' WHERE url_key = 'wss://time.example'`); err != nil {
+		t.Fatal(err)
+	}
+	second := claimToken(t, ctx, pool, "wss://time.example", CapGiftWrapPrivate, "time.example", "worker-a", 20, 1)
+	if err := commitProbeResult(ctx, pool, "wss://time.example", second, probeCompletion{
+		AttemptStatus: "verified", ObservedAt: older,
+		Writes: []observationWrite{{
+			Capability: CapGiftWrapPublic, Status: StatusVerified, Detail: "older-exposure", Confidence: 0.4,
+			Retrieved: boolPtr(true), ObservedAt: older,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	var observed time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT detail->>'text', observed_at FROM relay_capability_observations
+		WHERE url_key = 'wss://time.example' AND capability = $1
+	`, CapGiftWrapPublic).Scan(&detail, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if detail != "exposed" || observed.Before(newer.Add(-time.Second)) {
+		t.Fatalf("older completion replaced newer evidence detail=%s at=%s", detail, observed)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE relay_probe_attempts SET started_at = now() - interval '2 minutes' WHERE url_key = 'wss://time.example'`); err != nil {
+		t.Fatal(err)
+	}
+	third := claimToken(t, ctx, pool, "wss://time.example", CapGiftWrapPrivate, "time.example", "worker-a", 20, 1)
+	if err := commitProbeResult(ctx, pool, "wss://time.example", third, probeCompletion{
+		AttemptStatus: "inconclusive", ObservedAt: time.Now().UTC(),
+		Writes: []observationWrite{{
+			Capability: CapGiftWrapPublic, Status: "inconclusive", Detail: "timeout", Confidence: 0.3,
+			ObservedAt: time.Now().UTC(),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT detail->>'text' FROM relay_capability_observations
+		WHERE url_key = 'wss://time.example' AND capability = $1
+	`, CapGiftWrapPublic).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail != "exposed" {
+		t.Fatalf("inconclusive attempt erased exposure: %s", detail)
+	}
+}
+
+func TestCooldownDeferralDoesNotSpin(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "probe cooldown"), "probecool")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_probe_attempts (url_key, capability, host, worker_id, lease_token, started_at, finished_at, status)
+		VALUES ('wss://cool.example', 'retention', 'cool.example', 'worker-old', 'expired-token', now() - interval '1 minute', now() - interval '30 seconds', 'expired')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	eventID := strings.Repeat("c3", 32)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_probe_followups (url_key, endpoint_url, event_id, capability, check_after, published_at, status)
+		VALUES ('wss://cool.example', 'wss://cool.example', $1, 'retention', now() - interval '1 minute', now() - interval '2 hours', 'pending')
+	`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	state := &probeState{worker: "worker-a", allowPrivate: true, globalLimit: 20, minInterval: 2 * time.Hour, allowlist: []string{"cool.example"}}
+	ok, err := state.followOne(ctx, pool)
+	if err != nil || ok {
+		t.Fatalf("cooldown deferral ok=%v err=%v", ok, err)
+	}
+	var attempts, deferrals int
+	var wait time.Duration
+	var check time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT attempts, deferrals, check_after FROM relay_probe_followups WHERE event_id = $1
+	`, eventID).Scan(&attempts, &deferrals, &check); err != nil {
+		t.Fatal(err)
+	}
+	wait = time.Until(check)
+	if attempts != 0 || deferrals != 1 || wait < time.Hour {
+		t.Fatalf("attempts=%d deferrals=%d wait=%s", attempts, deferrals, wait)
 	}
 }

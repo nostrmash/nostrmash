@@ -49,39 +49,18 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				INSERT INTO contact_lists_latest (
 					pubkey, event_id, created_at, contacts_json, derivation_version
 				)
-				VALUES ($1, $2, $3, $4, $5)
+				SELECT $1, $2, $3, $4, $5
+				WHERE relay_intel_may_project($1, 3, '', $2, $3, NULL::text, NULL::bigint)
 				ON CONFLICT (pubkey) DO UPDATE
 				SET event_id = EXCLUDED.event_id,
 				    created_at = EXCLUDED.created_at,
 				    contacts_json = EXCLUDED.contacts_json,
 				    derivation_version = EXCLUDED.derivation_version,
 				    updated_at = now()
-				WHERE EXCLUDED.created_at > contact_lists_latest.created_at
-				   OR (
-				       EXCLUDED.created_at = contact_lists_latest.created_at
-				       AND EXCLUDED.event_id < contact_lists_latest.event_id
-				   )
-				   OR EXCLUDED.event_id = contact_lists_latest.event_id
-				   OR (
-				       EXISTS (
-				           SELECT 1 FROM replaceable_state rs
-				           WHERE rs.pubkey = EXCLUDED.pubkey AND rs.kind = 3 AND rs.d_tag = ''
-				             AND rs.event_id = EXCLUDED.event_id
-				       )
-				       AND (
-				           EXISTS (
-				               SELECT 1 FROM deletion_events de
-				               WHERE de.target_event_id = contact_lists_latest.event_id
-				                 AND de.deleter_pubkey = contact_lists_latest.pubkey
-				           )
-				           OR EXISTS (
-				               SELECT 1 FROM deletion_addresses da
-				               WHERE da.pubkey = contact_lists_latest.pubkey
-				                 AND da.kind = 3
-				                 AND da.created_at >= contact_lists_latest.created_at
-				           )
-				       )
-				   )
+				WHERE relay_intel_may_project(
+				    EXCLUDED.pubkey, 3, '', EXCLUDED.event_id, EXCLUDED.created_at,
+				    contact_lists_latest.event_id, contact_lists_latest.created_at
+				)
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert contact_lists_latest: %w", err)
@@ -241,39 +220,18 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 				INSERT INTO relay_lists_latest (
 					pubkey, event_id, created_at, relays_json, derivation_version
 				)
-				VALUES ($1, $2, $3, $4, $5)
+				SELECT $1, $2, $3, $4, $5
+				WHERE relay_intel_may_project($1, 10002, '', $2, $3, NULL::text, NULL::bigint)
 				ON CONFLICT (pubkey) DO UPDATE
 				SET event_id = EXCLUDED.event_id,
 				    created_at = EXCLUDED.created_at,
 				    relays_json = EXCLUDED.relays_json,
 				    derivation_version = EXCLUDED.derivation_version,
 				    updated_at = now()
-				WHERE EXCLUDED.created_at > relay_lists_latest.created_at
-				   OR (
-				       EXCLUDED.created_at = relay_lists_latest.created_at
-				       AND EXCLUDED.event_id < relay_lists_latest.event_id
-				   )
-				   OR EXCLUDED.event_id = relay_lists_latest.event_id
-				   OR (
-				       EXISTS (
-				           SELECT 1 FROM replaceable_state rs
-				           WHERE rs.pubkey = EXCLUDED.pubkey AND rs.kind = 10002 AND rs.d_tag = ''
-				             AND rs.event_id = EXCLUDED.event_id
-				       )
-				       AND (
-				           EXISTS (
-				               SELECT 1 FROM deletion_events de
-				               WHERE de.target_event_id = relay_lists_latest.event_id
-				                 AND de.deleter_pubkey = relay_lists_latest.pubkey
-				           )
-				           OR EXISTS (
-				               SELECT 1 FROM deletion_addresses da
-				               WHERE da.pubkey = relay_lists_latest.pubkey
-				                 AND da.kind = 10002
-				                 AND da.created_at >= relay_lists_latest.created_at
-				           )
-				       )
-				   )
+				WHERE relay_intel_may_project(
+				    EXCLUDED.pubkey, 10002, '', EXCLUDED.event_id, EXCLUDED.created_at,
+				    relay_lists_latest.event_id, relay_lists_latest.created_at
+				)
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert relay_lists_latest: %w", err)
@@ -358,6 +316,9 @@ func (h *Handlers) projectReplaceableListLatest(
 	)
 	if err != nil {
 		return err
+	}
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, pubkey, requiredKind); err != nil {
+		return fmt.Errorf("lock replaceable list coordinate: %w", err)
 	}
 	if err := upsert(tx, pubkey, winnerID, winnerCreatedAt, payload, writeVersion); err != nil {
 		return err

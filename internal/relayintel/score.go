@@ -440,11 +440,48 @@ func privacyReport(caps map[string]Capability, now time.Time) PrivacyReport {
 	if report.ExposureObservedAt == nil {
 		report.ExposureObservedAt = latestTime(caps[CapGiftWrapUnauthExposure].ObservedAt, caps[CapGiftWrapAuthExposure].ObservedAt)
 	}
-	if publicSeen && report.Confidence == 0 {
-		report.Confidence = public.Confidence
-		report.Freshness = public.Freshness
+	governing := governingCapability(assessment, caps, now)
+	report.Confidence = governing.Confidence
+	report.Freshness = governing.Freshness
+	if report.Freshness == "" {
+		report.Freshness = freshnessLabel(observedAt(governing), now)
 	}
+	report.EvidenceVersion = governing.EvidenceVersion
 	return report
+}
+
+func governingCapability(assessment string, caps map[string]Capability, now time.Time) Capability {
+	switch assessment {
+	case "recipient_only_verified", "stale":
+		return caps[CapGiftWrapPrivate]
+	case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
+		return newestExposureCapability(caps, now)
+	default:
+		if caps[CapGiftWrapAccept].Status == StatusVerified {
+			return caps[CapGiftWrapAccept]
+		}
+		return caps[CapGiftWrapPrivate]
+	}
+}
+
+func newestExposureCapability(caps map[string]Capability, now time.Time) Capability {
+	var chosen Capability
+	var at time.Time
+	for _, capability := range []string{CapGiftWrapPublic, CapGiftWrapUnauthExposure, CapGiftWrapAuthExposure} {
+		cap := caps[capability]
+		if !exposureSeen(cap) {
+			continue
+		}
+		seen := observedAt(cap)
+		if seen.IsZero() {
+			seen = now
+		}
+		if at.IsZero() || seen.After(at) {
+			at = seen
+			chosen = cap
+		}
+	}
+	return chosen
 }
 
 func privacyAssessmentAt(caps map[string]Capability, now time.Time) string {

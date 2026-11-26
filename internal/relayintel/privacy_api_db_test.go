@@ -119,6 +119,111 @@ func TestCapabilityPrivacyAPI(t *testing.T) {
 	if publication.Privacy.PublicationAuthVerified == nil || !*publication.Privacy.PublicationAuthVerified || publication.Privacy.RecipientAuthVerified != nil {
 		t.Fatalf("publication auth = %+v", publication.Privacy)
 	}
+
+	insertObservation(t, ctx, pool, "wss://timeout.example", CapGiftWrapUnauthExposure, "inconclusive", 0.35, `{"text":"unauthenticated_exposure"}`, now)
+	insertObservation(t, ctx, pool, "wss://timeout.example", CapGiftWrapAuthExposure, "inconclusive", 0.35, `{"text":"authenticated_observer_exposure"}`, now)
+	insertObservation(t, ctx, pool, "wss://timeout.example", CapGiftWrapRecipientExact, StatusVerified, 0.6, `{"retrieved":false,"authenticated":true}`, now)
+	timeout, err := service.Capabilities(ctx, "wss://timeout.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout.Privacy.Assessment != "privacy_unknown" || timeout.Privacy.UnauthenticatedExposure != nil || timeout.Privacy.AuthenticatedObserverExposure != nil || timeout.Privacy.ExposureConfirmed || timeout.Privacy.RecipientExactVerified == nil || *timeout.Privacy.RecipientExactVerified {
+		t.Fatalf("incomplete exposure = %+v", timeout.Privacy)
+	}
+
+	insertObservation(t, ctx, pool, "wss://preauth.example", CapGiftWrapRecipientExact, "inconclusive", 0.35, `{"text":"complete","unauthenticated":true}`, now)
+	insertObservation(t, ctx, pool, "wss://preauth.example", CapGiftWrapUnauthExposure, StatusVerified, 0.8, `{"retrieved":true,"unauthenticated":true}`, now)
+	preauth, err := service.Capabilities(ctx, "wss://preauth.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preauth.Privacy.Assessment != "publicly_accessible" || preauth.Privacy.RecipientExactVerified != nil || preauth.Privacy.RecipientRetrievalVerified != nil || preauth.Privacy.UnauthenticatedExposure == nil || !*preauth.Privacy.UnauthenticatedExposure || !preauth.Privacy.ExposureConfirmed {
+		t.Fatalf("pre-auth retrieval = %+v", preauth.Privacy)
+	}
+
+	insertObservation(t, ctx, pool, "wss://both.example", CapGiftWrapRecipientExact, StatusVerified, 0.8, `{"retrieved":true,"authenticated":true,"unauthenticated":true}`, now)
+	insertObservation(t, ctx, pool, "wss://both.example", CapGiftWrapUnauthExposure, StatusVerified, 0.8, `{"retrieved":true,"unauthenticated":true}`, now)
+	both, err := service.Capabilities(ctx, "wss://both.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if both.Privacy.RecipientExactVerified == nil || !*both.Privacy.RecipientExactVerified || both.Privacy.UnauthenticatedExposure == nil || !*both.Privacy.UnauthenticatedExposure || both.Privacy.Assessment != "publicly_accessible" {
+		t.Fatalf("pre-auth plus authenticated retrieval = %+v", both.Privacy)
+	}
+
+	insertObservation(t, ctx, pool, "wss://negative.example", CapGiftWrapUnauthExposure, StatusVerified, 0.8, `{"retrieved":false}`, now)
+	insertObservation(t, ctx, pool, "wss://negative.example", CapGiftWrapAuthExposure, StatusVerified, 0.8, `{"retrieved":false}`, now)
+	insertObservation(t, ctx, pool, "wss://negative.example", CapGiftWrapRecipientExact, StatusVerified, 0.6, `{"retrieved":false}`, now)
+	insertObservation(t, ctx, pool, "wss://negative.example", CapGiftWrapRecipientTag, StatusVerified, 0.6, `{"retrieved":false}`, now)
+	negative, err := service.Capabilities(ctx, "wss://negative.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if negative.Privacy.Assessment != "privacy_unknown" || negative.Privacy.ExposureConfirmed || negative.Privacy.UnauthenticatedExposure == nil || *negative.Privacy.UnauthenticatedExposure || negative.Privacy.AuthenticatedObserverExposure == nil || *negative.Privacy.AuthenticatedObserverExposure || negative.Privacy.RecipientExactVerified == nil || *negative.Privacy.RecipientExactVerified || negative.Privacy.RecipientTagVerified == nil || *negative.Privacy.RecipientTagVerified {
+		t.Fatalf("complete negative = %+v", negative.Privacy)
+	}
+}
+
+func TestStackedMigrationsAreUniqueAndRepeatable(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "migration sequence"), "probemig")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT migration_id FROM schema_migrations_audit
+		WHERE migration_id >= 'migrations/000144'
+		  AND migration_id < 'migrations/000160'
+		ORDER BY migration_id
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"migrations/000144_relay_intel_projection_invariants.sql",
+		"migrations/000145_relay_probe_evidence_fence.sql",
+		"migrations/000146_relay_probe_followup_lease.sql",
+		"migrations/000147_relay_probe_followup_ownership.sql",
+		"migrations/000150_relay_probe_privacy_ownership.sql",
+		"migrations/000151_relay_probe_completion_digest.sql",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("migration sequence = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("migration sequence = %v", got)
+		}
+	}
+	var digestColumn bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'relay_probe_attempts'
+			  AND column_name = 'result_digest'
+		)
+	`).Scan(&digestColumn); err != nil {
+		t.Fatal(err)
+	}
+	if !digestColumn {
+		t.Fatal("result_digest was not created")
+	}
 }
 
 func insertObservation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, raw, capability, status string, confidence float64, detail string, at time.Time) {
