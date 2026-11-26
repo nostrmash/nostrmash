@@ -86,6 +86,10 @@ func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
 	if privacyAssessment(exposed) != "recipient_only_verified" {
 		t.Fatal(privacyAssessment(exposed))
 	}
+	report := privacyReport(exposed, now)
+	if !report.RecipientRetrievalVerified || report.ExposureUnresolved || !report.ExposureConfirmed {
+		t.Fatalf("privacy report = %+v", report)
+	}
 	if privacyAssessmentAt(map[string]Capability{
 		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale},
 	}, now) != "stale" {
@@ -95,6 +99,11 @@ func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
 		CapGiftWrapPublic: {Status: StatusStale, ObservedAt: &stale},
 	}, now) != "previous_exposure_unresolved" {
 		t.Fatal("a stale exposure disappeared")
+	}
+	if unresolved := privacyReport(map[string]Capability{
+		CapGiftWrapPublic: {Status: StatusStale, ObservedAt: &stale},
+	}, now); unresolved.RecipientRetrievalVerified || !unresolved.ExposureUnresolved {
+		t.Fatalf("unresolved exposure = %+v", unresolved)
 	}
 	if privacyAssessmentAt(map[string]Capability{
 		CapGiftWrapPublic:  {Status: StatusVerified, ObservedAt: &older},

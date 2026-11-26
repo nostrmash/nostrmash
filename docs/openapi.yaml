@@ -798,6 +798,15 @@ paths:
                   read_subscription: { status: observed, confidence: 0.68, source: read_probe }
                   search: { status: advertised, confidence: 0.4, source: nip11, detail: "NIP-50 is advertised and has not been verified" }
                   giftwrap: { status: unknown, confidence: 0.15, source: none }
+                privacy:
+                  assessment: privacy_unknown
+                  recipient_retrieval_verified: false
+                  gift_wrap_accepted: false
+                  exposure_confirmed: false
+                  exposure_unresolved: false
+                  recipient_auth_verified: false
+                  publication_auth_verified: false
+                  stale: false
         '400':
           $ref: '#/components/responses/Error'
         '404':

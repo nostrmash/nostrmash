@@ -73,8 +73,24 @@ type CapabilitiesResponse struct {
 	EndpointType   string                `json:"endpoint_type"`
 	AdmissionState string                `json:"admission_state,omitempty"`
 	Capabilities   map[string]Capability `json:"capabilities"`
+	Privacy        PrivacyReport         `json:"privacy"`
 	Propagation    Propagation           `json:"propagation"`
 	Note           string                `json:"note"`
+}
+
+// PrivacyReport is the effective gift-wrap assessment. Downstream clients use
+// these fields instead of parsing observation detail text.
+type PrivacyReport struct {
+	Assessment                 string     `json:"assessment"`
+	RecipientRetrievalVerified bool       `json:"recipient_retrieval_verified"`
+	GiftWrapAccepted           bool       `json:"gift_wrap_accepted"`
+	ExposureConfirmed          bool       `json:"exposure_confirmed"`
+	ExposureUnresolved         bool       `json:"exposure_unresolved"`
+	PrivateObservedAt          *time.Time `json:"private_observed_at,omitempty"`
+	ExposureObservedAt         *time.Time `json:"exposure_observed_at,omitempty"`
+	RecipientAuthVerified      bool       `json:"recipient_auth_verified"`
+	PublicationAuthVerified    bool       `json:"publication_auth_verified"`
+	Stale                      bool       `json:"stale"`
 }
 
 // NewService binds the service to a pool. A nil pool reports the schema as not ready.
@@ -344,8 +360,9 @@ func (s *Service) capabilities(ctx context.Context, item preparedURL) (Capabilit
 			Observations: observations[item.Key], Propagation: propagation[item.URL],
 		}),
 		Propagation: propagation[item.URL],
-		Note:        "Advertised NIP support is not verification. EOSE on a read subscription is not write, search, or gift-wrap proof. No measurement here claims mobile push delivery.",
+		Note:        "Advertised NIP support is not verification. EOSE on a read subscription is not write, search, or gift-wrap proof. privacy is the structured assessment; detail strings are diagnostic. No measurement here claims mobile push delivery.",
 	}
+	resp.Privacy = privacyReport(resp.Capabilities, now)
 	computed, ready, err := loadSnapshotTime(ctx, s.pool)
 	if err != nil {
 		return CapabilitiesResponse{}, err

@@ -410,6 +410,25 @@ func privacyAssessment(caps map[string]Capability) string {
 	return privacyAssessmentAt(caps, time.Now())
 }
 
+func privacyReport(caps map[string]Capability, now time.Time) PrivacyReport {
+	assessment := privacyAssessmentAt(caps, now)
+	public := caps[CapGiftWrapPublic]
+	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
+	publicSeen := public.Status == StatusVerified || public.Status == StatusStale || public.Status == StatusObserved
+	return PrivacyReport{
+		Assessment:                 assessment,
+		RecipientRetrievalVerified: assessment == "recipient_only_verified",
+		GiftWrapAccepted:           caps[CapGiftWrapAccept].Status == StatusVerified,
+		ExposureConfirmed:          publicSeen,
+		ExposureUnresolved:         assessment == "previous_exposure_unresolved",
+		PrivateObservedAt:          private.ObservedAt,
+		ExposureObservedAt:         public.ObservedAt,
+		RecipientAuthVerified:      caps[CapAuthGiftWrap].Status == StatusVerified,
+		PublicationAuthVerified:    caps[CapAuthWrite].Status == StatusVerified,
+		Stale:                      assessment == "stale",
+	}
+}
+
 func privacyAssessmentAt(caps map[string]Capability, now time.Time) string {
 	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
 	public := caps[CapGiftWrapPublic]
