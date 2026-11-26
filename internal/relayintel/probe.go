@@ -252,7 +252,15 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		metrics.IncRelayIntelProbe("search", "error")
 		return
 	}
-	if readWriteAck(conn, id, time.Now().Add(5*time.Second)) != "accepted" {
+	ack, authStatus := readWriteAckWithAuth(conn, id, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
+		return signAuth(p.key, p.pubkey, relayURL, challenge)
+	})
+	if pool != nil && authStatus == "ok" {
+		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusVerified, 0.7, "probe", "auth_succeeded")
+	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
+		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusRestricted, 0.6, "probe", authStatus)
+	}
+	if ack != "accepted" {
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 		return
 	}

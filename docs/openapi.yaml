@@ -786,7 +786,10 @@ paths:
             Advertised, observed, verified, unsupported, unknown, stale, and
             restricted capabilities. A successful kind-0 EOSE is read_subscription
             only. NIP-11 support for NIP-17, NIP-42, or NIP-50 is advertised,
-            not verified. This request performs no network I/O.
+            not verified. giftwrap is verified only when a synthetic recipient
+            retrieved the event and a completed observer query did not.
+            giftwrap_accept, giftwrap_private, and giftwrap_public are separate.
+            A kind 1 write does not verify keypackage. This request performs no network I/O.
           content:
             application/json:
               example:

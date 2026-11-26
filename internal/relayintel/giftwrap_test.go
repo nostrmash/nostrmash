@@ -13,6 +13,56 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestAuthChallengeMustMatchTheSubmittedEvent(t *testing.T) {
+	key := newKey(t)
+	pubkey := pubOf(key)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON([]any{"AUTH", "challenge-1"})
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var frame []json.RawMessage
+		if json.Unmarshal(payload, &frame) != nil || len(frame) < 2 {
+			return
+		}
+		var signed map[string]any
+		if json.Unmarshal(frame[1], &signed) != nil {
+			return
+		}
+		if signed["kind"] != float64(22242) {
+			return
+		}
+		_ = conn.WriteJSON([]any{"OK", "wanted", true, ""})
+	}))
+	defer server.Close()
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`["EVENT",{}]`))
+	ack, authStatus := readWriteAckWithAuth(conn, "wanted", time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+		if challenge != "challenge-1" {
+			t.Fatalf("challenge = %s", challenge)
+		}
+		return signAuth(key, pubkey, wsURL(server), challenge)
+	})
+	if ack != "accepted" || authStatus != "ok" {
+		t.Fatalf("ack=%s auth=%s", ack, authStatus)
+	}
+}
+
 func TestGiftWrapDecryptsOnlyForTheRecipient(t *testing.T) {
 	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
 	senderPub := pubOf(sender)

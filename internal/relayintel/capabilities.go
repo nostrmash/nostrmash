@@ -19,6 +19,7 @@ const (
 	CapGiftWrapPrivate = "giftwrap_private"
 	CapGiftWrapPublic  = "giftwrap_public"
 	CapAuthWrite       = "auth_write"
+	CapAuthSearch      = "auth_search"
 	CapAuthGiftWrap    = "auth_giftwrap"
 	CapKeyPackage      = "keypackage"
 	CapRetention       = "retention"
@@ -182,6 +183,7 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 		CapGiftWrapPrivate: {Name: CapGiftWrapPrivate, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
 		CapGiftWrapPublic:  {Name: CapGiftWrapPublic, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
 		CapAuthWrite:       {Name: CapAuthWrite, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapAuthSearch:      {Name: CapAuthSearch, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
 		CapAuthGiftWrap:    {Name: CapAuthGiftWrap, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
 		CapKeyPackage:      {Name: CapKeyPackage, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
 		CapRetention:       {Name: CapRetention, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
