@@ -1,3 +1,5 @@
+//go:build relayintelbench
+
 package api
 
 import (

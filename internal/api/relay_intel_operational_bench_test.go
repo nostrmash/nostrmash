@@ -1,3 +1,5 @@
+//go:build relayintelbench
+
 package api
 
 import (
@@ -100,41 +102,44 @@ func (q *queryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryE
 func (q *queryCounter) snapshot() int64 { return q.n.Load() }
 
 type opReport struct {
-	mu          sync.Mutex
-	path        string
-	GeneratedAt string         `json:"generated_at"`
-	Commit      string         `json:"commit"`
-	Scale       string         `json:"scale"`
-	Accounts    int            `json:"accounts"`
-	Environment map[string]any `json:"environment"`
-	Fixture     map[string]any `json:"fixture,omitempty"`
-	API         map[string]any `json:"api,omitempty"`
-	Maintenance map[string]any `json:"maintenance,omitempty"`
-	Probes      map[string]any `json:"probes,omitempty"`
-	Synthetic   map[string]any `json:"synthetic,omitempty"`
-	Storage     map[string]any `json:"storage,omitempty"`
-	WAL         map[string]any `json:"wal,omitempty"`
-	Mixed       []any          `json:"mixed,omitempty"`
-	Plans       []string       `json:"plans,omitempty"`
-	Notes       []string       `json:"notes,omitempty"`
+	mu                   sync.Mutex
+	path                 string
+	GeneratedAt          string         `json:"generated_at"`
+	Commit               string         `json:"commit"`
+	ImplementationCommit string         `json:"implementation_commit"`
+	Scale                string         `json:"scale"`
+	Accounts             int            `json:"accounts"`
+	Environment          map[string]any `json:"environment"`
+	Fixture              map[string]any `json:"fixture,omitempty"`
+	API                  map[string]any `json:"api,omitempty"`
+	Maintenance          map[string]any `json:"maintenance,omitempty"`
+	Probes               map[string]any `json:"probes,omitempty"`
+	Synthetic            map[string]any `json:"synthetic,omitempty"`
+	Storage              map[string]any `json:"storage,omitempty"`
+	WAL                  map[string]any `json:"wal,omitempty"`
+	Mixed                []any          `json:"mixed,omitempty"`
+	Plans                []string       `json:"plans,omitempty"`
+	Notes                []string       `json:"notes,omitempty"`
 }
 
 func newOpReport(path, scale string, accounts int) *opReport {
 	commit := strings.TrimSpace(commandOutput("git", "rev-parse", "HEAD"))
+	implementation := strings.TrimSpace(commandOutput("git", "rev-parse", "origin/feat/relay-capability-probes"))
 	return &opReport{
-		path:        path,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Commit:      commit,
-		Scale:       scale,
-		Accounts:    accounts,
-		Environment: map[string]any{},
-		API:         map[string]any{},
-		Maintenance: map[string]any{},
-		Probes:      map[string]any{},
-		Synthetic:   map[string]any{},
-		Storage:     map[string]any{},
-		WAL:         map[string]any{},
-		Notes:       []string{},
+		path:                 path,
+		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+		Commit:               commit,
+		ImplementationCommit: implementation,
+		Scale:                scale,
+		Accounts:             accounts,
+		Environment:          map[string]any{},
+		API:                  map[string]any{},
+		Maintenance:          map[string]any{},
+		Probes:               map[string]any{},
+		Synthetic:            map[string]any{},
+		Storage:              map[string]any{},
+		WAL:                  map[string]any{},
+		Notes:                []string{},
 	}
 }
 

@@ -1087,36 +1087,6 @@ func signProbeEvent(priv *btcec.PrivateKey, pubkey string) (map[string]any, erro
 	}, nil
 }
 
-// ProbeEvidence is one capability sample written for a live lease.
-type ProbeEvidence struct {
-	Capability string
-	Status     string
-	Detail     string
-	Confidence float64
-}
-
-// RecordProbeEvidence stores one sample with the worker lease check.
-// It does not dial a relay.
-func RecordProbeEvidence(ctx context.Context, pool *pgxpool.Pool, urlKey, capability, status string, confidence float64, detail, leaseToken string) error {
-	return storeObservation(ctx, pool, urlKey, capability, status, confidence, "probe", detail, leaseToken)
-}
-
-// FinishProbeLease writes evidence, closes the attempt, and completes a
-// retention follow-up when followupID is positive. followupID 0 skips that
-// update. This is the worker commit path and it does not dial a relay.
-func FinishProbeLease(ctx context.Context, pool *pgxpool.Pool, urlKey, leaseToken, attemptStatus string, followupID int64, followStatus, followResult string, elapsedSeconds int, writes []ProbeEvidence) error {
-	items := make([]observationWrite, len(writes))
-	for i, write := range writes {
-		items[i] = observationWrite{
-			Capability: write.Capability,
-			Status:     write.Status,
-			Detail:     write.Detail,
-			Confidence: write.Confidence,
-		}
-	}
-	return commitProbeResult(ctx, pool, urlKey, leaseToken, attemptStatus, followupID, followStatus, followResult, elapsedSeconds, items)
-}
-
 func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, status string, confidence float64, source, detail, token string) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {

@@ -1,0 +1,132 @@
+
+## effective membership one account
+Subquery Scan on "*SELECT* 1"  (cost=0.99..120.89 rows=1 width=22) (actual time=0.030..0.040 rows=3.00 loops=1)
+  Buffers: shared hit=20
+  ->  Nested Loop Anti Join  (cost=0.99..120.88 rows=1 width=259) (actual time=0.030..0.039 rows=3.00 loops=1)
+        Join Filter: (de.target_event_id = h.event_id)
+        Buffers: shared hit=20
+        ->  Nested Loop Anti Join  (cost=0.99..118.37 rows=1 width=152) (actual time=0.025..0.030 rows=3.00 loops=1)
+              Buffers: shared hit=14
+              ->  Nested Loop  (cost=0.84..113.18 rows=1 width=165) (actual time=0.020..0.023 rows=3.00 loops=1)
+                    Join Filter: ((h.source_kind = m.source_kind) AND (h.d_tag = m.d_tag) AND (h.event_id = m.source_event_id))
+                    Rows Removed by Join Filter: 15
+                    Buffers: shared hit=8
+                    ->  Index Scan using relay_config_heads_pkey on relay_config_heads h  (cost=0.42..20.49 rows=4 width=143) (actual time=0.007..0.008 rows=6.00 loops=1)
+                          Index Cond: (pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text)
+                          Filter: (NOT client_side_only)
+                          Index Searches: 1
+                          Buffers: shared hit=4
+                    ->  Materialize  (cost=0.42..92.07 rows=8 width=157) (actual time=0.002..0.002 rows=3.00 loops=6)
+                          Storage: Memory  Maximum Storage: 17kB
+                          Buffers: shared hit=4
+                          ->  Index Scan using idx_relay_role_memberships_pubkey_role on relay_role_memberships m  (cost=0.42..92.03 rows=8 width=157) (actual time=0.008..0.008 rows=3.00 loops=1)
+                                Index Cond: ((pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text) AND (role = 'public_inbox'::text))
+                                Filter: (public_safe AND ((source_kind <> 10051) OR (NOT EXISTS(SubPlan 3))) AND ((source_kind <> 3) OR (role <> ALL ('{public_inbox,public_outbox}'::text[])) OR (NOT EXISTS(SubPlan 1))))
+                                Index Searches: 1
+                                Buffers: shared hit=4
+                                SubPlan 3
+                                  ->  Index Only Scan using relay_config_heads_pkey on relay_config_heads modern_1  (cost=0.42..4.44 rows=1 width=0) (never executed)
+                                        Index Cond: ((pubkey = m.pubkey) AND (source_kind = 10002) AND (d_tag = ''::text))
+                                        Heap Fetches: 0
+                                        Index Searches: 0
+                                SubPlan 1
+                                  ->  Index Only Scan using relay_config_heads_pkey on relay_config_heads modern  (cost=0.42..4.44 rows=1 width=0) (never executed)
+                                        Index Cond: ((pubkey = m.pubkey) AND (source_kind = 10002) AND (d_tag = ''::text))
+                                        Heap Fetches: 0
+                                        Index Searches: 0
+              ->  Index Only Scan using idx_deletion_addresses_coord on deletion_addresses d  (cost=0.15..5.17 rows=1 width=76) (actual time=0.002..0.002 rows=0.00 loops=3)
+                    Index Cond: ((pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text) AND (kind = h.source_kind) AND (d_tag = h.d_tag) AND (created_at >= h.created_at))
+                    Heap Fetches: 0
+                    Index Searches: 3
+                    Buffers: shared hit=6
+        ->  Seq Scan on deletion_events de  (cost=0.00..2.50 rows=1 width=130) (actual time=0.002..0.003 rows=0.00 loops=3)
+              Filter: (deleter_pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text)
+              Rows Removed by Filter: 40
+              Buffers: shared hit=6
+Planning:
+  Buffers: shared hit=34
+Planning Time: 0.569 ms
+Execution Time: 0.084 ms
+
+## canonical head
+Index Scan using relay_config_heads_pkey on relay_config_heads  (cost=0.42..8.44 rows=1 width=67) (actual time=0.005..0.005 rows=1.00 loops=1)
+  Index Cond: ((pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text) AND (source_kind = 10002) AND (d_tag = ''::text))
+  Index Searches: 1
+  Buffers: shared hit=4
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.026 ms
+Execution Time: 0.010 ms
+
+## candidate shortlist
+Limit  (cost=15.39..15.40 rows=4 width=80) (actual time=0.066..0.070 rows=80.00 loops=1)
+  Buffers: shared hit=26
+  ->  Sort  (cost=15.39..15.40 rows=4 width=80) (actual time=0.066..0.067 rows=80.00 loops=1)
+        Sort Key: trust_weighted DESC, distinct_users DESC, url_key
+        Sort Method: top-N heapsort  Memory: 43kB
+        Buffers: shared hit=26
+        ->  Bitmap Heap Scan on relay_role_stats  (cost=4.31..15.35 rows=4 width=80) (actual time=0.011..0.040 rows=241.00 loops=1)
+              Recheck Cond: (role = 'public_inbox'::text)
+              Heap Blocks: exact=23
+              Buffers: shared hit=26
+              ->  Bitmap Index Scan on idx_relay_role_stats_role_users  (cost=0.00..4.31 rows=4 width=0) (actual time=0.008..0.008 rows=241.00 loops=1)
+                    Index Cond: (role = 'public_inbox'::text)
+                    Index Searches: 1
+                    Buffers: shared hit=3
+Planning Time: 0.019 ms
+Execution Time: 0.082 ms
+
+## cohort follows
+Limit  (cost=0.41..8.43 rows=1 width=65) (actual time=0.009..0.131 rows=400.00 loops=1)
+  Buffers: shared hit=659
+  ->  Index Only Scan using idx_follower_edges_follower_followed on follower_edges  (cost=0.41..8.43 rows=1 width=65) (actual time=0.009..0.119 rows=400.00 loops=1)
+        Index Cond: (follower_pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text)
+        Heap Fetches: 718
+        Index Searches: 1
+        Buffers: shared hit=659
+Planning Time: 0.024 ms
+Execution Time: 0.145 ms
+
+## reconcile candidates
+Limit  (cost=0.84..166.48 rows=200 width=70) (actual time=532.162..532.163 rows=0.00 loops=1)
+  Buffers: shared hit=1032285 read=11794
+  ->  Nested Loop Left Join  (cost=0.84..171717.46 rows=207346 width=70) (actual time=532.162..532.162 rows=0.00 loops=1)
+        Filter: ((h.event_id IS NULL) OR (h.event_id <> rs.event_id) OR h.needs_replay)
+        Rows Removed by Filter: 208226
+        Buffers: shared hit=1032285 read=11794
+        ->  Index Scan using idx_replaceable_state_kind_pubkey on replaceable_state rs  (cost=0.42..40118.57 rows=207347 width=135) (actual time=0.027..96.817 rows=208226.00 loops=1)
+              Index Cond: (kind = ANY ('{3,10002,10006,10007,10012,10013,10050,10051,10063,10102,30002}'::integer[]))
+              Index Searches: 1
+              Buffers: shared hit=202903 read=8272
+        ->  Index Scan using relay_config_heads_pkey on relay_config_heads h  (cost=0.42..0.62 rows=1 width=136) (actual time=0.002..0.002 rows=1.00 loops=208226)
+              Index Cond: ((pubkey = rs.pubkey) AND (source_kind = rs.kind) AND (d_tag = rs.d_tag))
+              Index Searches: 208226
+              Buffers: shared hit=829382 read=3522
+Planning:
+  Buffers: shared hit=15 read=3 dirtied=1
+Planning Time: 0.132 ms
+Execution Time: 532.176 ms
+
+## synthetic identity lookup
+Index Only Scan using relay_probe_identities_pkey on relay_probe_identities  (cost=0.15..8.17 rows=1 width=4) (actual time=0.009..0.009 rows=0.00 loops=1)
+  Index Cond: (pubkey = 'd6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19'::text)
+  Heap Fetches: 0
+  Index Searches: 1
+  Buffers: shared hit=2
+Planning:
+  Buffers: shared read=1
+Planning Time: 0.043 ms
+Execution Time: 0.018 ms
+
+## due retention followups
+Limit  (cost=0.15..2.91 rows=20 width=16) (actual time=0.012..0.014 rows=20.00 loops=1)
+  Buffers: shared read=2
+  ->  Index Scan using relay_probe_followups_due_idx on relay_probe_followups  (cost=0.15..25.00 rows=180 width=16) (actual time=0.012..0.013 rows=20.00 loops=1)
+        Index Cond: (check_after <= now())
+        Filter: (status = ANY ('{pending,retryable}'::text[]))
+        Index Searches: 1
+        Buffers: shared read=2
+Planning:
+  Buffers: shared hit=7 read=2
+Planning Time: 0.075 ms
+Execution Time: 0.021 ms

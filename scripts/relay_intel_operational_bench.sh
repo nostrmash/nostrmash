@@ -10,13 +10,15 @@ export RELAY_INTEL_OPERATIONAL_BENCH=1
 export RELAY_INTEL_OPERATIONAL_SCALE="${RELAY_INTEL_OPERATIONAL_SCALE:-both}"
 export RELAY_INTEL_OPERATIONAL_OUT="${RELAY_INTEL_OPERATIONAL_OUT:-benchmarks/relay-intelligence/operational}"
 export RELAY_INTEL_OPERATIONAL_MIXED_EVENTS="${RELAY_INTEL_OPERATIONAL_MIXED_EVENTS:-200}"
-export RELAY_INTEL_OPERATIONAL_MIXED_REPEATS="${RELAY_INTEL_OPERATIONAL_MIXED_REPEATS:-2}"
+export RELAY_INTEL_OPERATIONAL_MIXED_REPEATS="${RELAY_INTEL_OPERATIONAL_MIXED_REPEATS:-3}"
+export RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS="${RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS:-30000}"
 
 mkdir -p "$RELAY_INTEL_OPERATIONAL_OUT"
 echo "commit $(git rev-parse HEAD)"
+echo "implementation $(git rev-parse origin/feat/relay-capability-probes)"
 echo "scale $RELAY_INTEL_OPERATIONAL_SCALE"
 echo "output $RELAY_INTEL_OPERATIONAL_OUT"
 
-go test ./internal/api/ \
+go test -tags relayintelbench ./internal/api/ \
   -run TestOperationalRelayIntelligence \
-  -v -count=1 -timeout 180m
+  -v -count=1 -timeout 240m

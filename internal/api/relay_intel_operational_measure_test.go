@@ -1,3 +1,5 @@
+//go:build relayintelbench
+
 package api
 
 import (
@@ -41,6 +43,7 @@ func runOperationalScale(t *testing.T, accounts int, outDir string) {
 		scale = "medium"
 	}
 	report := newOpReport(filepath.Join(outDir, "results-"+scale+".json"), scale, accounts)
+	report.note("Measurements use origin/feat/relay-capability-probes. Commits e8d305096c3612b16f8bc1f01de785034001d78c and 90eaa83fa5f63d94564756225444542fdc819fcf remain only on origin/fix/relay-intelligence. Their migration 000144 collides with 000144_relay_probe_evidence_fence.sql, so they are not included.")
 	report.Environment = collectEnvironment(ctx, pool, schema)
 	report.Environment["seed_session_work_mem"] = "64MB on the seed connection only"
 	report.save()
@@ -67,11 +70,11 @@ func runOperationalScale(t *testing.T, accounts int, outDir string) {
 	report.Fixture["personas"] = people.public()
 	report.mu.Unlock()
 
-	measureMaintenance(t, ctx, pool, counter, report, people, true)
+	measureMaintenance(t, ctx, pool, counter, report, people, true, "")
 	handlers := newBenchHandlers(t, pool)
 	measureAPI(t, ctx, pool, counter, handlers, people, fixture.PopularRelay, report)
 	measurePlans(t, ctx, pool, people, filepath.Join(outDir, "plans-"+scale+".txt"), report)
-	measureMaintenance(t, ctx, pool, counter, report, people, false)
+	measureMaintenance(t, ctx, pool, counter, report, people, false, filepath.Join(outDir, "plans-"+scale+".txt"))
 	measureProbes(t, ctx, pool, report)
 	measureSynthetic(t, ctx, pool, counter, report)
 	report.mu.Lock()
@@ -377,7 +380,6 @@ func measureAPI(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *
 		{"config_empty", people.Empty.pub, "/api/v1/profiles/" + people.Empty.pub + "/relay-config", func(b map[string]any) bool { return b["account"] != nil }},
 		{"config_missing", people.Missing.pub, "/api/v1/profiles/" + people.Missing.pub + "/relay-config", func(b map[string]any) bool { return b["account"] != nil }},
 	} {
-		handler := endpointHandler(base, item.path)
 		put(item.name+"_cold", timeGET(t, item.name, "application cache cold", 20, func() httpResult {
 			h := base
 			h.relayIntel = svc()
@@ -385,7 +387,7 @@ func measureAPI(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *
 		}, item.ok, counter))
 		h := base
 		h.relayIntel = svc()
-		handler = endpointHandler(h, item.path)
+		handler := endpointHandler(h, item.path)
 		put(item.name+"_warm", timeGET(t, item.name, "application cache warm", 40, func() httpResult {
 			return callGET(handler, item.path, item.pubkey)
 		}, item.ok, counter))
@@ -401,6 +403,7 @@ func measureAPI(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *
 	for _, scenario := range scenarios {
 		put(scenario.name, timePOST(t, scenario.name, scenario.samples, scenario.body, scenario.personalized, counter, base, svc))
 	}
+	results["optimize_concurrency"] = measureOptimizeConcurrency(t, ctx, pool, counter, people)
 	report.mu.Lock()
 	report.API = results
 	report.mu.Unlock()
@@ -559,7 +562,7 @@ func timeCalls(t *testing.T, name, cache string, n int, call func() (httpResult,
 	return summary
 }
 
-func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, report *opReport, people benchPeople, statsOnly bool) {
+func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, report *opReport, people benchPeople, statsOnly bool, planPath string) {
 	t.Helper()
 	if statsOnly {
 		t.Log("statistics refresh")
@@ -761,6 +764,11 @@ func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 	`); err != nil {
 		t.Fatal(err)
 	}
+	if planPath != "" {
+		for key, value := range measureRetentionBreakdown(t, ctx, pool, planPath) {
+			out[key] = value
+		}
+	}
 	purgeStart := time.Now()
 	wal2 := walLSN(ctx, pool)
 	purged, err := retention.New(pool).PurgeSupersededReplaceableEvents(ctx, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), 100)
@@ -930,6 +938,9 @@ func measurePlans(t *testing.T, ctx context.Context, pool *pgxpool.Pool, people 
 	writePlan("synthetic identity lookup", `
 		EXPLAIN (ANALYZE, BUFFERS, WAL)
 		SELECT 1 FROM relay_probe_identities WHERE pubkey = $1`, people.Dense.pub)
+	writePlan("synthetic identity epoch", `
+		EXPLAIN (ANALYZE, BUFFERS, WAL)
+		SELECT epoch FROM relay_probe_identity_epoch WHERE id`)
 	writePlan("due retention followups", `
 		EXPLAIN (ANALYZE, BUFFERS, WAL)
 		SELECT id FROM relay_probe_followups
@@ -1101,57 +1112,7 @@ func measureProbes(t *testing.T, ctx context.Context, pool *pgxpool.Pool, report
 	wg.Wait()
 	out["concurrent_distinct_urls"] = map[string]any{"successes": distinctWins.value(), "workers": 8, "wall_ms": time.Since(distinctStart).Milliseconds(), "latencies_ms": durationsMS(distinctLat), "errors": nonempty(distinctErr)}
 
-	token := claim(t, ctx, pool, "wss://finish.bench.example", "write_accept", "finish.bench.example", "bench", 60, 1)
-	finishStart := time.Now()
-	err := relayintel.RecordProbeEvidence(ctx, pool, "wss://finish.bench.example", relayintel.CapWriteAccept, relayintel.StatusVerified, 0.8, "accepted", token)
-	out["single_capability_completion"] = map[string]any{"wall_ms": ms(time.Since(finishStart)), "error": errorText(err)}
-	dupStart := time.Now()
-	dupErr := relayintel.RecordProbeEvidence(ctx, pool, "wss://finish.bench.example", relayintel.CapWriteAccept, relayintel.StatusVerified, 0.8, "accepted", token)
-	var samples int
-	_ = pool.QueryRow(ctx, `SELECT count(*) FROM relay_capability_samples WHERE detail = 'accepted'`).Scan(&samples)
-	out["duplicate_completion"] = map[string]any{
-		"wall_ms": ms(time.Since(dupStart)), "error": errorText(dupErr), "sample_rows": samples,
-		"note": "A repeated status and detail for the same attempt does not insert another sample.",
-	}
-	multiToken := claim(t, ctx, pool, "wss://multi.bench.example", "write_accept", "multi.bench.example", "bench", 60, 1)
-	multiStart := time.Now()
-	multiErr := relayintel.FinishProbeLease(ctx, pool, "wss://multi.bench.example", multiToken, "finished", 0, "", "", 0, []relayintel.ProbeEvidence{
-		{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "write", Confidence: 0.8},
-		{Capability: relayintel.CapWriteRetrieve, Status: relayintel.StatusVerified, Detail: "read-back", Confidence: 0.7},
-		{Capability: relayintel.CapAuthWrite, Status: relayintel.StatusAdvertised, Detail: "auth", Confidence: 0.5},
-	})
-	out["multi_capability_completion"] = map[string]any{"wall_ms": ms(time.Since(multiStart)), "error": errorText(multiErr)}
-
-	var followID int64
-	var followKey, followURL string
-	err = pool.QueryRow(ctx, `
-		SELECT id, url_key, endpoint_url FROM relay_probe_followups
-		WHERE finished_at IS NULL AND status = 'pending' AND check_after <= now()
-		ORDER BY id LIMIT 1
-	`).Scan(&followID, &followKey, &followURL)
-	if err != nil {
-		out["retention_followup_claim"] = map[string]any{"error": err.Error()}
-	} else {
-		claimStart := time.Now()
-		followToken := claim(t, ctx, pool, followKey, relayintel.CapRetention, "follow.bench.example", "bench", 60, 1)
-		if followToken == "" {
-			out["retention_followup_claim"] = map[string]any{"wall_ms": ms(time.Since(claimStart)), "obtained": false}
-		} else {
-			if _, err := pool.Exec(ctx, `
-				UPDATE relay_probe_followups
-				SET status = 'running', lease_token = $2, attempts = attempts + 1, claimed_at = now()
-				WHERE id = $1
-			`, followID, followToken); err != nil {
-				t.Fatal(err)
-			}
-			done := time.Now()
-			finishErr := relayintel.FinishProbeLease(ctx, pool, followKey, followToken, "finished", followID, "completed", "retrieved_after_120s", 120, []relayintel.ProbeEvidence{
-				{Capability: relayintel.CapRetention, Status: relayintel.StatusVerified, Detail: "retrieved_after_120s", Confidence: 0.6},
-			})
-			out["retention_followup_claim"] = map[string]any{"wall_ms": ms(time.Since(claimStart)), "obtained": true, "url": followURL}
-			out["retention_followup_completion"] = map[string]any{"wall_ms": ms(time.Since(done)), "error": errorText(finishErr)}
-		}
-	}
+	measureAtomicCompletion(t, ctx, pool, out)
 	var attempts, leases, samplesAll int64
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_attempts`).Scan(&attempts)
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_leases`).Scan(&leases)
@@ -1290,15 +1251,33 @@ func measureSynthetic(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cou
 	relayintel.ClearSyntheticCaches()
 	absent := fmt.Sprintf("%064x", 434343)
 	out["negative_cold"] = timeLookups(ctx, pool, counter, []string{absent})
-	out["negative_cache_hit"] = timeLookups(ctx, pool, counter, []string{absent})
+	repeatedMiss := make([]string, 1000)
+	for i := range repeatedMiss {
+		repeatedMiss[i] = absent
+	}
+	out["negative_cache_hit_1000"] = timeLookups(ctx, pool, counter, repeatedMiss)
+	var epochBefore, epochAfter int64
+	_ = pool.QueryRow(ctx, `SELECT epoch FROM relay_probe_identity_epoch WHERE id`).Scan(&epochBefore)
+	registered := fmt.Sprintf("%064x", 454545)
+	if err := relayintel.RegisterSyntheticIdentity(ctx, pool, registered); err != nil {
+		t.Fatal(err)
+	}
+	_ = pool.QueryRow(ctx, `SELECT epoch FROM relay_probe_identity_epoch WHERE id`).Scan(&epochAfter)
+	out["epoch_before_registry_change"] = epochBefore
+	out["epoch_after_registry_change"] = epochAfter
+	out["cached_miss_after_registry_change"] = timeLookups(ctx, pool, counter, []string{absent})
+	relayintel.ClearSyntheticCaches()
+	out["registered_identity_other_worker"] = timeLookups(ctx, pool, counter, []string{registered})
+	out["registered_identity_positive_cache"] = timeLookups(ctx, pool, counter, []string{registered})
 	time.Sleep(16 * time.Second)
 	out["negative_after_ttl"] = timeLookups(ctx, pool, counter, []string{absent})
 	fresh := fmt.Sprintf("%064x", 444444)
 	relayintel.ClearSyntheticCaches()
-	if _, err := pool.Exec(ctx, `INSERT INTO relay_probe_identities (pubkey) VALUES ($1)`, fresh); err != nil {
+	if err := relayintel.RegisterSyntheticIdentity(ctx, pool, fresh); err != nil {
 		t.Fatal(err)
 	}
-	out["newly_registered"] = timeLookups(ctx, pool, counter, []string{fresh})
+	relayintel.ClearSyntheticCaches()
+	out["newly_registered_other_worker"] = timeLookups(ctx, pool, counter, []string{fresh})
 	started := time.Now()
 	if err := func() error {
 		relayintel.LoadSyntheticIdentities(ctx, pool)
@@ -1339,13 +1318,13 @@ func measureSynthetic(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cou
 	out["concurrent_800_lookups_ms"] = time.Since(concStarted).Milliseconds()
 	out["concurrent_800_queries"] = counter.snapshot() - queriesBefore
 
-	deriveOrdinary := deriveAuthors(t, ctx, pool, 25, false)
-	deriveSynthetic := deriveAuthors(t, ctx, pool, 25, true)
+	deriveOrdinary := deriveAuthors(t, ctx, pool, counter, 25, false)
+	deriveSynthetic := deriveAuthors(t, ctx, pool, counter, 25, true)
 	out["derivation_ordinary_authors"] = deriveOrdinary
 	out["derivation_synthetic_authors"] = deriveSynthetic
 	if client := optionalMeili(t); client != nil {
 		handlers := derivation.NewHandlersWithOptions(pool, derivation.HandlersOptions{MeiliClient: client})
-		id := deriveAuthors(t, ctx, pool, 1, false)["last_event_id"]
+		id := deriveAuthors(t, ctx, pool, counter, 1, false)["last_event_id"]
 		if eventID, ok := id.(string); ok && eventID != "" {
 			started := time.Now()
 			err := handlers.SyncMeilisearch(ctx, eventID)
@@ -1378,20 +1357,21 @@ func timeLookups(ctx context.Context, pool *pgxpool.Pool, counter *queryCounter,
 	}
 }
 
-func deriveAuthors(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int, synthetic bool) map[string]any {
+func deriveAuthors(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, n int, synthetic bool) map[string]any {
 	t.Helper()
 	handlers := derivation.NewHandlers(pool)
 	pgStore := store.NewPostgresStore(pool)
 	started := time.Now()
+	queriesBefore := counter.snapshot()
 	errors := 0
 	var last string
 	for i := 0; i < n; i++ {
 		key := newKey(t)
 		if synthetic {
-			if _, err := pool.Exec(ctx, `INSERT INTO relay_probe_identities (pubkey) VALUES ($1) ON CONFLICT DO NOTHING`, key.pub); err != nil {
+			if err := relayintel.RegisterSyntheticIdentity(ctx, pool, key.pub); err != nil {
 				t.Fatal(err)
 			}
-			relayintel.RememberSynthetic(key.pub)
+			relayintel.ClearSyntheticCaches()
 		}
 		raw := sign(t, key.priv, 1, time.Now().Unix(), nil, "bench note")
 		var body struct {
@@ -1412,10 +1392,14 @@ func deriveAuthors(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int,
 		}
 		last = body.ID
 	}
-	return map[string]any{
+	out := map[string]any{
 		"events": n, "errors": errors, "wall_ms": time.Since(started).Milliseconds(), "last_event_id": last,
-		"synthetic": synthetic,
+		"synthetic": synthetic, "queries": counter.snapshot() - queriesBefore,
 	}
+	if synthetic {
+		out["note"] = "Each author is registered through the production epoch path, then the process cache is cleared so derivation performs the other-worker lookup."
+	}
+	return out
 }
 
 func optionalMeili(t *testing.T) *meili.Client {
@@ -1439,285 +1423,6 @@ func optionalMeili(t *testing.T) *meili.Client {
 		return nil
 	}
 	return client
-}
-
-func measureMixed(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, people benchPeople, report *opReport) {
-	t.Helper()
-	drained := drainJobs(t, ctx, pool, "bench-mixed-prep", 5000)
-	report.note(fmt.Sprintf("mixed workload prep drained %d queued jobs in %s so the comparison starts from an empty claimable queue", drained.Processed, drained.Elapsed.Round(time.Millisecond)))
-	events := operationalIntEnv("RELAY_INTEL_OPERATIONAL_MIXED_EVENTS", 200)
-	repeats := operationalIntEnv("RELAY_INTEL_OPERATIONAL_MIXED_REPEATS", 2)
-	runs := make([]any, 0, repeats*2)
-	for pass := 1; pass <= repeats; pass++ {
-		runs = append(runs, runMixedPass(t, ctx, pool, counter, people, events, false, pass))
-		runs = append(runs, runMixedPass(t, ctx, pool, counter, people, events, true, pass))
-	}
-	report.mu.Lock()
-	report.Mixed = runs
-	report.mu.Unlock()
-	report.save()
-}
-
-func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, people benchPeople, events int, relayIntelOn bool, pass int) map[string]any {
-	t.Helper()
-	label := "baseline"
-	if relayIntelOn {
-		label = "relay_intel_on"
-	}
-	t.Logf("mixed %s pass %d events %d", label, pass, events)
-	relayintel.SetProjectionEnabled(relayIntelOn)
-	defer relayintel.SetProjectionEnabled(true)
-	handlers := newBenchHandlers(t, pool)
-	queue := jobs.NewQueue(pool)
-	deriveHandlers := derivation.NewHandlers(pool)
-	pgStore := store.NewPostgresStore(pool)
-	keys := make([]testKey, 16)
-	for i := range keys {
-		keys[i] = newKey(t)
-	}
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	var ingestOK, ingestErr, deriveOK, deriveErr atomicInt
-	var apiSamples []time.Duration
-	var apiErr atomicInt
-	var riSamples []time.Duration
-	var riErr atomicInt
-	var sampleMu sync.Mutex
-	wal0 := walLSN(ctx, pool)
-	q0 := counter.snapshot()
-	stat0 := pool.Stat()
-	db0 := dbCounters(ctx, pool)
-	started := time.Now()
-
-	var maintenanceCalls atomicInt
-	var lockWaitSamples atomicInt
-	var maxLockWaiters atomicInt
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if relayIntelOn {
-				_ = relayintel.RepairCanonicalBatch(ctx, pool, 50)
-				_ = relayintel.BackfillBatch(ctx, pool, 200)
-				_ = relayintel.RefreshStats(ctx, pool, "", 10*time.Minute)
-			} else {
-				_ = relayintel.RepairCanonicalBatch(ctx, pool, 50)
-			}
-			_, _ = retention.New(pool).PurgeSupersededReplaceableEvents(ctx, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), 25)
-			var waiting int
-			_ = pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting)
-			if waiting > 0 {
-				lockWaitSamples.add()
-			}
-			maxLockWaiters.max(waiting)
-			maintenanceCalls.add()
-			select {
-			case <-stop:
-				return
-			case <-time.After(5 * time.Second):
-			}
-		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			one := time.Now()
-			got := callGET(handlers.GetProfileByPubkey, "/api/v1/profiles/"+people.Dense.pub, people.Dense.pub)
-			sampleMu.Lock()
-			if got.Status == http.StatusOK {
-				apiSamples = append(apiSamples, time.Since(one))
-			} else {
-				apiErr.add()
-			}
-			sampleMu.Unlock()
-		}
-	}()
-	if relayIntelOn {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				one := time.Now()
-				got := callGET(handlers.GetProfileRelayRecommendations, "/api/v1/profiles/"+people.Dense.pub+"/relay-recommendations?preset=balanced", people.Dense.pub)
-				sampleMu.Lock()
-				if got.Status == http.StatusOK && planMeaningful(got.Body, true) {
-					riSamples = append(riSamples, time.Since(one))
-				} else {
-					riErr.add()
-				}
-				sampleMu.Unlock()
-				one = time.Now()
-				got = callPOST(handlers.PostRelayOptimize, map[string]any{
-					"pubkey": people.Sparse.pub, "preset": "balanced", "roles": []string{"public_inbox", "public_outbox"},
-				})
-				sampleMu.Lock()
-				if got.Status == http.StatusOK && planMeaningful(got.Body, true) {
-					riSamples = append(riSamples, time.Since(one))
-				} else {
-					riErr.add()
-				}
-				sampleMu.Unlock()
-			}
-		}()
-	}
-
-	ingestDone := make(chan struct{})
-	var ingestWG sync.WaitGroup
-	perWorker := events / 4
-	if perWorker < 1 {
-		perWorker = 1
-	}
-	for worker := 0; worker < 4; worker++ {
-		ingestWG.Add(1)
-		go func(n int) {
-			defer ingestWG.Done()
-			for i := 0; i < perWorker; i++ {
-				key := keys[(n+i)%len(keys)]
-				kind := 1
-				content := fmt.Sprintf("mixed %s %d %d", label, n, i)
-				tags := [][]string{{"t", "bench"}}
-				if i%8 == 0 {
-					kind = relayintel.KindPublicRelayList
-					content = ""
-					tags = [][]string{{"r", "wss://r1.op1.example", "read"}, {"r", "wss://r2.op2.example", "write"}}
-				}
-				createdAt := time.Now().Unix() + int64(n*1000+i)
-				raw := sign(t, key.priv, kind, createdAt, tags, content)
-				var body struct {
-					ID string `json:"id"`
-				}
-				if err := json.Unmarshal(raw, &body); err != nil {
-					ingestErr.add()
-					continue
-				}
-				event := model.Event{
-					ID: body.ID, Pubkey: key.pub, CreatedAt: createdAt, Kind: kind,
-					Sig: strings.Repeat("ab", 64), Content: content, RawJSON: raw,
-				}
-				if err := pgStore.InsertCanonicalEvent(ctx, event, tags, "wss://r1.op1.example", time.Now().UTC()); err != nil {
-					ingestErr.add()
-					continue
-				}
-				ingestOK.add()
-			}
-		}(worker)
-	}
-	var ingestWall time.Duration
-	go func() {
-		ingestWG.Wait()
-		ingestWall = time.Since(started)
-		close(ingestDone)
-	}()
-
-	deriveStop := make(chan struct{})
-	var deriveWG sync.WaitGroup
-	for worker := 0; worker < 2; worker++ {
-		deriveWG.Add(1)
-		go func(n int) {
-			defer deriveWG.Done()
-			id := fmt.Sprintf("bench-mixed-%s-%d", label, n)
-			for {
-				select {
-				case <-deriveStop:
-					return
-				default:
-				}
-				claimed, err := queue.ClaimAvailable(ctx, id, 10)
-				if err != nil {
-					deriveErr.add()
-					return
-				}
-				if len(claimed) == 0 {
-					select {
-					case <-ingestDone:
-						claimed, err = queue.ClaimAvailable(ctx, id, 10)
-						if err != nil || len(claimed) == 0 {
-							return
-						}
-					case <-deriveStop:
-						return
-					case <-time.After(20 * time.Millisecond):
-						continue
-					}
-				}
-				for _, job := range claimed {
-					err := derivation.ProcessJob(ctx, deriveHandlers, derivation.Job{JobType: job.JobType, Payload: job.Payload})
-					if err != nil {
-						deriveErr.add()
-						_, _ = queue.FailJob(ctx, job.ID, id, err.Error(), time.Second)
-						continue
-					}
-					if err := queue.CompleteJob(ctx, job.ID, id); err != nil {
-						deriveErr.add()
-						continue
-					}
-					deriveOK.add()
-				}
-			}
-		}(worker)
-	}
-	<-ingestDone
-	drained := make(chan struct{})
-	go func() {
-		deriveWG.Wait()
-		close(drained)
-	}()
-	select {
-	case <-drained:
-	case <-time.After(3 * time.Minute):
-		t.Logf("mixed %s pass %d derivation drain exceeded 3 minutes", label, pass)
-	}
-	close(deriveStop)
-	deriveWG.Wait()
-	close(stop)
-	wg.Wait()
-	elapsed := time.Since(started)
-	var pending int64
-	_ = pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status = 'pending'`).Scan(&pending)
-	sampleMu.Lock()
-	apiCopy := append([]time.Duration(nil), apiSamples...)
-	riCopy := append([]time.Duration(nil), riSamples...)
-	sampleMu.Unlock()
-	stat1 := pool.Stat()
-	return map[string]any{
-		"scenario": label, "pass": pass, "events_attempted": perWorker * 4,
-		"ingest_ok": ingestOK.n, "ingest_errors": ingestErr.n,
-		"derive_ok": deriveOK.n, "derive_errors": deriveErr.n,
-		"wall_ms":                  elapsed.Milliseconds(),
-		"ingest_wall_ms":           ingestWall.Milliseconds(),
-		"ingest_per_s":             float64(ingestOK.value()) / ingestWall.Seconds(),
-		"derive_per_s":             float64(deriveOK.value()) / elapsed.Seconds(),
-		"pending_jobs_after":       pending,
-		"maintenance_cycles":       maintenanceCalls.value(),
-		"lock_wait_samples":        lockWaitSamples.value(),
-		"max_lock_waiters":         maxLockWaiters.value(),
-		"existing_api":             summarizeLatency("profile", "handler", pgCacheNote, apiCopy, apiErr.n, len(apiCopy), nil, elapsed, 0, 0, "", nil),
-		"relay_intel_api":          summarizeLatency("relay intel during mixed", "warm-or-miss", pgCacheNote, riCopy, riErr.n, len(riCopy), nil, elapsed, 0, 0, "", nil),
-		"wal_bytes":                walBytes(ctx, pool, wal0, walLSN(ctx, pool)),
-		"queries":                  counter.snapshot() - q0,
-		"pool_empty_acquires":      stat1.EmptyAcquireCount() - stat0.EmptyAcquireCount(),
-		"pool_acquires":            stat1.AcquireCount() - stat0.AcquireCount(),
-		"pool_max_conns":           stat1.MaxConns(),
-		"database":                 dbDelta(db0, dbCounters(ctx, pool)),
-		"projection_enabled":       relayIntelOn,
-		"canonical_repair_enabled": true,
-	}
 }
 
 type dbSnap struct {
