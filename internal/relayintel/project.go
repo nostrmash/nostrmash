@@ -26,6 +26,9 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		return nil
 	}
 	head := parsed.Head
+	if err := LockCoordinate(ctx, tx, head.Pubkey, head.SourceKind, head.DTag); err != nil {
+		return err
+	}
 	var locked string
 	err = tx.QueryRow(ctx, `
 		SELECT event_id FROM relay_config_heads
@@ -87,6 +90,14 @@ var ErrNotReady = errors.New("relay intelligence schema is not ready")
 var ErrInvalidInput = errors.New("invalid relay intelligence input")
 
 // SchemaMissing reports a query that failed because a role table does not exist.
+func LockCoordinate(ctx context.Context, tx pgx.Tx, pubkey string, kind int, dTag string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, fmt.Sprintf("%s:%d:%s", pubkey, kind, dTag))
+	if err != nil && !SchemaMissing(err) {
+		return fmt.Errorf("lock relay coordinate: %w", err)
+	}
+	return nil
+}
+
 func SchemaMissing(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
@@ -133,6 +144,9 @@ func wrapDB(err error) error {
 }
 
 func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
+	if err := LockCoordinate(ctx, tx, in.Pubkey, in.Kind, ""); err != nil {
+		return err
+	}
 	var existingID string
 	var existingCreated int64
 	err := tx.QueryRow(ctx, `

@@ -71,8 +71,17 @@ LIMIT @row_limit;
 -- displaces the current winner, and when a losing version is derived. Cost follows the queued
 -- backlog, not the size of events. The queue has no foreign key, so this
 -- statement removes both the event and its queue row. gone drops ids whose
--- event was deleted by something else.
-WITH gone AS (
+-- event was deleted by something else. A queued id that is the current
+-- replaceable_state winner is removed from the queue and is not deleted.
+WITH unqueue_winners AS (
+    DELETE FROM replaceable_event_purge p
+    WHERE EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+    )
+    RETURNING p.event_id
+),
+gone AS (
     SELECT p.event_id
     FROM replaceable_event_purge p
     WHERE NOT EXISTS (
@@ -91,6 +100,14 @@ candidates AS (
     JOIN events e ON e.id = p.event_id
     WHERE e.kind = ANY(@kinds::int[])
       AND e.first_seen_at < @superseded_before
+      AND NOT EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM unqueue_winners uw
+        WHERE uw.event_id = p.event_id
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM jobs j

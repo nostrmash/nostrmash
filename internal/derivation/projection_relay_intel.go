@@ -161,6 +161,9 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 		}
 	}
 	for _, item := range coords {
+		if err := relayintel.LockCoordinate(ctx, tx, pubkey, item.kind, item.dTag); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM relay_role_memberships
 			WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3 AND created_at <= $4
@@ -191,7 +194,7 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 }
 
 func splitRelayCoordinate(value string) (kind int, pubkey, dTag string, ok bool) {
-	value = strings.TrimSpace(value)
+	value = strings.TrimLeft(value, " \t")
 	kindEnd := strings.IndexByte(value, ':')
 	if kindEnd <= 0 || kindEnd >= len(value)-1 {
 		return 0, "", "", false
