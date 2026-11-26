@@ -3,6 +3,7 @@ package relayintel
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nostrmash/nostrmash/internal/dbmigrate"
@@ -75,17 +76,65 @@ func TestStaleLeaseCannotPublishEvidence(t *testing.T) {
 	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, "inconclusive", 0.2, "probe", "timeout", token); err != nil {
 		t.Fatal(err)
 	}
-	var status string
+	var status, text string
+	var confidence float64
 	var failures, window int
 	if err := pool.QueryRow(ctx, `
-		SELECT status, COALESCE((detail->>'recent_failures')::int, 0), COALESCE((detail->>'recent_window')::int, 0)
+		SELECT status, confidence, COALESCE(detail->>'text', ''),
+		       COALESCE((detail->>'recent_failures')::int, 0), COALESCE((detail->>'recent_window')::int, 0)
 		FROM relay_capability_observations
 		WHERE url_key = $1 AND capability = $2
-	`, "wss://evidence.example", CapWriteAccept).Scan(&status, &failures, &window); err != nil {
+	`, "wss://evidence.example", CapWriteAccept).Scan(&status, &confidence, &text, &failures, &window); err != nil {
 		t.Fatal(err)
 	}
-	if status != StatusVerified || window < 2 {
-		t.Fatalf("status=%s failures=%d window=%d", status, failures, window)
+	if status != StatusVerified || confidence < 0.79 || text != "ok" || window < 2 {
+		t.Fatalf("status=%s confidence=%v text=%s failures=%d window=%d", status, confidence, text, failures, window)
+	}
+}
+
+func TestStaleWorkerLosesTheLeaseDuringCommit(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "relay probe fence"), "probefence")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	token := claimToken(t, ctx, pool, "wss://fence.example", "write_accept", "fence.example", "worker-a", 20, 60)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var locked string
+	if err := tx.QueryRow(ctx, `
+		SELECT lease_token FROM relay_probe_leases WHERE lease_token = $1 FOR UPDATE
+	`, token).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- storeObservation(ctx, pool, "wss://fence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "late", token)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := tx.Exec(ctx, `UPDATE relay_probe_leases SET expires_at = now() - interval '1 minute' WHERE lease_token = $1`, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an expired lease published evidence")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("evidence write did not finish after the lease expired")
+	}
+	var samples int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_capability_samples WHERE detail = 'late'`).Scan(&samples); err != nil {
+		t.Fatal(err)
+	}
+	if samples != 0 {
+		t.Fatal("rolled-back evidence remained")
 	}
 }
 

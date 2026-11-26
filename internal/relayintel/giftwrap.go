@@ -41,9 +41,10 @@ type giftWrapEvidence struct {
 }
 
 type accessResult struct {
-	Status        string
-	Hit           bool
-	Authenticated bool
+	Status         string
+	Hit            bool
+	Authenticated  bool
+	SeenBeforeAuth bool
 }
 
 func (p *probeState) probeOneGiftWrap(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
@@ -87,7 +88,9 @@ func (p *probeState) probeOneGiftWrap(ctx context.Context, pool *pgxpool.Pool) (
 			continue
 		}
 		evidence := p.exchangeGiftWrap(ctx, pool, relayURL)
-		p.storeGiftWrap(ctx, pool, key, token, evidence)
+		if err := p.storeGiftWrap(ctx, pool, key, token, evidence); err != nil {
+			return true, err
+		}
 		p.finish(ctx, pool, token)
 		return true, nil
 	}
@@ -97,6 +100,11 @@ func (p *probeState) probeOneGiftWrap(ctx context.Context, pool *pgxpool.Pool) (
 func (p *probeState) exchangeGiftWrap(ctx context.Context, pool *pgxpool.Pool, relayURL string) giftWrapEvidence {
 	event, err := buildGiftWrap(p.key, p.pubkey, p.recipientPub)
 	if err != nil {
+		metrics.IncRelayIntelProbe("giftwrap", "error")
+		return giftWrapEvidence{Outcome: "error"}
+	}
+	author, _ := event["pubkey"].(string)
+	if err := registerSyntheticIdentity(ctx, pool, author); err != nil {
 		metrics.IncRelayIntelProbe("giftwrap", "error")
 		return giftWrapEvidence{Outcome: "error"}
 	}
@@ -172,41 +180,58 @@ func (p *probeState) readGiftWrap(ctx context.Context, relayURL, eventID string,
 			return signAuth(key, authPub, relayURL, challenge)
 		}
 	}
-	status, ids, authenticated := readSubscription(conn, "nm-gift", filter, time.Now().Add(5*time.Second), auth)
-	return accessResult{Status: status, Hit: containsID(ids, eventID), Authenticated: authenticated}
+	status, ids, exposed, authenticated := readSubscription(ctx, conn, "nm-gift", filter, time.Now().Add(5*time.Second), auth)
+	return accessResult{
+		Status: status, Hit: containsID(ids, eventID) || containsID(exposed, eventID),
+		Authenticated: authenticated, SeenBeforeAuth: containsID(exposed, eventID),
+	}
 }
 
-func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key, token string, evidence giftWrapEvidence) {
-	if pool == nil {
-		return
+func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key, token string, evidence giftWrapEvidence) error {
+	if pool == nil || token == "" {
+		return nil
 	}
+	var writes []observationWrite
 	if evidence.Accept == "accepted" {
-		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, StatusVerified, 0.7, "probe", "ok_true", token)
+		writes = append(writes, observationWrite{Capability: CapGiftWrapAccept, Status: StatusVerified, Detail: "ok_true", Confidence: 0.7})
 	} else if evidence.Accept != "" {
 		status, detail := publicationEvidence(evidence.Accept)
-		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, status, 0.55, "probe", detail, token)
+		writes = append(writes, observationWrite{Capability: CapGiftWrapAccept, Status: status, Detail: detail, Confidence: 0.55})
 	}
 	switch evidence.Auth {
 	case "ok":
-		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusVerified, 0.7, "probe", "auth_succeeded", token)
+		writes = append(writes, observationWrite{Capability: CapAuthGiftWrap, Status: StatusVerified, Detail: "auth_succeeded", Confidence: 0.7})
 	case "unauthorized":
-		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusRestricted, 0.6, "probe", "auth_rejected", token)
+		writes = append(writes, observationWrite{Capability: CapAuthGiftWrap, Status: StatusRestricted, Detail: "auth_rejected", Confidence: 0.6})
+	}
+	attemptStatus := evidence.Outcome
+	if attemptStatus == "" {
+		attemptStatus = "incomplete"
 	}
 	switch evidence.Outcome {
 	case "private":
-		_ = storeObservation(ctx, pool, key, CapGiftWrapPrivate, StatusVerified, 0.8, "probe", "recipient_only", token)
-		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusVerified, 0.8, "probe", "recipient_only", token)
+		writes = append(writes,
+			observationWrite{Capability: CapGiftWrapPrivate, Status: StatusVerified, Detail: "recipient_only " + accessPathSummary(evidence), Confidence: 0.8},
+			observationWrite{Capability: CapGiftWrap, Status: StatusVerified, Detail: "recipient_only " + accessPathSummary(evidence), Confidence: 0.8},
+		)
 		metrics.IncRelayIntelProbe("giftwrap", "ok")
 	case "public":
-		_ = storeObservation(ctx, pool, key, CapGiftWrapPublic, StatusVerified, 0.8, "probe", "observer_retrieved", token)
-		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusRestricted, 0.7, "probe", "publicly_accessible", token)
+		detail := "observer_retrieved"
+		if evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverTag.SeenBeforeAuth || evidence.AnonExact.SeenBeforeAuth || evidence.AnonTag.SeenBeforeAuth {
+			detail = "retrieved_before_auth"
+		}
+		writes = append(writes,
+			observationWrite{Capability: CapGiftWrapPublic, Status: StatusVerified, Detail: detail + " " + accessPathSummary(evidence), Confidence: 0.8},
+			observationWrite{Capability: CapGiftWrap, Status: StatusRestricted, Detail: "publicly_accessible " + accessPathSummary(evidence), Confidence: 0.7},
+		)
 		metrics.IncRelayIntelProbe("giftwrap", "public")
 	default:
 		if evidence.Accept == "accepted" {
-			_ = storeObservation(ctx, pool, key, CapGiftWrapPrivate, "inconclusive", 0.35, "probe", evidence.Outcome, token)
+			writes = append(writes, observationWrite{Capability: CapGiftWrapPrivate, Status: "inconclusive", Detail: evidence.Outcome, Confidence: 0.35})
 		}
 		metrics.IncRelayIntelProbe("giftwrap", "inconclusive")
 	}
+	return commitProbeResult(ctx, pool, key, token, attemptStatus, 0, "", "", 0, writes)
 }
 
 func classifyGiftWrap(evidence giftWrapEvidence) string {
@@ -214,12 +239,13 @@ func classifyGiftWrap(evidence giftWrapEvidence) string {
 		return evidence.Accept
 	}
 	if evidence.Checked {
-		if evidence.ObserverExact.Hit || evidence.ObserverTag.Hit || evidence.AnonExact.Hit || evidence.AnonTag.Hit {
+		if evidence.ObserverExact.Hit || evidence.ObserverTag.Hit || evidence.AnonExact.Hit || evidence.AnonTag.Hit ||
+			evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverTag.SeenBeforeAuth || evidence.AnonExact.SeenBeforeAuth || evidence.AnonTag.SeenBeforeAuth {
 			return "public"
 		}
 		recipientOK := pathEstablished(evidence.RecipientExact, true) && pathEstablished(evidence.RecipientTag, true)
-		observerOK := pathEstablished(evidence.ObserverExact, false) && pathEstablished(evidence.ObserverTag, false)
-		anonOK := anonClosed(evidence.AnonExact) && anonClosed(evidence.AnonTag)
+		observerOK := negativeEvidence(evidence.ObserverExact, true) && negativeEvidence(evidence.ObserverTag, true)
+		anonOK := negativeEvidence(evidence.AnonExact, false) && negativeEvidence(evidence.AnonTag, false)
 		if recipientOK && observerOK && anonOK {
 			return "private"
 		}
@@ -231,13 +257,30 @@ func classifyGiftWrap(evidence giftWrapEvidence) string {
 	if evidence.ObserverHit {
 		return "public"
 	}
-	if evidence.Recipient == "complete" && evidence.RecipientHit && evidence.Observer == "complete" && !evidence.ObserverHit {
-		return "private"
-	}
 	if evidence.Recipient == "complete" && evidence.RecipientHit {
 		return "retrieved_privacy_unknown"
 	}
 	return "accepted_only"
+}
+
+func accessPathSummary(evidence giftWrapEvidence) string {
+	return fmt.Sprintf("recipient_exact=%s hit=%t before_auth=%t recipient_tag=%s hit=%t before_auth=%t observer_exact=%s hit=%t before_auth=%t observer_tag=%s hit=%t before_auth=%t anon_exact=%s hit=%t before_auth=%t anon_tag=%s hit=%t before_auth=%t",
+		evidence.RecipientExact.Status, evidence.RecipientExact.Hit, evidence.RecipientExact.SeenBeforeAuth,
+		evidence.RecipientTag.Status, evidence.RecipientTag.Hit, evidence.RecipientTag.SeenBeforeAuth,
+		evidence.ObserverExact.Status, evidence.ObserverExact.Hit, evidence.ObserverExact.SeenBeforeAuth,
+		evidence.ObserverTag.Status, evidence.ObserverTag.Hit, evidence.ObserverTag.SeenBeforeAuth,
+		evidence.AnonExact.Status, evidence.AnonExact.Hit, evidence.AnonExact.SeenBeforeAuth,
+		evidence.AnonTag.Status, evidence.AnonTag.Hit, evidence.AnonTag.SeenBeforeAuth)
+}
+
+func negativeEvidence(result accessResult, authenticatedPath bool) bool {
+	if result.Hit || result.SeenBeforeAuth {
+		return false
+	}
+	if authenticatedPath {
+		return result.Authenticated && (result.Status == "complete" || result.Status == "denied")
+	}
+	return !result.Authenticated && (result.Status == "complete" || result.Status == "auth_required")
 }
 
 func pathEstablished(result accessResult, wantHit bool) bool {
@@ -245,10 +288,6 @@ func pathEstablished(result accessResult, wantHit bool) bool {
 		return false
 	}
 	return true
-}
-
-func anonClosed(result accessResult) bool {
-	return result.Status == "complete" && !result.Hit && !result.Authenticated
 }
 
 func buildGiftWrap(sender *btcec.PrivateKey, senderPub, recipientPub string) (map[string]any, error) {

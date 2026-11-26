@@ -1517,14 +1517,20 @@ type RelayProbeAttempt struct {
 }
 
 type RelayProbeFollowup struct {
-	ID          int64
-	UrlKey      string
-	EndpointUrl string
-	EventID     string
-	Capability  string
-	CheckAfter  pgtype.Timestamptz
-	FinishedAt  pgtype.Timestamptz
-	Result      string
+	ID             int64
+	UrlKey         string
+	EndpointUrl    string
+	EventID        string
+	Capability     string
+	CheckAfter     pgtype.Timestamptz
+	FinishedAt     pgtype.Timestamptz
+	Result         string
+	Status         string
+	LeaseToken     string
+	PublishedAt    pgtype.Timestamptz
+	VerifiedAt     pgtype.Timestamptz
+	ElapsedSeconds pgtype.Int4
+	Attempts       int32
 }
 
 type RelayProbeIdentity struct {

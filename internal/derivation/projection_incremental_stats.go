@@ -64,7 +64,7 @@ func (h *Handlers) ApplyIncrementalAuthorStats(ctx context.Context, eventID stri
 	// Gift wraps are signed by an ephemeral key. Touching profile and
 	// activity rows for that key creates one stats row per wrap and
 	// does not describe a person.
-	if kind == 1059 || relayintel.SyntheticPubkey(pubkey) {
+	if kind == 1059 || relayintel.SyntheticAuthor(ctx, h.pool, pubkey) {
 		return nil
 	}
 

@@ -1,6 +1,8 @@
 package relayintel
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -175,8 +177,41 @@ func TestGiftWrapDecryptsOnlyForTheRecipient(t *testing.T) {
 	if classifyGiftWrap(giftWrapEvidence{Accept: "accepted", Recipient: "complete", RecipientHit: true, Observer: "complete", ObserverHit: true}) != "public" {
 		t.Fatal("a public gift wrap was classified as private")
 	}
-	if classifyGiftWrap(giftWrapEvidence{Accept: "accepted", Recipient: "complete", RecipientHit: true, Observer: "complete"}) != "private" {
+	if classifyGiftWrap(giftWrapEvidence{
+		Accept: "accepted", Checked: true,
+		RecipientExact: accessResult{Status: "complete", Hit: true, Authenticated: true},
+		RecipientTag:   accessResult{Status: "complete", Hit: true, Authenticated: true},
+		ObserverExact:  accessResult{Status: "complete", Authenticated: true},
+		ObserverTag:    accessResult{Status: "complete", Authenticated: true},
+		AnonExact:      accessResult{Status: "complete"},
+		AnonTag:        accessResult{Status: "complete"},
+	}) != "private" {
 		t.Fatal("recipient-only access was not recognized")
+	}
+	denied := giftWrapEvidence{
+		Accept: "accepted", Checked: true,
+		RecipientExact: accessResult{Status: "complete", Hit: true, Authenticated: true},
+		RecipientTag:   accessResult{Status: "complete", Hit: true, Authenticated: true},
+		ObserverExact:  accessResult{Status: "denied", Authenticated: true},
+		ObserverTag:    accessResult{Status: "denied", Authenticated: true},
+		AnonExact:      accessResult{Status: "auth_required"},
+		AnonTag:        accessResult{Status: "auth_required"},
+	}
+	if classifyGiftWrap(denied) != "private" {
+		t.Fatal("an explicit authorization denial was not negative evidence")
+	}
+	denied.ObserverExact.Status = "payment_required"
+	if classifyGiftWrap(denied) == "private" {
+		t.Fatal("a payment restriction proved recipient-only access")
+	}
+	denied.ObserverExact.Status = "rate_limited"
+	if classifyGiftWrap(denied) == "private" {
+		t.Fatal("a rate limit proved recipient-only access")
+	}
+	denied.ObserverExact.Status = "denied"
+	denied.AnonExact.Status = "incomplete"
+	if classifyGiftWrap(denied) == "private" {
+		t.Fatal("an incomplete anonymous query proved recipient-only access")
 	}
 }
 
@@ -337,6 +372,146 @@ func TestAcceptedGiftWrapIsNotPrivate(t *testing.T) {
 	}
 }
 
+func TestExposureBeforeAuthSurvivesAuthentication(t *testing.T) {
+	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
+	recipientPub := pubOf(recipient)
+	var published map[string]any
+	server := giftWrapServer(t, recipientPub, &published, "expose_then_deny")
+	defer server.Close()
+	state := &probeState{
+		key: sender, pubkey: pubOf(sender), allowPrivate: true,
+		recipientKey: recipient, recipientPub: recipientPub,
+		observerKey: observer, observerPub: pubOf(observer),
+		allowlist: []string{probeHost(wsURL(server))},
+	}
+	evidence := state.exchangeGiftWrap(t.Context(), nil, wsURL(server))
+	if evidence.Outcome != "public" {
+		t.Fatalf("pre-auth exposure became %s: %+v", evidence.Outcome, evidence)
+	}
+	if !evidence.ObserverExact.SeenBeforeAuth || !evidence.ObserverExact.Hit || !evidence.AnonExact.Hit {
+		t.Fatalf("unauthorized retrieval was not retained: %+v", evidence)
+	}
+}
+
+func TestSubscriptionRetriesAfterAuthRequiredClose(t *testing.T) {
+	key := newKey(t)
+	pubkey := pubOf(key)
+	event, err := signProbeEvent(key, pubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := event["id"].(string)
+	var opened []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var frame []json.RawMessage
+			if json.Unmarshal(payload, &frame) != nil || len(frame) == 0 {
+				continue
+			}
+			var typ string
+			_ = json.Unmarshal(frame[0], &typ)
+			switch typ {
+			case "REQ":
+				var sub string
+				_ = json.Unmarshal(frame[1], &sub)
+				opened = append(opened, sub)
+				if len(opened) == 1 {
+					_ = conn.WriteJSON([]any{"CLOSED", sub, "auth-required: sign in"})
+					_ = conn.WriteJSON([]any{"AUTH", "sub-challenge"})
+					continue
+				}
+				_ = conn.WriteJSON([]any{"EOSE", opened[0]})
+				_ = conn.WriteJSON([]any{"EOSE", sub})
+			case "AUTH":
+				var signed map[string]any
+				if json.Unmarshal(frame[1], &signed) != nil || signed["kind"] != float64(22242) {
+					return
+				}
+				tags, _ := signed["tags"].([]any)
+				var relayOK, challengeOK bool
+				for _, raw := range tags {
+					tag, _ := raw.([]any)
+					if len(tag) < 2 {
+						continue
+					}
+					name, _ := tag[0].(string)
+					value, _ := tag[1].(string)
+					if name == "relay" && value != "" {
+						relayOK = true
+					}
+					if name == "challenge" && value == "sub-challenge" {
+						challengeOK = true
+					}
+				}
+				if !relayOK || !challengeOK {
+					return
+				}
+				authID, _ := signed["id"].(string)
+				_ = conn.WriteJSON([]any{"OK", authID, true, ""})
+			}
+		}
+	}))
+	defer server.Close()
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	status, ids, _, authenticated := readSubscription(context.Background(), conn, "nm-gift", map[string]any{"ids": []string{id}, "limit": 1}, time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+		if challenge != "sub-challenge" {
+			t.Fatalf("challenge = %s", challenge)
+		}
+		return signAuth(key, pubkey, wsURL(server), challenge)
+	})
+	if status != "complete" || !authenticated || len(ids) != 0 {
+		t.Fatalf("status=%s auth=%v ids=%v opened=%v", status, authenticated, ids, opened)
+	}
+	if len(opened) < 2 || opened[0] == opened[1] {
+		t.Fatalf("subscription was not reopened: %v", opened)
+	}
+}
+
+func TestOversizedFrameDoesNotCompleteASubscription(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		frame := append([]byte(`["EOSE","nm-gift","`), bytes.Repeat([]byte("x"), 70*1024)...)
+		frame = append(frame, ']', byte('"'), ']')
+		_ = conn.WriteMessage(websocket.TextMessage, frame)
+	}))
+	defer server.Close()
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	status, ids, exposed, _ := readSubscription(context.Background(), conn, "nm-gift", map[string]any{"limit": 1}, time.Now().Add(2*time.Second), nil)
+	if status != "incomplete" || len(ids) != 0 || len(exposed) != 0 {
+		t.Fatalf("status=%s ids=%v exposed=%v", status, ids, exposed)
+	}
+}
+
 func newKey(t *testing.T) *btcec.PrivateKey {
 	t.Helper()
 	key, err := btcec.NewPrivateKey()
@@ -408,6 +583,18 @@ func giftWrapServer(t *testing.T, recipient string, published *map[string]any, m
 				_ = json.Unmarshal(frame[1], &sub)
 				var filter map[string]any
 				_ = json.Unmarshal(frame[2], &filter)
+				if mode == "expose_then_deny" && authed == "" {
+					if *published != nil {
+						_ = conn.WriteJSON([]any{"EVENT", sub, *published})
+					}
+					_ = conn.WriteJSON([]any{"AUTH", "gift-challenge"})
+					_ = conn.WriteJSON([]any{"EOSE", sub})
+					continue
+				}
+				if mode == "expose_then_deny" {
+					_ = conn.WriteJSON([]any{"CLOSED", sub, "restricted: not authorized"})
+					continue
+				}
 				if mode != "public" && authed == "" {
 					_ = conn.WriteJSON([]any{"AUTH", "gift-challenge"})
 					_ = conn.WriteJSON([]any{"EOSE", sub})
