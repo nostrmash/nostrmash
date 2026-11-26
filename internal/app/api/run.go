@@ -259,6 +259,7 @@ func Run(ctx context.Context, log *slog.Logger, build BuildInfo, stop func()) er
 		QueryOptions:          queryOptions,
 		Hydration:             cfg.Hydration,
 		RelayCatalogFreshness: cfg.RelayCatalogFreshness,
+		RelayIntel:            cfg.RelayIntel,
 		DiscoveryCache: &api.DiscoveryCacheOptions{
 			Enabled:         &discoveryCacheEnabled,
 			MaxEntries:      cfg.DiscoveryCache.MaxEntries,

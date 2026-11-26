@@ -23,7 +23,7 @@ func (h *Handlers) rebuildProfileFieldsWithVersion(ctx context.Context, versionO
 func (h *Handlers) rebuildSurfacesWithVersion(ctx context.Context, versionOverride *int) error {
 	return h.rebuildProjectKinds(ctx, DerivationSurfaces, []int{
 		8, 9, 11, 1018, 1063, 1068, 1311, 1985, 9041,
-		10000, 10006, 10007, 10009, 10012, 10015, 10030, 10063,
+		10000, 10006, 10007, 10009, 10012, 10013, 10015, 10030, 10051, 10063, 10102,
 		30002, 30004, 30005, 30008, 30009, 30015, 30315,
 		39000, 39001, 39002, 39003,
 	}, h.projectSurfacesWithVersion, versionOverride)

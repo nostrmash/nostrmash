@@ -242,7 +242,7 @@ func (s *adminService) GetSearchStatus(ctx context.Context) (adminSearchStatusRe
 						events.created_at
 					FROM events
 					WHERE events.kind = 0
-					ORDER BY events.pubkey, events.created_at DESC, events.id DESC
+					ORDER BY events.pubkey, events.created_at DESC, events.id ASC
 				)
 				SELECT COUNT(*)
 				FROM latest_kind0
@@ -251,7 +251,7 @@ func (s *adminService) GetSearchStatus(ctx context.Context) (adminSearchStatusRe
 					OR latest_kind0.created_at > profiles_latest.metadata_created_at
 					OR (
 						latest_kind0.created_at = profiles_latest.metadata_created_at
-						AND latest_kind0.id > profiles_latest.metadata_event_id
+						AND latest_kind0.id < profiles_latest.metadata_event_id
 					)
 			),
 			(

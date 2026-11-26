@@ -78,6 +78,9 @@ func (h *Handlers) projectSurfacesWithVersion(ctx context.Context, eventID strin
 		err = projectInterestListTx(ctx, tx, pubkey, kind, tags)
 	case 30002, 10006, 10007, 10012:
 		err = projectRelayPreferenceTx(ctx, tx, pubkey, kind, tags)
+	case 10013, 10051, 10102:
+		// Role rows are written by projectRelayIntelEvent after commit.
+		// Kind 10013 stays client-side: no relay URLs are indexed here.
 	case 10063:
 		err = projectBlossomTx(ctx, tx, pubkey, tags)
 	case 10030:
@@ -97,13 +100,17 @@ func (h *Handlers) projectSurfacesWithVersion(ctx context.Context, eventID strin
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit surfaces: %w", err)
 	}
+	switch kind {
+	case 10006, 10007, 10012, 10013, 10051, 10063, 10102, 30002:
+		return h.projectRelayIntelEvent(ctx, eventID)
+	}
 	return nil
 }
 
 func isSurfaceKind(kind int) bool {
 	switch kind {
 	case 8, 9, 11, 1018, 1063, 1068, 1311, 1985, 9041,
-		10000, 10006, 10007, 10009, 10012, 10015, 10030, 10063,
+		10000, 10006, 10007, 10009, 10012, 10013, 10015, 10030, 10051, 10063, 10102,
 		30002, 30004, 30005, 30008, 30009, 30015, 30315,
 		39000, 39001, 39002, 39003:
 		return true

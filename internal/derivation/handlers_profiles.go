@@ -45,7 +45,7 @@ func (h *Handlers) projectProfilesLatestWithVersion(ctx context.Context, eventID
 		FROM events
 		WHERE pubkey = $1
 		  AND kind = 0
-		ORDER BY created_at DESC, id DESC
+		ORDER BY created_at DESC, id ASC
 		LIMIT 1
 	`, pubkey).Scan(&winner.EventID, &winner.CreatedAt, &winner.Content)
 	if err != nil {

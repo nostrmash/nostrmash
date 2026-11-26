@@ -85,6 +85,7 @@ Choose the path that matches what you need:
 | Contributing changes | [CONTRIBUTING.md](CONTRIBUTING.md) | [docs/testing.md](docs/testing.md) |
 | Operating compatibility surfaces | [docs/primal_compatibility_matrix.md](docs/primal_compatibility_matrix.md) | [docs/compatibility_rollout.md](docs/compatibility_rollout.md) |
 | Planning trust and ranking work | [docs/architecture/trust-subsystem.md](docs/architecture/trust-subsystem.md) | [docs/architecture/trust-bounded-ingest.md](docs/architecture/trust-bounded-ingest.md) |
+| Relay roles and recommendations | [docs/architecture/relay-intelligence.md](docs/architecture/relay-intelligence.md) | [docs/openapi.yaml](docs/openapi.yaml) |
 | Bounding storage after deploy/wipe | [docs/architecture/trust-bounded-ingest.md](docs/architecture/trust-bounded-ingest.md) | [docs/operations.md#trust-bounded-ingest-rollout](docs/operations.md#trust-bounded-ingest-rollout) |
 
 For the complete docs hub and source-of-truth map, use [docs/README.md](docs/README.md).

@@ -127,7 +127,7 @@ func latestMetadataIsNewer(current ProfileProjection, latest ProfileProjection) 
 	if latest.MetadataCreatedAt != current.MetadataCreatedAt {
 		return latest.MetadataCreatedAt > current.MetadataCreatedAt
 	}
-	return strings.TrimSpace(latest.MetadataEventID) > strings.TrimSpace(current.MetadataEventID)
+	return strings.TrimSpace(latest.MetadataEventID) < strings.TrimSpace(current.MetadataEventID)
 }
 
 func (s *PostgresStore) getProfileProjectionFromLatestMetadataEvent(ctx context.Context, pubkey string) (ProfileProjection, error) {
@@ -154,7 +154,7 @@ func (s *PostgresStore) getProfileProjectionsFromLatestMetadataEvents(
 		FROM events
 		WHERE kind = 0
 		  AND pubkey = ANY($1::text[])
-		ORDER BY pubkey, created_at DESC, id DESC
+		ORDER BY pubkey, created_at DESC, id ASC
 	`, pubkeys)
 	if err != nil {
 		return nil, fmt.Errorf("get latest metadata events by pubkey: %w", err)

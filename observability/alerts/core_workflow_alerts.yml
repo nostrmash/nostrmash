@@ -396,3 +396,25 @@ groups:
           summary: "Storage pressure critical: candidate ingest paused"
           description: "Storage pressure level 4 (pause_candidate) for 5m. Candidate-expanding ingest is paused and the gate is forced trusted_only. Operator intervention required: expand storage or reduce retained data."
           runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRelayIntelStatsStale
+        expr: nostrmash_relay_intel_stats_age_seconds > 1800
+        for: 20m
+        labels:
+          severity: warning
+          slo: freshness
+        annotations:
+          summary: "Relay role statistics are stale"
+          description: "The role-stat snapshot is older than 30 minutes. Rankings serve the previous aggregate. The combined popular-relays API is independent. Check the worker relay-intel loop and migration 000133."
+          runbook: "docs/operations.md#alert-response-playbook"
+
+      - alert: NostrMashRelayIntelProbeErrors
+        expr: sum(rate(nostrmash_relay_intel_probe_total{outcome="error"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          slo: freshness
+        annotations:
+          summary: "Relay intelligence probes are failing"
+          description: "Active probes are reporting errors. They are disabled unless RELAY_INTEL_ACTIVE_PROBES is set. Do not raise the hourly budget to compensate. Labels are class and outcome only."
+          runbook: "docs/operations.md#alert-response-playbook"

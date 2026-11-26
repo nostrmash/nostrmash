@@ -14,7 +14,7 @@ func (h *Handlers) ProjectContactListsLatest(ctx context.Context, eventID string
 }
 
 func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		3,
@@ -59,8 +59,9 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				WHERE EXCLUDED.created_at > contact_lists_latest.created_at
 				   OR (
 				       EXCLUDED.created_at = contact_lists_latest.created_at
-				       AND EXCLUDED.event_id >= contact_lists_latest.event_id
+				       AND EXCLUDED.event_id < contact_lists_latest.event_id
 				   )
+				   OR EXCLUDED.event_id = contact_lists_latest.event_id
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert contact_lists_latest: %w", err)
@@ -174,7 +175,10 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) error {
@@ -182,7 +186,7 @@ func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) 
 }
 
 func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		10002,
@@ -227,7 +231,7 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 				WHERE EXCLUDED.created_at > relay_lists_latest.created_at
 				   OR (
 				       EXCLUDED.created_at = relay_lists_latest.created_at
-				       AND EXCLUDED.event_id >= relay_lists_latest.event_id
+				       AND EXCLUDED.event_id < relay_lists_latest.event_id
 				   )
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
@@ -235,7 +239,12 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	// Markers are stored in relay_role_memberships. relays_json stays a URL
+	// array so existing discovery and API readers keep their contract.
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 type replaceableListPayloadBuilder func(tags [][]string) json.RawMessage

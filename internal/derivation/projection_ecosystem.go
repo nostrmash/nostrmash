@@ -218,7 +218,7 @@ func (h *Handlers) projectProfileFieldsWithVersion(ctx context.Context, eventID 
 	if err := h.pool.QueryRow(ctx, `
 		SELECT id, created_at, content FROM events
 		WHERE pubkey = $1 AND kind = 0
-		ORDER BY created_at DESC, id DESC
+		ORDER BY created_at DESC, id ASC
 		LIMIT 1
 	`, pubkey).Scan(&winnerID, &createdAt, &content); err != nil {
 		return fmt.Errorf("load latest profile content: %w", err)
@@ -577,7 +577,7 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	if err := h.pool.QueryRow(ctx, `
 		SELECT id, created_at FROM events
 		WHERE pubkey = $1 AND kind = $2
-		ORDER BY created_at DESC, id DESC
+		ORDER BY created_at DESC, id ASC
 		LIMIT 1
 	`, pubkey, kind).Scan(&winnerID, &createdAt); err != nil {
 		return fmt.Errorf("load latest extended list: %w", err)
@@ -653,6 +653,9 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit extended lists: %w", err)
+	}
+	if kind == 10050 {
+		return h.projectRelayIntelEvent(ctx, eventID)
 	}
 	return nil
 }

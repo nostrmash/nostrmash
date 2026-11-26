@@ -92,7 +92,7 @@ func (h *Handlers) ProjectDeletionEvents(ctx context.Context, eventID string) er
 }
 
 func (h *Handlers) projectDeletionEventsWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectInteractionEvent(
+	if err := h.projectInteractionEvent(
 		ctx,
 		eventID,
 		5,
@@ -121,7 +121,10 @@ func (h *Handlers) projectDeletionEventsWithVersion(ctx context.Context, eventID
 			}
 			return h.reconcileDMUnreadForDeletedTarget(ctx, tx, targetEventID)
 		},
-	)
+	); err != nil {
+		return err
+	}
+	return h.clearRelayIntelDeletion(ctx, eventID)
 }
 
 type interactionSource struct {

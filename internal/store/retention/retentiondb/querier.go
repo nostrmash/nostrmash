@@ -108,7 +108,8 @@ type Querier interface {
 	// displaces the current winner, and when a losing version is derived. Cost follows the queued
 	// backlog, not the size of events. The queue has no foreign key, so this
 	// statement removes both the event and its queue row. gone drops ids whose
-	// event was deleted by something else.
+	// event was deleted by something else. A queued id that is the current
+	// replaceable_state winner is removed from the queue and is not deleted.
 	PurgeSupersededReplaceableEvents(ctx context.Context, arg PurgeSupersededReplaceableEventsParams) (int64, error)
 	PurgeUntrustedAuthorEventHashtags(ctx context.Context, rowLimit int32) (int64, error)
 	PurgeUntrustedAuthorEventURLs(ctx context.Context, rowLimit int32) (int64, error)

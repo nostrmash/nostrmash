@@ -29,6 +29,7 @@ What it does not try to be:
 - [Alert response playbook](#alert-response-playbook)
 - [Debug and build identity](#debug-and-build-identity)
 - [Trust-bounded ingest rollout](#trust-bounded-ingest-rollout)
+- [Relay intelligence](#relay-intelligence)
 - [Contributor handoff checklist](#contributor-handoff-checklist)
 
 ## Operator checklist
@@ -204,6 +205,18 @@ Purges raw deletion events (kind `5`) after their derivation completes. The dist
 ### Deprecated
 
 - `TRUST_CANONICAL_INGEST_MODE` — deprecated, not wired. Use `INGESTOR_TRUST_GATE_MODE`.
+
+## Relay intelligence
+
+Role-aware recommendations are on by default after migration `000133_relay_role_intelligence.sql`. The design, including what is not verified, is [architecture/relay-intelligence.md](architecture/relay-intelligence.md).
+
+- Apply `000133` before expecting role rows. Until then, new event projection no-ops and the API returns 503 `schema_not_ready`. `GET /api/v1/relays/popular` does not read the new tables.
+- `RELAY_INTEL_ENABLED=false` returns 404 from the new routes and stops the worker loop. Existing rows stay.
+- The worker rebuilds `relay_role_stats` about every 10 minutes and backfills stored events at 200 per 5 seconds. That backfill does not crawl relays.
+- Active write probes are off. Turning `RELAY_INTEL_ACTIVE_PROBES` on requires `RELAY_INTEL_PROBE_SECRET_KEY` on the worker only. The API never loads that key. Gift-wrap probes are not implemented.
+- `RELAY_INTEL_ALLOW_PRIVATE_NETWORK` is for a self-hosted deployment that must verify loopback or RFC1918 relays. Link-local and metadata hosts stay blocked. Leave it false on the public deployment.
+- Rankings can be empty with `stats_not_ready` until the first successful aggregate refresh. That is not an outage of the popular-relays API.
+- Optimize and verify do not publish events. A single relay read-back is not global propagation.
 
 ## Contributor handoff checklist
 
@@ -791,6 +804,12 @@ Alert rules are defined in `observability/alerts/core_workflow_alerts.yml`. Use 
 - `NostrMashMeilisearchSweeperStalled`
   - Meaning: no Meilisearch sweeper batch (success or error) has completed in 15m while the queue is non-empty — every sweeper goroutine is hung, not just slow. Seen in production as `pending_meilisearch_syncs` growing for hours with the sweeper's processed counter completely flat.
   - Check next: restart the `worker` container to clear stuck goroutines (queue should start draining within seconds); `WORKER_MEILISEARCH_SWEEPER_BATCH_TIMEOUT` bounds each goroutine so a recurrence should self-heal within that timeout instead of hanging indefinitely. If it recurs, check Meilisearch CPU/health for the underlying cause.
+- `NostrMashRelayIntelStatsStale`
+  - Meaning: the worker's role-stat snapshot is older than 30 minutes. Rankings keep serving the previous snapshot. `GET /api/v1/relays/popular` is a different query and can still be fresh.
+  - Check next: worker logs for relay-intel stats errors, database load, and whether `RELAY_INTEL_STATS_ENABLED` is true. A missing `000133` migration leaves this gauge untouched.
+- `NostrMashRelayIntelProbeErrors`
+  - Meaning: active probes are failing. Probes are off unless `RELAY_INTEL_ACTIVE_PROBES=true`, so this stays quiet on the default deployment.
+  - Check next: worker logs and the probe budget. Do not raise the hourly budget to push through errors. Gift-wrap probes are unimplemented and do not count as this alert.
 
 ## Debug and build identity
 

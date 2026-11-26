@@ -70,7 +70,7 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 			WHERE EXCLUDED.created_at > replaceable_state.created_at
 			   OR (
 			       EXCLUDED.created_at = replaceable_state.created_at
-			       AND EXCLUDED.event_id > replaceable_state.event_id
+			       AND EXCLUDED.event_id < replaceable_state.event_id
 			   )
 			RETURNING event_id
 		)

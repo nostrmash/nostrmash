@@ -601,7 +601,15 @@ func (q *Queries) PurgeStaleTrustedProfileDiscoveryCandidates(ctx context.Contex
 }
 
 const purgeSupersededReplaceableEvents = `-- name: PurgeSupersededReplaceableEvents :execrows
-WITH gone AS (
+WITH unqueue_winners AS (
+    DELETE FROM replaceable_event_purge p
+    WHERE EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+    )
+    RETURNING p.event_id
+),
+gone AS (
     SELECT p.event_id
     FROM replaceable_event_purge p
     WHERE NOT EXISTS (
@@ -620,6 +628,14 @@ candidates AS (
     JOIN events e ON e.id = p.event_id
     WHERE e.kind = ANY($2::int[])
       AND e.first_seen_at < $3
+      AND NOT EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM unqueue_winners uw
+        WHERE uw.event_id = p.event_id
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM jobs j
@@ -653,7 +669,8 @@ type PurgeSupersededReplaceableEventsParams struct {
 // displaces the current winner, and when a losing version is derived. Cost follows the queued
 // backlog, not the size of events. The queue has no foreign key, so this
 // statement removes both the event and its queue row. gone drops ids whose
-// event was deleted by something else.
+// event was deleted by something else. A queued id that is the current
+// replaceable_state winner is removed from the queue and is not deleted.
 func (q *Queries) PurgeSupersededReplaceableEvents(ctx context.Context, arg PurgeSupersededReplaceableEventsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, purgeSupersededReplaceableEvents,
 		arg.RowLimit,

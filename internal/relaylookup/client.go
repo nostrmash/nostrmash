@@ -373,7 +373,7 @@ func (c *Client) FetchProfilesByPubkeys(ctx context.Context, pubkeys []string) (
 			if evt.CreatedAt < winner.MetadataCreatedAt {
 				continue
 			}
-			if evt.CreatedAt == winner.MetadataCreatedAt && evt.ID <= winner.MetadataEventID {
+			if evt.CreatedAt == winner.MetadataCreatedAt && evt.ID >= winner.MetadataEventID {
 				continue
 			}
 		}
