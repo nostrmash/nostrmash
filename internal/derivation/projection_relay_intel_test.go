@@ -121,7 +121,7 @@ func TestRelayRoleProjectionKeepsMarkersAndLegacyApart(t *testing.T) {
 		t.Fatalf("private head=%v members=%d", clientSide, privateMembers)
 	}
 	var registry int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_registry WHERE relay_url LIKE '%secret.example%'`).Scan(&registry); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_registry WHERE normalized_url LIKE '%secret.example%'`).Scan(&registry); err != nil {
 		t.Fatal(err)
 	}
 	if registry != 0 {
