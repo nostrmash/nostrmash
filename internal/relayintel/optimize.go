@@ -121,7 +121,7 @@ func Select(req SelectRequest) SelectResult {
 		if !relay.Pinned {
 			continue
 		}
-		if relay.IneligibleReason == "blocked_by_account" {
+		if absoluteProhibition(relay) {
 			result.ConstraintsSatisfied = false
 			result.Unsatisfied = append(result.Unsatisfied, Reason{
 				Code: "blocked_by_account",
@@ -141,7 +141,7 @@ func Select(req SelectRequest) SelectResult {
 	}
 	excludedPins := 0
 	for _, relay := range relays {
-		if relay.Pinned && !relay.Eligible && relay.IneligibleReason != "blocked_by_account" {
+		if relay.Pinned && !relay.Eligible && !absoluteProhibition(relay) {
 			excludedPins++
 		}
 	}
@@ -189,7 +189,7 @@ func Select(req SelectRequest) SelectResult {
 			if !relay.Current {
 				continue
 			}
-			if hardIneligible(relay) && !relay.Pinned {
+			if absoluteProhibition(relay) || (hardIneligible(relay) && !relay.Pinned) {
 				result.ConstraintsSatisfied = false
 				result.Unsatisfied = append(result.Unsatisfied, Reason{
 					Code: relay.IneligibleReason,
@@ -282,7 +282,7 @@ func improveBySwap(selected, relays []ScoredRelay, seen map[string]struct{}, kno
 				if _, ok := seen[alt.URL]; ok {
 					continue
 				}
-				if alt.IneligibleReason == "blocked_by_account" || (hardIneligible(alt) && !alt.Pinned) {
+				if absoluteProhibition(alt) || (hardIneligible(alt) && !alt.Pinned) {
 					continue
 				}
 				if !alt.Eligible && !alt.Pinned && !alt.Custom {
@@ -397,7 +397,7 @@ func bestAddition(selected, relays []ScoredRelay, seen map[string]struct{}, know
 		if _, ok := seen[relay.URL]; ok {
 			continue
 		}
-		if relay.IneligibleReason == "blocked_by_account" || (hardIneligible(relay) && !relay.Pinned) {
+		if absoluteProhibition(relay) || (hardIneligible(relay) && !relay.Pinned) {
 			continue
 		}
 		if !relay.Eligible && !relay.Pinned && !relay.Custom && !relay.Current {
@@ -580,8 +580,13 @@ func coverageDefinition(role string) string {
 }
 
 func hardIneligible(relay ScoredRelay) bool {
+	for _, violation := range relay.Violations {
+		if violation.Hard {
+			return true
+		}
+	}
 	switch relay.IneligibleReason {
-	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected", "excluded":
+	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected", "excluded", "min_reliability", "min_capability_confidence":
 		return true
 	default:
 		return false

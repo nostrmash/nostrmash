@@ -8,6 +8,107 @@ import (
 	"time"
 )
 
+func TestBlockedAndPaidPinKeepsTheBlock(t *testing.T) {
+	pay := true
+	relay := ScoreRelay(ScoreInput{
+		Role: RolePublicInbox, Pinned: true, Blocked: true, FreeOnly: true, PaymentRequired: &pay,
+	})
+	if relay.Eligible || relay.IneligibleReason != "blocked_by_account" {
+		t.Fatalf("primary = %s eligible=%v", relay.IneligibleReason, relay.Eligible)
+	}
+	if !hasViolation(relay, "blocked_by_account") || !hasViolation(relay, "payment_required") {
+		t.Fatalf("violations = %#v", relay.Violations)
+	}
+	relay.URL = "wss://blocked.example"
+	relay.Pinned = true
+	other := scored("wss://other.example", 0.4, "host:other", map[string]float64{"a": 1})
+	result := Select(SelectRequest{
+		Role: RolePublicInbox, Min: 1, Max: 1,
+		Relays: []ScoredRelay{relay, other},
+	})
+	if containsURL(result, relay.URL) || result.ConstraintsSatisfied {
+		t.Fatalf("blocked pin survived: %#v %+v", result.Selected, result.Unsatisfied)
+	}
+}
+
+func TestConstraintCombinationsNeverRestoreABlock(t *testing.T) {
+	for pins := 0; pins < 2; pins++ {
+		for blocked := 0; blocked < 2; blocked++ {
+			for excluded := 0; excluded < 2; excluded++ {
+				relay := scored("wss://mix.example", 0.9, "host:mix", map[string]float64{"a": 1})
+				relay.Current = true
+				relay.Pinned = pins == 1
+				if blocked == 1 {
+					relay.Violations = append(relay.Violations, Violation{Code: "blocked_by_account", Hard: true, BlocksSigning: true})
+					relay.Eligible = false
+					relay.IneligibleReason = "blocked_by_account"
+				}
+				if excluded == 1 {
+					relay.Violations = append(relay.Violations, Violation{Code: "excluded", Hard: true, ManualRetention: true, BlocksSigning: true})
+					if relay.IneligibleReason == "" {
+						relay.IneligibleReason = "excluded"
+					}
+					if !relay.Pinned {
+						relay.Eligible = false
+					}
+				}
+				result := Select(SelectRequest{
+					Role: RolePublicInbox, Min: 1, Max: 1, RetainExisting: true, Hysteresis: 0.08,
+					Relays: []ScoredRelay{relay, scored("wss://other.example", 0.2, "host:other", map[string]float64{"a": 1})},
+				})
+				if blocked == 1 && containsURL(result, relay.URL) {
+					t.Fatalf("pins=%d excluded=%d restored a block", pins, excluded)
+				}
+				if excluded == 1 && !relay.Pinned && containsURL(result, relay.URL) {
+					t.Fatalf("excluded relay was kept")
+				}
+				if (blocked == 1 || (excluded == 1 && !relay.Pinned)) && result.ConstraintsSatisfied {
+					t.Fatalf("constraints satisfied with a prohibition pins=%d blocked=%d excluded=%d", pins, blocked, excluded)
+				}
+			}
+		}
+	}
+}
+
+func TestCanonicalWinnerReplacesAStaleProjection(t *testing.T) {
+	heads := []Head{{SourceKind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10}}
+	updated, notes := preferCanonical(heads, []canonicalWinner{{
+		Kind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
+	}})
+	if updated[0].EventID != "aaaaaaaa" || !reasonCodeOn(notesReasons(notes), "projection_stale") {
+		t.Fatalf("heads=%+v notes=%#v", updated, notes)
+	}
+	newer, none := preferCanonical([]Head{{SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 20}}, []canonicalWinner{{
+		Kind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10,
+	}})
+	if newer[0].EventID != "aaaaaaaa" || len(none) != 0 {
+		t.Fatalf("canonical older event replaced the projection: %+v %#v", newer, none)
+	}
+}
+
+func TestSharedOutboxKeepsKeyPackagePreferences(t *testing.T) {
+	free := true
+	reliability := 0.8
+	preferred := []string{"wss://preferred.example"}
+	constraints := Constraints{ByRole: map[string]RoleConstraints{
+		RolePublicOutbox: {},
+		RoleKeyPackage:   {FreeOnly: &free, MinReliability: &reliability, Preferred: &preferred},
+	}}
+	_, notes := foldSharedRoles([]string{RoleKeyPackage}, AccountConfig{KeyPackageDiscovery: "nip65_outbox"}, &constraints)
+	merged := constraints.forRole(RolePublicOutbox)
+	if merged.FreeOnly != true || merged.MinReliability != 0.8 || !stringIn(merged.Preferred, "wss://preferred.example") {
+		t.Fatalf("merged = %+v notes=%#v", merged, notes)
+	}
+}
+
+func notesReasons(notes []sourceNote) []Reason {
+	out := make([]Reason, 0, len(notes))
+	for _, note := range notes {
+		out = append(out, note.reason)
+	}
+	return out
+}
+
 func TestKeepInvestigationsDoesNotRestoreExcludedRelays(t *testing.T) {
 	selected := []SelectedRelay{{URL: "wss://keep.example", Current: true}}
 	recs := []Recommendation{

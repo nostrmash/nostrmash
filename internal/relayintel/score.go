@@ -81,6 +81,54 @@ type Reason struct {
 	Text string `json:"text"`
 }
 
+// Violation is one eligibility failure. A relay can have several at once.
+// ManualRetention means a pin may keep the relay for review. An account
+// blocklist does not allow that.
+type Violation struct {
+	Code            string `json:"code"`
+	Role            string `json:"role,omitempty"`
+	Severity        string `json:"severity"`
+	Hard            bool   `json:"hard"`
+	ManualRetention bool   `json:"manual_retention"`
+	BlocksSigning   bool   `json:"blocks_signing"`
+	Text            string `json:"text"`
+}
+
+func primaryReason(violations []Violation) string {
+	for _, violation := range violations {
+		if violation.Hard && !violation.ManualRetention {
+			return violation.Code
+		}
+	}
+	for _, violation := range violations {
+		if violation.Hard {
+			return violation.Code
+		}
+	}
+	if len(violations) == 0 {
+		return ""
+	}
+	return violations[0].Code
+}
+
+func absoluteProhibition(relay ScoredRelay) bool {
+	for _, violation := range relay.Violations {
+		if violation.Hard && !violation.ManualRetention {
+			return true
+		}
+	}
+	return relay.IneligibleReason == "blocked_by_account" && len(relay.Violations) == 0
+}
+
+func hasViolation(relay ScoredRelay, code string) bool {
+	for _, violation := range relay.Violations {
+		if violation.Code == code {
+			return true
+		}
+	}
+	return relay.IneligibleReason == code
+}
+
 // ScoredRelay is one candidate after eligibility and scoring.
 type ScoredRelay struct {
 	URL              string                `json:"url"`
@@ -94,6 +142,7 @@ type ScoredRelay struct {
 	ConfidenceLabel  string                `json:"confidence_label"`
 	Eligible         bool                  `json:"eligible"`
 	IneligibleReason string                `json:"ineligible_reason,omitempty"`
+	Violations       []Violation           `json:"violations,omitempty"`
 	Reasons          []Reason              `json:"reasons"`
 	OperatorKey      string                `json:"operator_key,omitempty"`
 	Domain           string                `json:"domain,omitempty"`
@@ -219,35 +268,38 @@ func ScoreRelay(in ScoreInput) ScoredRelay {
 	}
 
 	if in.Blocked {
-		out.Eligible = false
-		out.IneligibleReason = "blocked_by_account"
-		out.Reasons = append(out.Reasons, Reason{Code: "blocked_by_account", Text: "This account's public blocked-relay list names this endpoint."})
+		out.Violations = append(out.Violations, Violation{
+			Code: "blocked_by_account", Role: in.Role, Severity: "prohibition", Hard: true, BlocksSigning: true,
+			Text: "This account's public blocked-relay list names this endpoint.",
+		})
 	}
 	if ineligible != "" {
-		out.IneligibleReason = ineligible
-		if in.Pinned {
-			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this relay for review, but it does not meet the role requirement."})
-		} else {
-			out.Eligible = false
-		}
+		out.Violations = append(out.Violations, Violation{
+			Code: ineligible, Role: in.Role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+			Text: "The relay does not meet a role requirement.",
+		})
 	}
 	if in.FreeOnly && !in.PaidAccess && paymentRestricted(in, caps) {
-		out.IneligibleReason = "payment_required"
-		out.Reasons = append(out.Reasons, Reason{Code: "payment_required", Text: "The relay advertises a payment requirement and this request asked for free relays."})
-		if !in.Pinned {
-			out.Eligible = false
-		} else {
-			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this paid relay for review. The payment conflict is still reported."})
-		}
+		out.Violations = append(out.Violations, Violation{
+			Code: "payment_required", Role: in.Role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+			Text: "The relay advertises a payment requirement and this request asked for free relays.",
+		})
 	}
 	if authRejected(in, caps) {
-		out.IneligibleReason = "auth_rejected"
-		out.Reasons = append(out.Reasons, Reason{Code: "auth_rejected", Text: "Authentication does not match the requested read or write preference."})
-		if !in.Pinned {
-			out.Eligible = false
-		} else {
-			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this relay for review. The authentication conflict is still reported."})
-		}
+		out.Violations = append(out.Violations, Violation{
+			Code: "auth_rejected", Role: in.Role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+			Text: "Authentication does not match the requested read or write preference.",
+		})
+	}
+	out.IneligibleReason = primaryReason(out.Violations)
+	for _, violation := range out.Violations {
+		out.Reasons = append(out.Reasons, Reason{Code: violation.Code, Text: violation.Text})
+	}
+	if absoluteProhibition(out) || (len(out.Violations) > 0 && !in.Pinned) {
+		out.Eligible = false
+	}
+	if in.Pinned && len(out.Violations) > 0 && !absoluteProhibition(out) {
+		out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this relay for review. The eligibility conflict is still reported."})
 	}
 
 	if confidence < 0.25 && !in.Pinned {
