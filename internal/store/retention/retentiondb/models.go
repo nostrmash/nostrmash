@@ -1417,6 +1417,17 @@ type RelayIntelBackfillCursor struct {
 	UpdatedAt     pgtype.Timestamptz
 }
 
+type RelayIntelRepair struct {
+	WinnerEventID string
+	LoserEventID  string
+	Pubkey        string
+	Kind          int32
+	DTag          string
+	Status        string
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+}
+
 type RelayIntelSnapshot struct {
 	ID            bool
 	ComputedAt    pgtype.Timestamptz

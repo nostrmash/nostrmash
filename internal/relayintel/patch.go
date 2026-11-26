@@ -96,15 +96,21 @@ func Patch(in PatchInput) PatchResult {
 	}
 	var tags [][]string
 	var changed bool
+	var problem string
 	switch {
 	case in.InboxOptimized || in.OutboxOptimized:
-		tags, changed = patchNIP65(ev.Tags, in)
+		tags, changed, problem = patchNIP65(ev.Tags, in)
 	case in.ListOptimized:
-		tags, changed = patchList(ev.Tags, in.TagName, in.Desired)
+		tags, changed, problem = patchList(ev.Tags, in.TagName, in.Desired)
 	default:
 		out.Complete = true
 		out.Safe = true
 		out.Unchanged = true
+		return out
+	}
+	if problem != "" {
+		out.Blocking = []Reason{{Code: problem, Text: "Managed relay tags for one endpoint carry different extra metadata. The replacement was not returned for signing."}}
+		out.RequiresReview = true
 		return out
 	}
 	if !changed {
@@ -126,15 +132,22 @@ func Patch(in PatchInput) PatchResult {
 
 func createReplacement(in PatchInput) PatchResult {
 	var tags [][]string
+	var problem string
 	switch {
 	case in.InboxOptimized || in.OutboxOptimized:
-		tags, _ = patchNIP65(nil, in)
+		tags, _, problem = patchNIP65(nil, in)
 	case in.ListOptimized:
-		tags, _ = patchList(nil, in.TagName, in.Desired)
+		tags, _, problem = patchList(nil, in.TagName, in.Desired)
 	default:
 		return PatchResult{
 			Origin: "missing", RequiresRefresh: true,
 			Blocking: []Reason{{Code: "source_missing", Text: "No complete source event is available. Local absence is not a confirmed empty list."}},
+		}
+	}
+	if problem != "" {
+		return PatchResult{
+			RequiresReview: true,
+			Blocking:       []Reason{{Code: problem, Text: "Managed relay tags for one endpoint carry different extra metadata. The replacement was not returned for signing."}},
 		}
 	}
 	if tags == nil {
@@ -186,8 +199,10 @@ func confirmProposal(result PatchResult, in PatchInput) PatchResult {
 	if in.ExpectedKind == KindRelaySet && firstD(result.Event.Tags) != firstD(source.Tags) {
 		return rejectProposal(result)
 	}
-	if !sameUnmanagedTags(source.Tags, result.Event.Tags, in) {
-		return rejectProposal(result)
+	if !sameUnmanagedTags(source.Tags, result.Event.Tags, in) || !managedMetadataKept(source.Tags, result.Event.Tags, in) {
+		rejected := rejectProposal(result)
+		rejected.Blocking = []Reason{{Code: "metadata_lost", Text: "The replacement dropped metadata on a relay tag that was not part of the selection change."}}
+		return rejected
 	}
 	blossom := in.TagName == "server" || in.ExpectedKind == KindBlossomServers
 	switch {
@@ -246,6 +261,7 @@ func unmanagedTags(tags [][]string, in PatchInput) [][]string {
 	out := make([][]string, 0)
 	for _, tag := range tags {
 		if len(tag) == 0 {
+			out = append(out, tag)
 			continue
 		}
 		if in.InboxOptimized || in.OutboxOptimized {
@@ -282,10 +298,6 @@ func urlsForRole(parsed Parsed, role string) []string {
 		out = append(out, member.EndpointURL)
 	}
 	return out
-}
-
-func sameRelaySet(got, want []string) bool {
-	return sameEndpoints(got, want, false)
 }
 
 func sameEndpoints(got, want []string, blossom bool) bool {
@@ -333,12 +345,14 @@ func endpointKey(raw string, blossom bool) string {
 }
 
 type relayMark struct {
-	read  bool
-	write bool
-	url   string
+	read     bool
+	write    bool
+	url      string
+	tail     []string
+	conflict bool
 }
 
-func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
+func patchNIP65(source [][]string, in PatchInput) ([][]string, bool, string) {
 	existing := map[string]relayMark{}
 	for _, tag := range source {
 		if len(tag) < 2 || tag[0] != "r" {
@@ -356,6 +370,13 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 		if item.url == "" {
 			item.url = tag[1]
 		}
+		if tail := tagTail(tag); len(tail) > 0 {
+			if len(item.tail) > 0 && !sameStrings(item.tail, tail) {
+				item.conflict = true
+			} else if len(item.tail) == 0 {
+				item.tail = append([]string(nil), tail...)
+			}
+		}
 		if marker == "" || marker == "read" {
 			item.read = true
 		}
@@ -363,6 +384,11 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 			item.write = true
 		}
 		existing[norm] = item
+	}
+	for _, item := range existing {
+		if item.conflict {
+			return nil, false, "ambiguous_relay_metadata"
+		}
 	}
 	finalRead := map[string]string{}
 	finalWrite := map[string]string{}
@@ -381,7 +407,7 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 		finalWrite = desiredSet(in.Outbox, existing)
 	}
 	if sameSet(keysOfMap(finalRead), readNorms(existing)) && sameSet(keysOfMap(finalWrite), writeNorms(existing)) {
-		return nil, false
+		return nil, false, ""
 	}
 	emitted := map[string]struct{}{}
 	tags := make([][]string, 0, len(source))
@@ -408,13 +434,14 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 			continue
 		}
 		want := markerFor(read, write)
-		if want == marker {
-			tags = append(tags, append([]string(nil), tag...))
-		} else {
-			next := append([]string(nil), tag...)
+		next := append([]string(nil), tag...)
+		if want != marker {
 			next = setMarker(next, want)
-			tags = append(tags, next)
 		}
+		if extra := existing[norm].tail; len(extra) > 0 && len(tagTail(next)) == 0 {
+			next = append(next, extra...)
+		}
+		tags = append(tags, next)
 		emitted[norm] = struct{}{}
 	}
 	for _, raw := range append(append([]string{}, in.Inbox...), in.Outbox...) {
@@ -433,17 +460,26 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 		if item, ok := existing[norm]; ok && item.url != "" {
 			url = item.url
 		}
-		tags = append(tags, markerTag(url, markerFor(read, write)))
+		next := markerTag(url, markerFor(read, write))
+		if extra := existing[norm].tail; len(extra) > 0 {
+			next = append(next, extra...)
+		}
+		tags = append(tags, next)
 		emitted[norm] = struct{}{}
 	}
-	return tags, true
+	return tags, true, ""
 }
 
-func patchList(source [][]string, tagName string, desired []string) ([][]string, bool) {
+func patchList(source [][]string, tagName string, desired []string) ([][]string, bool, string) {
 	if tagName == "" {
 		tagName = "relay"
 	}
-	existing := map[string]string{}
+	type listed struct {
+		url      string
+		tail     []string
+		conflict bool
+	}
+	existing := map[string]listed{}
 	for _, tag := range source {
 		if len(tag) < 2 || !managedTag(tag[0], tagName) {
 			continue
@@ -452,8 +488,22 @@ func patchList(source [][]string, tagName string, desired []string) ([][]string,
 		if !ok {
 			continue
 		}
-		if _, seen := existing[norm]; !seen {
-			existing[norm] = tag[1]
+		item := existing[norm]
+		if item.url == "" {
+			item.url = tag[1]
+		}
+		if tail := listTail(tag); len(tail) > 0 {
+			if len(item.tail) > 0 && !sameStrings(item.tail, tail) {
+				item.conflict = true
+			} else if len(item.tail) == 0 {
+				item.tail = append([]string(nil), tail...)
+			}
+		}
+		existing[norm] = item
+	}
+	for _, item := range existing {
+		if item.conflict {
+			return nil, false, "ambiguous_relay_metadata"
 		}
 	}
 	final := map[string]string{}
@@ -462,14 +512,18 @@ func patchList(source [][]string, tagName string, desired []string) ([][]string,
 		if !ok {
 			continue
 		}
-		if original, seen := existing[norm]; seen {
-			final[norm] = original
+		if item, seen := existing[norm]; seen {
+			final[norm] = item.url
 		} else {
 			final[norm] = raw
 		}
 	}
-	if sameSet(keysOfMap(final), keysOfString(existing)) {
-		return nil, false
+	current := map[string]string{}
+	for norm, item := range existing {
+		current[norm] = item.url
+	}
+	if sameSet(keysOfMap(final), keysOfString(current)) {
+		return nil, false, ""
 	}
 	emitted := map[string]struct{}{}
 	tags := make([][]string, 0, len(source)+len(desired))
@@ -495,7 +549,11 @@ func patchList(source [][]string, tagName string, desired []string) ([][]string,
 		if _, done := emitted[norm]; done {
 			continue
 		}
-		tags = append(tags, append([]string(nil), tag...))
+		next := append([]string(nil), tag...)
+		if extra := existing[norm].tail; len(extra) > 0 && len(listTail(next)) == 0 {
+			next = append(next, extra...)
+		}
+		tags = append(tags, next)
 		emitted[norm] = struct{}{}
 	}
 	for _, raw := range desired {
@@ -509,10 +567,14 @@ func patchList(source [][]string, tagName string, desired []string) ([][]string,
 		if _, keep := final[norm]; !keep {
 			continue
 		}
-		tags = append(tags, []string{tagName, final[norm]})
+		next := []string{tagName, final[norm]}
+		if extra := existing[norm].tail; len(extra) > 0 {
+			next = append(next, extra...)
+		}
+		tags = append(tags, next)
 		emitted[norm] = struct{}{}
 	}
-	return tags, true
+	return tags, true, ""
 }
 
 func knownMarker(tag []string) (string, bool) {
@@ -634,6 +696,91 @@ func keysOfMap(values map[string]string) []string {
 
 func keysOfString(values map[string]string) []string {
 	return keysOfMap(values)
+}
+
+func tagTail(tag []string) []string {
+	if len(tag) <= 3 {
+		return nil
+	}
+	return tag[3:]
+}
+
+func listTail(tag []string) []string {
+	if len(tag) <= 2 {
+		return nil
+	}
+	return tag[2:]
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func managedMetadataKept(source, next [][]string, in PatchInput) bool {
+	nip65 := in.InboxOptimized || in.OutboxOptimized
+	want := map[string]string{}
+	for _, tag := range source {
+		norm, tail, ok := managedIdentity(tag, nip65, in.TagName)
+		if !ok || tail == "" {
+			continue
+		}
+		if prev, seen := want[norm]; seen && prev != tail {
+			return false
+		}
+		want[norm] = tail
+	}
+	got := map[string]string{}
+	for _, tag := range next {
+		norm, tail, ok := managedIdentity(tag, nip65, in.TagName)
+		if !ok {
+			continue
+		}
+		got[norm] = tail
+	}
+	for norm, tail := range want {
+		if _, present := got[norm]; !present {
+			continue
+		}
+		if got[norm] != tail {
+			return false
+		}
+	}
+	return true
+}
+
+func managedIdentity(tag []string, nip65 bool, tagName string) (string, string, bool) {
+	if len(tag) < 2 {
+		return "", "", false
+	}
+	if nip65 {
+		if tag[0] != "r" {
+			return "", "", false
+		}
+		if _, known := knownMarker(tag); !known {
+			return "", "", false
+		}
+		norm, ok := canonicalRelay(tag[1])
+		if !ok {
+			return "", "", false
+		}
+		return norm, strings.Join(tagTail(tag), "\x00"), true
+	}
+	if !managedTag(tag[0], tagName) {
+		return "", "", false
+	}
+	norm, ok := canonicalEndpoint(tag[1], tag[0] == "server" || tagName == "server")
+	if !ok {
+		return "", "", false
+	}
+	return norm, strings.Join(listTail(tag), "\x00"), true
 }
 
 func sameSet(left, right []string) bool {

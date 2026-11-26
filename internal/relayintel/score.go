@@ -455,7 +455,16 @@ func functionalityComponent(role string, caps map[string]Capability) (float64, f
 			return 0.45, 0.4, []Reason{{Code: "dm_unverified", Text: "The relay answers ordinary subscriptions. DM acceptance is still unverified."}}, ""
 		}
 		return 0.35, 0.25, nil, ""
-	case RolePublicOutbox, RoleKeyPackage:
+	case RoleKeyPackage:
+		kp := caps[CapKeyPackage]
+		if kp.Status == StatusVerified {
+			return 0.9, 0.8, []Reason{{Code: "keypackage_retrieved", Text: "A signed kind 30443 event was accepted and read back. This is relay transport evidence, not end-to-end Marmot compatibility."}}, ""
+		}
+		if kp.Status == StatusUnsupported {
+			return 0.15, 0.7, []Reason{{Code: "keypackage_unsupported", Text: "The relay rejected a KeyPackage event."}}, "keypackage_unsupported"
+		}
+		return 0.35, 0.25, []Reason{{Code: "keypackage_unknown", Text: "Kind 1 publishing was not treated as KeyPackage support. No interoperable KeyPackage fixture was checked."}}, ""
+	case RolePublicOutbox:
 		write := caps[CapWriteRetrieve]
 		accept := caps[CapWriteAccept]
 		if write.Status == StatusVerified {

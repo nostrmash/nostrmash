@@ -840,7 +840,8 @@ paths:
                     auth_write: { type: string, enum: [allow, prefer_without, require, reject] }
                     min_reliability: { type: number }
                     min_capability_confidence: { type: number }
-                    diversity: { type: number }
+                    diversity: { type: number, description: Soft operator-diversity preference. It does not block signing. }
+                    require_operator_diversity: { type: boolean, description: When true, operator concentration blocks signing if another eligible operator exists. }
                     retain_existing: { type: boolean }
                 supplied_relays:
                   type: array

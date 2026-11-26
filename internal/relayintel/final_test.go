@@ -309,6 +309,118 @@ func TestDeletedCoordinateIsNotOrdinaryCreation(t *testing.T) {
 	}
 }
 
+func TestPaidAccessDoesNotImplyPaymentRequired(t *testing.T) {
+	relay := scored("wss://paid.example", 0.8, "host:paid", map[string]float64{"a": 1})
+	relay.PaidAccess = true
+	relay.Eligible = true
+	selection := SelectResult{Selected: []SelectedRelay{{URL: relay.URL}}, ConstraintsSatisfied: true, IndependentlySatisfied: true}
+	audited := auditSelection(selection, []ScoredRelay{relay}, nil, 1, 1, 1, Constraints{FreeOnly: true})
+	if !audited.ConstraintsSatisfied || reasonCode(audited.Unsatisfied, "payment_required") {
+		t.Fatalf("declared paid access blocked a free-only list: %+v", audited)
+	}
+}
+
+func TestDiversityPreferenceDoesNotBlockSigning(t *testing.T) {
+	first := scored("wss://one.example", 0.8, "host:same", map[string]float64{"a": 1})
+	second := scored("wss://two.example", 0.7, "host:same", map[string]float64{"b": 1})
+	other := scored("wss://other.example", 0.4, "host:other", map[string]float64{"c": 1})
+	selection := SelectResult{
+		Selected:             []SelectedRelay{{URL: first.URL}, {URL: second.URL}},
+		ConstraintsSatisfied: true, IndependentlySatisfied: true,
+	}
+	soft := auditSelection(selection, []ScoredRelay{first, second, other}, nil, 1, 3, 0.5, Constraints{})
+	if !soft.ConstraintsSatisfied || !reasonCode(soft.Qualifications, "operator_concentration") {
+		t.Fatalf("soft diversity = %+v", soft)
+	}
+	hard := auditSelection(selection, []ScoredRelay{first, second, other}, nil, 1, 3, 0.5, Constraints{RequireDiversity: true})
+	if hard.ConstraintsSatisfied || !reasonCode(hard.Unsatisfied, "operator_concentration") {
+		t.Fatalf("mandatory diversity = %+v", hard)
+	}
+}
+
+func TestKeyPackageConfidenceIsNotPublicWriteConfidence(t *testing.T) {
+	confidence := 0.9
+	maxOutbox := 4
+	maxKey := 2
+	constraints := Constraints{ByRole: map[string]RoleConstraints{
+		RolePublicOutbox: {Max: &maxOutbox},
+		RoleKeyPackage:   {Max: &maxKey, MinCapabilityConfidence: &confidence},
+	}}
+	_, notes := foldSharedRoles([]string{RoleKeyPackage}, AccountConfig{KeyPackageDiscovery: "nip65_outbox"}, &constraints)
+	merged := constraints.forRole(RolePublicOutbox)
+	if merged.MinCapabilityConfidence != 0 {
+		t.Fatalf("keypackage confidence became a public write threshold: %v", merged.MinCapabilityConfidence)
+	}
+	if merged.Max[RolePublicOutbox] != 2 {
+		t.Fatalf("stricter maximum was not kept: %#v", merged.Max)
+	}
+	if reasonCodeOn(notes, "shared_constraint_conflict") {
+		t.Fatalf("a stricter maximum was reported as a conflict: %#v", notes)
+	}
+	relay := scored("wss://out.example", 0.8, "host:out", nil)
+	relay.Capabilities = ResolveCapabilities(Evidence{Observations: []Observation{{
+		Capability: CapWriteRetrieve, Status: StatusVerified, Confidence: 0.95, ObservedAt: time.Now(), SampleCount: 1,
+	}}})
+	selection := SelectResult{Selected: []SelectedRelay{{URL: relay.URL}}, ConstraintsSatisfied: true, IndependentlySatisfied: true}
+	audited := auditKeyPackageCapability(selection, []ScoredRelay{relay}, constraints)
+	if audited.ConstraintsSatisfied || !reasonCode(audited.Unsatisfied, "keypackage_unverified") {
+		t.Fatalf("kind 1 write satisfied keypackage: %+v", audited)
+	}
+}
+
+func TestAmbiguousRelayMetadataIsRejected(t *testing.T) {
+	url := "wss://a.example"
+	raw := eventRaw(t, KindPublicRelayList, "", [][]string{
+		{"r", url, "read", "hint", "a"},
+		{"r", url, "write", "hint", "b"},
+	})
+	result := Patch(PatchInput{
+		Source: raw, InboxOptimized: true,
+		Inbox: []string{"wss://other.example"},
+	})
+	if result.Safe || result.Event != nil || !reasonCodeOn(result.Blocking, "ambiguous_relay_metadata") {
+		t.Fatalf("ambiguous metadata was accepted: %+v", result)
+	}
+}
+
+func TestDroppedRelayMetadataIsNotSafe(t *testing.T) {
+	raw := eventRaw(t, KindPublicRelayList, "", [][]string{
+		{"r", "wss://a.example", "read", "hint"},
+	})
+	input := PatchInput{
+		Source: raw, InboxOptimized: true, OutboxOptimized: true,
+		Inbox: []string{"wss://b.example"}, Outbox: []string{"wss://a.example"},
+	}
+	result := Patch(input)
+	if result.Event == nil {
+		t.Fatal(result)
+	}
+	for i, tag := range result.Event.Tags {
+		if len(tag) > 0 && tag[0] == "r" && strings.Contains(tag[1], "a.example") && len(tag) > 3 {
+			result.Event.Tags[i] = tag[:3]
+		}
+	}
+	rejected := confirmProposal(result, input)
+	if rejected.Safe || !reasonCodeOn(rejected.Blocking, "metadata_lost") {
+		t.Fatalf("dropped metadata stayed safe: %+v", rejected)
+	}
+}
+
+func TestSourceReportShowsAStaleProjection(t *testing.T) {
+	before := []Head{{SourceKind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10}}
+	after := []Head{{SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10}}
+	_, notes := preferCanonical(append([]Head(nil), before...), []canonicalWinner{{
+		Kind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
+	}})
+	resolved := map[string]resolvedSource{
+		sourceKey(KindPublicRelayList, ""): {EventID: after[0].EventID, Kind: KindPublicRelayList},
+	}
+	reports := sourceReports(before, resolved, notes)
+	if len(reports) != 1 || reports[0].Status != "stale" || !reports[0].RequiresRefresh || reports[0].ProjectionEventID != "bbbbbbbb" || reports[0].CanonicalEventID != "aaaaaaaa" {
+		t.Fatalf("reports = %+v", reports)
+	}
+}
+
 func TestKeyPackagePinsStayOnTheSharedOutbox(t *testing.T) {
 	maxOutbox := 4
 	minKey := 5

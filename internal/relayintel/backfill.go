@@ -29,6 +29,9 @@ func BackfillBatch(ctx context.Context, pool *pgxpool.Pool, batch int) error {
 	if batch <= 0 || batch > 1000 {
 		batch = 200
 	}
+	if err := reconcileAuthoritative(ctx, pool, batch); err != nil {
+		return err
+	}
 	for _, kind := range BackfillKinds() {
 		done, err := backfillKind(ctx, pool, kind, batch)
 		if err != nil {
@@ -42,6 +45,18 @@ func BackfillBatch(ctx context.Context, pool *pgxpool.Pool, batch int) error {
 }
 
 func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (bool, error) {
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = lockTx.Rollback(ctx) }()
+	var locked bool
+	if err := lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('nostrmash-relay-intel-backfill'), $1)`, kind).Scan(&locked); err != nil {
+		return false, wrapDB(err)
+	}
+	if !locked {
+		return true, nil
+	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO relay_intel_backfill_cursor (source_kind)
 		VALUES ($1)
@@ -52,12 +67,11 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 	var created int64
 	var eventID string
 	var done bool
-	var processed int64
-	err := pool.QueryRow(ctx, `
-		SELECT last_created_at, last_event_id, done, processed
+	err = pool.QueryRow(ctx, `
+		SELECT last_created_at, last_event_id, done
 		FROM relay_intel_backfill_cursor
 		WHERE source_kind = $1
-	`, kind).Scan(&created, &eventID, &done, &processed)
+	`, kind).Scan(&created, &eventID, &done)
 	if err != nil {
 		return false, wrapDB(err)
 	}
@@ -94,6 +108,7 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
+	added := int64(0)
 	for _, item := range page {
 		var payload struct {
 			Tags [][]string `json:"tags"`
@@ -127,7 +142,7 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 		}
 		created = item.created
 		eventID = item.id
-		processed++
+		added++
 	}
 	finished := len(page) < batch
 	if _, err := pool.Exec(ctx, `
@@ -135,16 +150,83 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 		SET last_created_at = $2,
 		    last_event_id = $3,
 		    done = $4,
-		    processed = $5,
+		    processed = processed + $5,
 		    updated_at = now()
 		WHERE source_kind = $1
-	`, kind, created, eventID, finished, processed); err != nil {
+		  AND ($2, $3) >= (last_created_at, last_event_id)
+	`, kind, created, eventID, finished, added); err != nil {
 		return false, wrapDB(err)
 	}
 	if finished {
 		metrics.SetRelayIntelBackfillDone(kind, 1)
 	}
 	return finished, nil
+}
+
+func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) error {
+	if _, err := pool.Exec(ctx, `SELECT repair_replaceable_tie($1)`, batch); err != nil {
+		if SchemaMissing(err) || undefinedFunction(err) {
+			return nil
+		}
+		return wrapDB(err)
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.raw_json::text
+		FROM replaceable_state rs
+		JOIN events e ON e.id = rs.event_id
+		LEFT JOIN relay_config_heads h
+		  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
+		WHERE (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.truncated)
+		ORDER BY e.created_at ASC, e.id ASC
+		LIMIT $1
+	`, batch)
+	if err != nil {
+		if SchemaMissing(err) {
+			return nil
+		}
+		return wrapDB(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, pubkey, content, raw string
+		var kind int
+		var created int64
+		if err := rows.Scan(&id, &pubkey, &kind, &created, &content, &raw); err != nil {
+			return err
+		}
+		if !HandlesKind(kind) {
+			continue
+		}
+		var payload struct {
+			Tags [][]string `json:"tags"`
+		}
+		if json.Unmarshal([]byte(raw), &payload) != nil {
+			continue
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		err = Project(ctx, tx, EventInput{
+			Pubkey: pubkey, EventID: id, Kind: kind, CreatedAt: created, Content: content, Tags: payload.Tags,
+		})
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			if SchemaMissing(err) || skippable(err) {
+				continue
+			}
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func undefinedFunction(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42883"
 }
 
 func skippable(err error) bool {
