@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/nostrmash/nostrmash/internal/nip05"
 	"github.com/nostrmash/nostrmash/internal/nostr"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 func (h *Handlers) ProjectEventAttributes(ctx context.Context, eventID string) error {
@@ -361,8 +362,9 @@ func (h *Handlers) projectDMVolumeWithVersion(ctx context.Context, eventID strin
 		return fmt.Errorf("handlers are not initialized")
 	}
 	var kind int
+	var pubkey string
 	var createdAt int64
-	if err := h.pool.QueryRow(ctx, `SELECT kind, created_at FROM events WHERE id = $1`, eventID).Scan(&kind, &createdAt); err != nil {
+	if err := h.pool.QueryRow(ctx, `SELECT kind, pubkey, created_at FROM events WHERE id = $1`, eventID).Scan(&kind, &pubkey, &createdAt); err != nil {
 		return fmt.Errorf("load event for dm volume: %w", err)
 	}
 	protocol := ""
@@ -372,6 +374,13 @@ func (h *Handlers) projectDMVolumeWithVersion(ctx context.Context, eventID strin
 	case 1059:
 		protocol = "nip17"
 	default:
+		return nil
+	}
+	synthetic, lookupErr := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+	if lookupErr != nil {
+		return fmt.Errorf("synthetic identity: %w", lookupErr)
+	}
+	if synthetic {
 		return nil
 	}
 	tags, err := h.loadEventTags(ctx, eventID)
