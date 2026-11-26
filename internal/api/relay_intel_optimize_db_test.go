@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,7 +38,20 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	if err := derivation.EnsureRegisteredDerivations(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
-	handlers := Handlers{relayIntel: relayintel.NewService(pool, relayintel.Options{})}
+	handlers := &Handlers{relayIntel: relayintel.NewService(pool, relayintel.Options{})}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/relays/optimize", func(w http.ResponseWriter, r *http.Request) {
+		handlers.PostRelayOptimize(w, r)
+	})
+	mux.HandleFunc("GET /api/v1/profiles/{pubkey}/relay-config", func(w http.ResponseWriter, r *http.Request) {
+		handlers.GetProfileRelayConfig(w, r)
+	})
+	mux.HandleFunc("GET /api/v1/profiles/{pubkey}/relay-diagnostics", func(w http.ResponseWriter, r *http.Request) {
+		handlers.GetProfileRelayDiagnostics(w, r)
+	})
+	mux.HandleFunc("GET /api/v1/profiles/{pubkey}/relay-recommendations", func(w http.ResponseWriter, r *http.Request) {
+		handlers.GetProfileRelayRecommendations(w, r)
+	})
 	now := time.Now().Unix()
 	ownerKey := newKey(t)
 	friendKey := newKey(t)
@@ -86,7 +101,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	}
 
 	before := headIDs(t, ctx, pool, ownerKey.pub)
-	cfg := getJSON(t, handlers.GetProfileRelayConfig, "/api/v1/profiles/"+ownerKey.pub+"/relays", ownerKey.pub)
+	cfg := getJSON(t, mux, "/api/v1/profiles/"+ownerKey.pub+"/relay-config")
 	if cfg["account"].(map[string]any)["modern_event_id"] != public.id {
 		t.Fatalf("config modern event = %v", cfg["account"].(map[string]any)["modern_event_id"])
 	}
@@ -111,11 +126,11 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 		t.Fatal("private configuration content was returned")
 	}
 
-	diag := getJSON(t, handlers.GetProfileRelayDiagnostics, "/api/v1/profiles/"+ownerKey.pub+"/relay-diagnostics", ownerKey.pub)
+	diag := getJSON(t, mux, "/api/v1/profiles/"+ownerKey.pub+"/relay-diagnostics")
 	if _, ok := diag["findings"].([]any); !ok {
 		t.Fatalf("diagnostics = %s", mustJSON(diag))
 	}
-	recs := getJSON(t, handlers.GetProfileRelayRecommendations, "/api/v1/profiles/"+ownerKey.pub+"/relay-recommendations?preset=balanced", ownerKey.pub)
+	recs := getJSON(t, mux, "/api/v1/profiles/"+ownerKey.pub+"/relay-recommendations?preset=balanced")
 	if recs["preset"] != "balanced" || len(recs["roles"].([]any)) == 0 {
 		t.Fatalf("recommendations = %s", mustJSON(recs))
 	}
@@ -141,7 +156,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 			"by_role":         map[string]any{"search": map[string]any{"max": 1}},
 		},
 	}
-	plan := postJSON(t, handlers.PostRelayOptimize, body)
+	plan := postJSON(t, mux, body)
 	assertOptimizeContract(t, plan)
 	if !selected(plan, "public_inbox", "wss://in.example") {
 		t.Fatalf("pinned inbox missing: %s", mustJSON(plan))
@@ -178,7 +193,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	}
 
 	stale := sign(t, ownerKey.priv, relayintel.KindPublicRelayList, now-500, [][]string{{"r", "wss://stale.example"}}, "")
-	stalePlan := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+	stalePlan := postJSON(t, mux, map[string]any{
 		"pubkey": ownerKey.pub, "preset": "balanced", "roles": []string{"public_inbox", "public_outbox"},
 		"source_events": []json.RawMessage{stale},
 	})
@@ -205,7 +220,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 				WHERE pubkey = $1 AND source_kind = 10002 AND d_tag = ''
 			`, ownerKey.pub, public.id, now-100)
 		})
-		got := getJSON(t, handlers.GetProfileRelayConfig, "/api/v1/profiles/"+ownerKey.pub+"/relays", ownerKey.pub)
+		got := getJSON(t, mux, "/api/v1/profiles/"+ownerKey.pub+"/relay-config")
 		if !sourceStatus(got, relayintel.KindPublicRelayList, "stale") {
 			t.Fatalf("sources = %s", mustJSON(got["sources"]))
 		}
@@ -217,13 +232,13 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	t.Run("explicit empty and legacy fallback", func(t *testing.T) {
 		emptyKey := newKey(t)
 		publish(t, ctx, pool, emptyKey, relayintel.KindPublicRelayList, now-20, "", [][]string{})
-		emptyCfg := getJSON(t, handlers.GetProfileRelayConfig, "/api/v1/profiles/"+emptyKey.pub+"/relays", emptyKey.pub)
+		emptyCfg := getJSON(t, mux, "/api/v1/profiles/"+emptyKey.pub+"/relay-config")
 		if emptyCfg["account"].(map[string]any)["modern_public"] != "empty" {
 			t.Fatalf("empty list = %v", emptyCfg["account"])
 		}
 		legacyKey := newKey(t)
 		publish(t, ctx, pool, legacyKey, relayintel.KindLegacyContact, now-20, `{"wss://only-legacy.example":{"read":true,"write":true}}`, nil)
-		legacyCfg := getJSON(t, handlers.GetProfileRelayConfig, "/api/v1/profiles/"+legacyKey.pub+"/relays", legacyKey.pub)
+		legacyCfg := getJSON(t, mux, "/api/v1/profiles/"+legacyKey.pub+"/relay-config")
 		legacyAccount := legacyCfg["account"].(map[string]any)
 		if legacyAccount["modern_event_id"] != nil && legacyAccount["modern_event_id"] != "" {
 			t.Fatalf("legacy account invented a modern list: %v", legacyAccount["modern_event_id"])
@@ -235,11 +250,11 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 		key := newKey(t)
 		search := publish(t, ctx, pool, key, relayintel.KindSearchRelays, now-30, "", [][]string{{"relay", "wss://gone-search.example"}})
 		publish(t, ctx, pool, key, 5, now-10, "", [][]string{{"e", search.id}})
-		deleted := getJSON(t, handlers.GetProfileRelayConfig, "/api/v1/profiles/"+key.pub+"/relays", key.pub)
+		deleted := getJSON(t, mux, "/api/v1/profiles/"+key.pub+"/relay-config")
 		if !sourceStatus(deleted, relayintel.KindSearchRelays, "deleted") {
 			t.Fatalf("deleted source = %s", mustJSON(deleted["sources"]))
 		}
-		created := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		created := postJSON(t, mux, map[string]any{
 			"pubkey": key.pub, "preset": "minimal", "roles": []string{"public_inbox", "public_outbox"},
 			"allow_create": true,
 			"constraints":  map[string]any{"pinned": []string{"wss://created.example"}, "min": map[string]int{"public_inbox": 1, "public_outbox": 1}, "max": map[string]int{"public_inbox": 1, "public_outbox": 1}},
@@ -251,7 +266,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 		if created["proposal"].(map[string]any)["ready_to_sign"] == true {
 			t.Fatal("a newly created list was marked ready without client review")
 		}
-		recreated := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		recreated := postJSON(t, mux, map[string]any{
 			"pubkey": key.pub, "preset": "minimal", "roles": []string{"search"}, "allow_recreate": true,
 			"constraints": map[string]any{"pinned": []string{"wss://recreated.example"}, "min": map[string]int{"search": 1}, "max": map[string]int{"search": 1}},
 		})
@@ -262,14 +277,14 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	})
 
 	t.Run("blocked pin diversity and unverified keypackage", func(t *testing.T) {
-		conflict := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		conflict := postJSON(t, mux, map[string]any{
 			"pubkey": ownerKey.pub, "preset": "balanced", "roles": []string{"public_inbox"},
 			"constraints": map[string]any{"pinned": []string{"wss://blocked.example"}, "min": map[string]int{"public_inbox": 1}, "max": map[string]int{"public_inbox": 1}},
 		})
 		if conflict["constraints_satisfied"] == true || (!hasReason(conflict, "blocked_by_account") && !hasReason(conflict, "pin_missing")) {
 			t.Fatalf("blocked pin = %s", mustJSON(conflict))
 		}
-		diverse := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		diverse := postJSON(t, mux, map[string]any{
 			"pubkey": ownerKey.pub, "preset": "decentralization", "roles": []string{"public_outbox"},
 			"constraints": map[string]any{
 				"require_operator_diversity": true,
@@ -281,7 +296,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 		if diverse["constraints_satisfied"] == true || (!hasReason(diverse, "operator_concentration") && !hasReason(diverse, "operator_ownership_unknown")) {
 			t.Fatalf("diversity = %s", mustJSON(diverse))
 		}
-		keypackage := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		keypackage := postJSON(t, mux, map[string]any{
 			"pubkey": ownerKey.pub, "preset": "balanced", "roles": []string{"public_outbox", "keypackage"},
 			"constraints": map[string]any{
 				"by_role": map[string]any{"keypackage": map[string]any{"min_capability_confidence": 0.8}},
@@ -301,13 +316,13 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE events SET raw_json = '{}'::jsonb WHERE id = $1`, stored.id); err != nil {
 			t.Fatal(err)
 		}
-		unsafe := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		unsafe := postJSON(t, mux, map[string]any{
 			"pubkey": key.pub, "preset": "balanced", "roles": []string{"public_inbox", "public_outbox"},
 		})
 		if unsafe["proposal"].(map[string]any)["proposal_safe"] == true || unsafe["proposal"].(map[string]any)["ready_to_sign"] == true {
 			t.Fatalf("unreadable source = %s", mustJSON(unsafe["proposal"]))
 		}
-		same := postJSON(t, handlers.PostRelayOptimize, map[string]any{
+		same := postJSON(t, mux, map[string]any{
 			"pubkey": ownerKey.pub, "preset": "balanced", "roles": []string{"public_inbox", "public_outbox"},
 			"constraints": map[string]any{
 				"retain_existing": true,
@@ -398,12 +413,11 @@ func publish(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key testKey,
 	return storedID{id: body.ID}
 }
 
-func getJSON(t *testing.T, fn func(http.ResponseWriter, *http.Request), path, pubkey string) map[string]any {
+func getJSON(t *testing.T, mux *http.ServeMux, path string) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
-	req.SetPathValue("pubkey", pubkey)
 	rec := httptest.NewRecorder()
-	fn(rec, req)
+	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("%s status %d: %s", path, rec.Code, rec.Body.String())
 	}
@@ -414,15 +428,16 @@ func getJSON(t *testing.T, fn func(http.ResponseWriter, *http.Request), path, pu
 	return out
 }
 
-func postJSON(t *testing.T, fn func(http.ResponseWriter, *http.Request), body map[string]any) map[string]any {
+func postJSON(t *testing.T, mux *http.ServeMux, body map[string]any) map[string]any {
 	t.Helper()
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/relays/optimize", bytes.NewReader(encoded))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	fn(rec, req)
+	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("optimize status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -430,6 +445,8 @@ func postJSON(t *testing.T, fn func(http.ResponseWriter, *http.Request), body ma
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
+	validateOptimizeSchema(t, out)
+	assertSigningContract(t, out)
 	return out
 }
 
@@ -578,6 +595,8 @@ func assertOptimizeContract(t *testing.T, plan map[string]any) {
 		t.Fatal("openapi optimize response has no example")
 	}
 	assertExampleShape(t, example, plan)
+	validateOptimizeSchema(t, plan)
+	assertSigningContract(t, plan)
 	if plan["algorithm"] == "" || plan["optimizer_version"] == "" || plan["tie_break"] == "" {
 		t.Fatalf("version fields = %s", mustJSON(plan))
 	}
@@ -610,6 +629,216 @@ func assertExampleShape(t *testing.T, example, got map[string]any) {
 			}
 		}
 	}
+}
+
+func validateOptimizeSchema(t *testing.T, plan map[string]any) {
+	t.Helper()
+	doc := openAPIDocument(t)
+	paths, _ := doc["paths"].(map[string]any)
+	route, _ := paths["/api/v1/relays/optimize"].(map[string]any)
+	post, _ := route["post"].(map[string]any)
+	responses, _ := post["responses"].(map[string]any)
+	ok, _ := responses["200"].(map[string]any)
+	content, _ := ok["content"].(map[string]any)
+	media, _ := content["application/json"].(map[string]any)
+	schema, _ := media["schema"].(map[string]any)
+	if len(schema) == 0 {
+		t.Fatal("openapi optimize response has no schema")
+	}
+	validateSchema(t, doc, schema, plan, "response")
+}
+
+func assertSigningContract(t *testing.T, plan map[string]any) {
+	t.Helper()
+	proposal, ok := plan["proposal"].(map[string]any)
+	if !ok {
+		t.Fatal("proposal is not an object")
+	}
+	ready, _ := proposal["ready_to_sign"].(bool)
+	safe, _ := proposal["proposal_safe"].(bool)
+	complete, _ := proposal["source_complete"].(bool)
+	refresh, _ := proposal["requires_refresh"].(bool)
+	review, _ := proposal["requires_review"].(bool)
+	satisfied, _ := plan["constraints_satisfied"].(bool)
+	blocking, _ := proposal["blocking_reasons"].([]any)
+	hasEvent := proposal["public_relays"] != nil
+	if lists, ok := proposal["lists"].([]any); ok && len(lists) > 0 {
+		hasEvent = true
+	}
+	wantReady := safe && complete && satisfied && len(blocking) == 0 && !refresh && !review && hasEvent
+	if ready != wantReady {
+		t.Fatalf("ready_to_sign=%v, eligibility=%v: %s", ready, wantReady, mustJSON(proposal))
+	}
+	roles, _ := plan["roles"].([]any)
+	roleUnsatisfied := false
+	for _, item := range roles {
+		selection, _ := item.(map[string]any)["selection"].(map[string]any)
+		if selection["constraints_satisfied"] == false {
+			roleUnsatisfied = true
+		}
+		if satisfied && selection["constraints_satisfied"] != true {
+			t.Fatalf("satisfied plan has an unsatisfied role: %s", mustJSON(item))
+		}
+	}
+	topUnsatisfied := false
+	if reasons, ok := plan["unsatisfied_constraints"].([]any); ok && len(reasons) > 0 {
+		topUnsatisfied = true
+	}
+	if satisfied && topUnsatisfied {
+		t.Fatal("satisfied plan still lists unsatisfied constraints")
+	}
+	if !satisfied && !roleUnsatisfied && !topUnsatisfied {
+		t.Fatal("constraints_satisfied is false without an unsatisfied constraint")
+	}
+	checkEvent := func(event map[string]any) {
+		t.Helper()
+		if _, ok := event["sig"]; ok {
+			t.Fatal("proposal event includes a signature")
+		}
+		if _, ok := event["id"]; ok {
+			t.Fatal("proposal event includes an id")
+		}
+		for _, key := range []string{"kind", "pubkey", "content", "tags"} {
+			if _, ok := event[key]; !ok {
+				t.Fatalf("proposal event is missing %s", key)
+			}
+		}
+		change, _ := event["change"].(string)
+		if change == "creation" || change == "recreation" {
+			if proposal["requires_review"] != true || ready {
+				t.Fatalf("%s event is eligible to sign: %s", change, mustJSON(proposal))
+			}
+		}
+	}
+	if event, ok := proposal["public_relays"].(map[string]any); ok {
+		checkEvent(event)
+	}
+	if lists, ok := proposal["lists"].([]any); ok {
+		for _, item := range lists {
+			checkEvent(item.(map[string]any))
+		}
+	}
+}
+
+func openAPIDocument(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "docs", "openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func validateSchema(t *testing.T, doc, schema map[string]any, value any, path string) {
+	t.Helper()
+	if ref, ok := schema["$ref"].(string); ok {
+		schema = schemaByRef(t, doc, ref)
+	}
+	if value == nil {
+		if schema["nullable"] == true {
+			return
+		}
+		t.Fatalf("%s is null", path)
+	}
+	switch schema["type"] {
+	case "object":
+		obj, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("%s has type %T, want object", path, value)
+		}
+		props, _ := schema["properties"].(map[string]any)
+		if required, ok := schema["required"].([]any); ok {
+			for _, key := range required {
+				name, _ := key.(string)
+				if _, exists := obj[name]; !exists {
+					t.Fatalf("%s is missing %s", path, name)
+				}
+			}
+		}
+		additional, limited := schema["additionalProperties"]
+		for key, child := range obj {
+			prop, ok := props[key].(map[string]any)
+			if !ok {
+				if limited && additional == false {
+					t.Fatalf("%s has undocumented field %s", path, key)
+				}
+				if addSchema, ok := additional.(map[string]any); ok {
+					validateSchema(t, doc, addSchema, child, path+"."+key)
+				}
+				continue
+			}
+			validateSchema(t, doc, prop, child, path+"."+key)
+		}
+	case "array":
+		items, ok := value.([]any)
+		if !ok {
+			t.Fatalf("%s has type %T, want array", path, value)
+		}
+		itemSchema, _ := schema["items"].(map[string]any)
+		if itemSchema == nil {
+			return
+		}
+		for i, item := range items {
+			validateSchema(t, doc, itemSchema, item, fmt.Sprintf("%s[%d]", path, i))
+		}
+	case "string":
+		text, ok := value.(string)
+		if !ok {
+			t.Fatalf("%s has type %T, want string", path, value)
+		}
+		if schema["format"] == "date-time" {
+			if _, err := time.Parse(time.RFC3339Nano, text); err != nil {
+				t.Fatalf("%s is not a timestamp: %s", path, text)
+			}
+		}
+		assertEnum(t, schema, text, path)
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			t.Fatalf("%s has type %T, want boolean", path, value)
+		}
+	case "integer":
+		number, ok := value.(float64)
+		if !ok || math.Trunc(number) != number {
+			t.Fatalf("%s has type %T, want integer", path, value)
+		}
+	case "number":
+		if _, ok := value.(float64); !ok {
+			t.Fatalf("%s has type %T, want number", path, value)
+		}
+	}
+}
+
+func assertEnum(t *testing.T, schema map[string]any, value, path string) {
+	t.Helper()
+	enum, ok := schema["enum"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range enum {
+		if item == value {
+			return
+		}
+	}
+	t.Fatalf("%s = %v, not one of %v", path, value, enum)
+}
+
+func schemaByRef(t *testing.T, doc map[string]any, ref string) map[string]any {
+	t.Helper()
+	const prefix = "#/components/schemas/"
+	if !strings.HasPrefix(ref, prefix) {
+		t.Fatalf("unsupported schema ref %s", ref)
+	}
+	components, _ := doc["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	schema, _ := schemas[strings.TrimPrefix(ref, prefix)].(map[string]any)
+	if schema == nil {
+		t.Fatalf("missing schema %s", ref)
+	}
+	return schema
 }
 
 func moduleRoot(t *testing.T) string {

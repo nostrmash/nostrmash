@@ -162,6 +162,9 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 			}
 			return err
 		}
+		if err := clearDeletedListProjections(ctx, tx, pubkey, ids, 0, 0); err != nil {
+			return err
+		}
 	}
 	for _, item := range coords {
 		if err := relayintel.LockCoordinate(ctx, tx, pubkey, item.kind, item.dTag); err != nil {
@@ -190,6 +193,9 @@ func (h *Handlers) clearRelayIntelDeletion(ctx context.Context, eventID string) 
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (event_id, kind, d_tag) DO NOTHING
 		`, eventID, pubkey, item.kind, item.dTag, createdAt); err != nil && !relayintel.SchemaMissing(err) {
+			return err
+		}
+		if err := clearDeletedListProjections(ctx, tx, pubkey, nil, item.kind, createdAt); err != nil {
 			return err
 		}
 	}
@@ -226,4 +232,44 @@ func splitRelayCoordinate(value string) (kind int, pubkey, dTag string, ok bool)
 		dTag = ""
 	}
 	return kind, pubkey, dTag, true
+}
+
+// clearDeletedListProjections removes list rows a deletion already covered so
+// a later replay cannot be the only thing standing between a tombstone and
+// a restored configuration. eventIDs clears specific versions. kind plus
+// createdAt clears an address up to the deletion timestamp.
+func clearDeletedListProjections(ctx context.Context, tx pgx.Tx, pubkey string, eventIDs []string, kind int, createdAt int64) error {
+	if len(eventIDs) > 0 {
+		statements := []string{
+			`DELETE FROM relay_lists_latest WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
+			`DELETE FROM dm_relay_lists_latest WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
+			`DELETE FROM profiles_latest WHERE pubkey = $1 AND metadata_event_id = ANY($2::text[])`,
+			`SELECT relay_intel_remove_contact_projection($1, event_id)
+			 FROM contact_lists_latest
+			 WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(ctx, statement, pubkey, eventIDs); err != nil && !relayintel.SchemaMissing(err) {
+				return err
+			}
+		}
+		return nil
+	}
+	var statement string
+	switch kind {
+	case 3:
+		statement = `SELECT relay_intel_remove_contact_projection($1, event_id)
+			FROM contact_lists_latest
+			WHERE pubkey = $1 AND created_at <= $2`
+	case 10002:
+		statement = `DELETE FROM relay_lists_latest WHERE pubkey = $1 AND created_at <= $2`
+	case 10050:
+		statement = `DELETE FROM dm_relay_lists_latest WHERE pubkey = $1 AND created_at <= $2`
+	default:
+		return nil
+	}
+	if _, err := tx.Exec(ctx, statement, pubkey, createdAt); err != nil && !relayintel.SchemaMissing(err) {
+		return err
+	}
+	return nil
 }

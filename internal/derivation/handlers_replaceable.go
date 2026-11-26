@@ -24,16 +24,19 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 	var event replaceableEvent
 	err := h.pool.QueryRow(ctx, `
 		SELECT e.pubkey, e.kind, e.created_at,
-		       COALESCE((
-		           SELECT et.value
-		           FROM event_tags et
-		           WHERE et.event_id = e.id
-		             AND et.tag_name = 'd'
-		             AND et.tag_index >= 0
-		             AND et.value_index = 0
-		           ORDER BY et.tag_index ASC
-		           LIMIT 1
-		       ), '')
+		       CASE
+		           WHEN e.kind >= 30000 AND e.kind < 40000 THEN COALESCE((
+		               SELECT et.value
+		               FROM event_tags et
+		               WHERE et.event_id = e.id
+		                 AND et.tag_name = 'd'
+		                 AND et.tag_index >= 0
+		                 AND et.value_index = 0
+		               ORDER BY et.tag_index ASC
+		               LIMIT 1
+		           ), '')
+		           ELSE ''
+		       END
 		FROM events e
 		WHERE e.id = $1
 	`, eventID).Scan(&event.Pubkey, &event.Kind, &event.CreatedAt, &event.DTag)
@@ -50,6 +53,9 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, $3)`, event.Pubkey, event.Kind, event.DTag); err != nil {
+		return fmt.Errorf("lock replaceable coordinate: %w", err)
+	}
 	var isNewAddress bool
 	err = tx.QueryRow(ctx, `
 		WITH prior AS (
@@ -61,7 +67,8 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 			INSERT INTO replaceable_state (
 				pubkey, kind, d_tag, event_id, created_at, derivation_version
 			)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			SELECT $1, $2, $3, $4, $5, $6
+			WHERE NOT relay_intel_deleted($1, $2, $3, $4, $5)
 			ON CONFLICT (pubkey, kind, d_tag) DO UPDATE
 			SET event_id = EXCLUDED.event_id,
 			    created_at = EXCLUDED.created_at,
@@ -74,21 +81,8 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 			        AND EXCLUDED.event_id < replaceable_state.event_id
 			    )
 			)
-			AND NOT EXISTS (
-			    SELECT 1 FROM deletion_events de
-			    WHERE de.target_event_id = EXCLUDED.event_id
-			      AND de.deleter_pubkey = EXCLUDED.pubkey
-			)
-			AND NOT EXISTS (
-			    SELECT 1 FROM deletion_addresses da
-			    WHERE da.pubkey = EXCLUDED.pubkey
-			      AND da.kind = EXCLUDED.kind
-			      AND da.created_at >= EXCLUDED.created_at
-			      AND (
-			          (EXCLUDED.kind >= 30000 AND EXCLUDED.kind < 40000 AND da.d_tag = EXCLUDED.d_tag)
-			          OR EXCLUDED.kind < 30000
-			          OR EXCLUDED.kind >= 40000
-			      )
+			AND NOT relay_intel_deleted(
+			    EXCLUDED.pubkey, EXCLUDED.kind, EXCLUDED.d_tag, EXCLUDED.event_id, EXCLUDED.created_at
 			)
 			RETURNING event_id
 		)
