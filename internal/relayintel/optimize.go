@@ -35,20 +35,22 @@ type SelectedRelay struct {
 
 // SelectResult is a deterministic set plus the coverage arithmetic.
 type SelectResult struct {
-	Selected             []SelectedRelay `json:"selected"`
-	CurrentCoverage      float64         `json:"current_coverage"`
-	ProposedCoverage     float64         `json:"proposed_coverage"`
-	Improvement          float64         `json:"improvement"`
-	UnknownWeight        float64         `json:"unknown_weight"`
-	KnownWeight          float64         `json:"known_weight"`
-	DistinctEndpoints    int             `json:"distinct_endpoints"`
-	OperatorCount        int             `json:"operator_count"`
-	MaxOperatorShare     float64         `json:"max_operator_share"`
-	ConcentrationBasis   string          `json:"concentration_basis"`
-	Redundancy           float64         `json:"redundancy"`
-	ConstraintsSatisfied bool            `json:"constraints_satisfied"`
-	Unsatisfied          []Reason        `json:"unsatisfied_constraints,omitempty"`
-	CoverageDefinition   string          `json:"coverage_definition"`
+	Selected               []SelectedRelay `json:"selected"`
+	CurrentCoverage        float64         `json:"current_coverage"`
+	ProposedCoverage       float64         `json:"proposed_coverage"`
+	Improvement            float64         `json:"improvement"`
+	UnknownWeight          float64         `json:"unknown_weight"`
+	KnownWeight            float64         `json:"known_weight"`
+	DistinctEndpoints      int             `json:"distinct_endpoints"`
+	OperatorCount          int             `json:"operator_count"`
+	MaxOperatorShare       float64         `json:"max_operator_share"`
+	ConcentrationBasis     string          `json:"concentration_basis"`
+	Redundancy             float64         `json:"redundancy"`
+	ConstraintsSatisfied   bool            `json:"constraints_satisfied"`
+	IndependentlySatisfied bool            `json:"independently_satisfied"`
+	Qualifications         []Reason        `json:"qualifications,omitempty"`
+	Unsatisfied            []Reason        `json:"unsatisfied_constraints,omitempty"`
+	CoverageDefinition     string          `json:"coverage_definition"`
 }
 
 // Select picks a complementary set. Individually popular relays that cover
@@ -89,11 +91,12 @@ func Select(req SelectRequest) SelectResult {
 	})
 
 	result := SelectResult{
-		UnknownWeight:        round3(unknownWeight),
-		KnownWeight:          round3(knownWeight),
-		CoverageDefinition:   coverageDefinition(req.Role),
-		ConcentrationBasis:   "host_or_nip11_pubkey",
-		ConstraintsSatisfied: true,
+		UnknownWeight:          round3(unknownWeight),
+		KnownWeight:            round3(knownWeight),
+		CoverageDefinition:     coverageDefinition(req.Role),
+		ConcentrationBasis:     "host_or_nip11_pubkey",
+		ConstraintsSatisfied:   true,
+		IndependentlySatisfied: true,
 	}
 
 	byURL := map[string]ScoredRelay{}
@@ -181,6 +184,7 @@ func Select(req SelectRequest) SelectResult {
 		result.CurrentCoverage = coverageOf(currentOnly(relays), known, knownWeight)
 		result.ProposedCoverage = result.CurrentCoverage
 		finishDiversity(&result, selected)
+		result.IndependentlySatisfied = result.ConstraintsSatisfied
 		return result
 	}
 
@@ -259,6 +263,7 @@ func Select(req SelectRequest) SelectResult {
 	result.DistinctEndpoints = len(selected)
 	finishDiversity(&result, selected)
 	result.Redundancy = redundancy(selected, known, knownWeight)
+	result.IndependentlySatisfied = result.ConstraintsSatisfied
 	return result
 }
 

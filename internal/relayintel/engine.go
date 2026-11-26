@@ -611,6 +611,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		preview := BuildRecommendations(role, current.Relays, selection.Selected, scoredByURL, down)
 		selection.Selected, _ = keepInvestigations(selection.Selected, preview, scoredByURL)
 		selection = reconcileSelection(selection, scoredByURL, roleMembers, maxCount)
+		selection = auditSelection(selection, scored, pinnedURLs(pinned), minCount, maxCount, diversity, rc)
 		recs := BuildRecommendations(role, current.Relays, selection.Selected, scoredByURL, down)
 		if role == RoleFavorite || role == RoleRelaySet || role == RoleDMInbox || role == RoleKeyPackage {
 			for i := range recs {
@@ -1101,7 +1102,140 @@ func reconcileSelection(selection SelectResult, scored map[string]ScoredRelay, m
 		selection.ConstraintsSatisfied = false
 		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "retained_over_max", Text: "Keeping an investigated relay made the list longer than the maximum."})
 	}
+	selection.IndependentlySatisfied = selection.ConstraintsSatisfied
 	return selection
+}
+
+func pinnedURLs(pinned map[string]preparedURL) []string {
+	out := make([]string, 0, len(pinned))
+	for url := range pinned {
+		out = append(out, url)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// auditSelection checks the list that will actually be proposed. Scoring-time
+// skips are not enough, because retention and swaps can change the set.
+func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string, minCount, maxCount int, diversity float64, rc Constraints) SelectResult {
+	byURL := map[string]ScoredRelay{}
+	for _, relay := range scored {
+		byURL[relay.URL] = relay
+	}
+	chosen := map[string]struct{}{}
+	thin := false
+	for _, item := range selection.Selected {
+		chosen[item.URL] = struct{}{}
+		relay, ok := byURL[item.URL]
+		if !ok {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "unknown_selected", Text: "The final list contains a relay that was not scored."})
+			continue
+		}
+		if relay.Score == nil {
+			thin = true
+		}
+		if absoluteProhibition(relay) || hasViolation(relay, "excluded") || hasViolation(relay, "payment_required") || hasViolation(relay, "auth_rejected") || hasViolation(relay, "min_reliability") || hasViolation(relay, "min_capability_confidence") || hasViolation(relay, "search_unsupported") || hasViolation(relay, "dm_unsupported") {
+			selection.ConstraintsSatisfied = false
+			code := relay.IneligibleReason
+			if code == "" {
+				code = "ineligible"
+			}
+			if !reasonCodeOn(selection.Unsatisfied, code) && !reasonCodeOn(selection.Unsatisfied, "pinned_ineligible") {
+				selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: code, Text: "The final list still contains a relay that violates a mandatory requirement."})
+			}
+		}
+		if rc.MinReliability > 0 && relay.Components.Reliability < rc.MinReliability && !reasonCodeOn(selection.Unsatisfied, "min_reliability") {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "min_reliability", Text: "A selected relay is below the requested reliability."})
+		}
+		if rc.MinCapabilityConfidence > 0 && capabilityConfidence(relay.Role, relay.Capabilities) < rc.MinCapabilityConfidence && !reasonCodeOn(selection.Unsatisfied, "min_capability_confidence") {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "min_capability_confidence", Text: "A selected relay is below the requested capability confidence."})
+		}
+		if rc.FreeOnly && relay.PaidAccess && !reasonCodeOn(selection.Unsatisfied, "payment_required") {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "payment_required", Text: "A selected relay requires payment and the request asked for free relays."})
+		}
+	}
+	for _, pin := range pins {
+		if _, ok := chosen[pin]; !ok {
+			selection.ConstraintsSatisfied = false
+			if !reasonCodeOn(selection.Unsatisfied, "pin_missing") {
+				selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "pin_missing", Text: "A pinned relay is missing from the final list."})
+			}
+		}
+	}
+	if minCount > 0 && len(selection.Selected) < minCount && !reasonCodeOn(selection.Unsatisfied, "minimum_count_unmet") {
+		selection.ConstraintsSatisfied = false
+		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "minimum_count_unmet", Text: "The final list is shorter than the requested minimum."})
+	}
+	if maxCount > 0 && len(selection.Selected) > maxCount && !reasonCodeOn(selection.Unsatisfied, "retained_over_max") {
+		selection.ConstraintsSatisfied = false
+		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "retained_over_max", Text: "The final list is longer than the requested maximum."})
+	}
+	if diversity > 0 && diversity < 1 && len(selection.Selected) >= 2 && concentrated(selection.Selected, byURL) && diverseAlternative(selection.Selected, byURL) && !reasonCodeOn(selection.Unsatisfied, "operator_concentration") {
+		selection.ConstraintsSatisfied = false
+		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "operator_concentration", Text: "The final list uses one operator even though a different eligible operator was available."})
+	}
+	if thin {
+		selection.IndependentlySatisfied = false
+		selection.Qualifications = append(selection.Qualifications, Reason{Code: "retained_insufficient_evidence", Text: "An existing relay was kept without enough evidence to treat the list as independently verified."})
+	} else {
+		selection.IndependentlySatisfied = selection.ConstraintsSatisfied
+	}
+	return selection
+}
+
+func concentrated(selected []SelectedRelay, byURL map[string]ScoredRelay) bool {
+	operators := map[string]struct{}{}
+	for _, item := range selected {
+		relay, ok := byURL[item.URL]
+		if !ok {
+			continue
+		}
+		operators[selectedOperator(relay)] = struct{}{}
+	}
+	return len(operators) == 1
+}
+
+func diverseAlternative(selected []SelectedRelay, byURL map[string]ScoredRelay) bool {
+	chosen := map[string]struct{}{}
+	var only string
+	for _, item := range selected {
+		chosen[item.URL] = struct{}{}
+		if relay, ok := byURL[item.URL]; ok {
+			only = selectedOperator(relay)
+		}
+	}
+	for _, relay := range byURL {
+		if _, ok := chosen[relay.URL]; ok || !relay.Eligible {
+			continue
+		}
+		if selectedOperator(relay) != only {
+			return true
+		}
+	}
+	return false
+}
+
+func selectedOperator(relay ScoredRelay) string {
+	if relay.OperatorKey != "" {
+		return relay.OperatorKey
+	}
+	if relay.Domain != "" {
+		return relay.Domain
+	}
+	return relay.URL
+}
+
+func reasonCodeOn(reasons []Reason, code string) bool {
+	for _, reason := range reasons {
+		if reason.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func capabilityConfidence(role string, caps map[string]Capability) float64 {
