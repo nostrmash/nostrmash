@@ -6,10 +6,35 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/nostrmash/nostrmash/internal/nostr"
 )
+
+// resolveBarrier runs after a request has read canonical state and before it
+// builds the response. Tests use it to commit a concurrent canonical change.
+// The read snapshot must not observe that change. Production leaves it unset.
+var (
+	resolveBarrierMu sync.Mutex
+	resolveBarrier   func()
+)
+
+// SetResolveBarrier installs the test hook described above. A nil function removes it.
+func SetResolveBarrier(fn func()) {
+	resolveBarrierMu.Lock()
+	resolveBarrier = fn
+	resolveBarrierMu.Unlock()
+}
+
+func runResolveBarrier() {
+	resolveBarrierMu.Lock()
+	fn := resolveBarrier
+	resolveBarrierMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
 
 // maxAuthoritativeEndpoints is the largest list this request will optimize.
 // The stored analytical projection stays at MaxEndpointsPerEvent. A complete
@@ -53,12 +78,13 @@ func sourceReports(before []Head, resolved map[string]resolvedSource, notes []so
 	}
 	noteBy := map[string]Reason{}
 	rank := map[string]int{
-		"projection_missing": 1,
-		"projection_stale":   1,
-		"stale_source":       2,
-		"source_too_large":   2,
-		"source_unreadable":  3,
-		"source_deleted":     4,
+		"projection_missing":      1,
+		"projection_stale":        1,
+		"projection_inconsistent": 2,
+		"stale_source":            2,
+		"source_too_large":        2,
+		"source_unreadable":       3,
+		"source_deleted":          4,
 	}
 	for _, note := range notes {
 		key := sourceKey(note.kind, note.dTag)
@@ -86,6 +112,8 @@ func sourceReports(before []Head, resolved map[string]resolvedSource, notes []so
 			switch reason.Code {
 			case "projection_stale":
 				status, refresh = "stale", true
+			case "projection_inconsistent":
+				status, refresh = "inconsistent", true
 			case "projection_missing":
 				status, refresh = "missing", true
 			case "source_deleted":
@@ -143,11 +171,15 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[
 		return AccountConfig{}, nil, nil, nil, err
 	}
 	original := append([]Head(nil), heads...)
-	heads, canonNotes := preferCanonical(heads, winners)
-	ids := make([]string, 0, len(heads)+len(client))
+	ids := make([]string, 0, len(heads)+len(winners)+len(client))
 	for _, head := range heads {
 		if head.EventID != "" {
 			ids = append(ids, head.EventID)
+		}
+	}
+	for _, winner := range winners {
+		if winner.EventID != "" {
+			ids = append(ids, winner.EventID)
 		}
 	}
 	for _, item := range client {
@@ -155,19 +187,56 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[
 			ids = append(ids, item.ID)
 		}
 	}
-	indexed, err := loadEventRaw(ctx, tx, ids)
-	if err != nil {
-		return AccountConfig{}, nil, nil, nil, err
-	}
 	deleted, err := loadDeletions(ctx, tx, pubkey, ids)
 	if err != nil {
 		return AccountConfig{}, nil, nil, nil, err
 	}
+	heads, canonNotes := preferCanonical(heads, winners, deleted)
+	chosen := make([]string, 0, len(heads)+len(client))
+	for _, head := range heads {
+		if head.EventID != "" {
+			chosen = append(chosen, head.EventID)
+		}
+	}
+	for _, item := range client {
+		if item.ID != "" {
+			chosen = append(chosen, item.ID)
+		}
+	}
+	indexed, err := loadEventRaw(ctx, tx, chosen)
+	if err != nil {
+		return AccountConfig{}, nil, nil, nil, err
+	}
+	runResolveBarrier()
 	if err := tx.Commit(ctx); err != nil {
 		return AccountConfig{}, nil, nil, nil, err
 	}
 	account, resolved, notes := applyAuthoritative(pubkey, heads, members, indexed, client, deleted)
 	notes = append(notes, canonNotes...)
+	// A deleted canonical winner is not installed. When no live projection
+	// remains, the coordinate is still reported as deleted so inspection
+	// does not treat the list as merely absent.
+	for _, winner := range winners {
+		if winner.EventID == "" || !HandlesKind(winner.Kind) || !eventSuppressed(winner.EventID, winner.CreatedAt, winner.Kind, winner.DTag, deleted) {
+			continue
+		}
+		key := sourceKey(winner.Kind, winner.DTag)
+		if _, ok := resolved[key]; ok {
+			continue
+		}
+		live := false
+		for _, head := range heads {
+			if head.SourceKind == winner.Kind && head.DTag == winner.DTag && !eventSuppressed(head.EventID, head.CreatedAt, head.SourceKind, head.DTag, deleted) {
+				live = true
+				break
+			}
+		}
+		if live {
+			continue
+		}
+		resolved[key] = resolvedSource{Origin: "deleted", Kind: winner.Kind, DTag: winner.DTag, EventID: winner.EventID, CreatedAt: winner.CreatedAt}
+		notes = append(notes, sourceNote{kind: winner.Kind, dTag: winner.DTag, reason: Reason{Code: "source_deleted", Text: "A deletion covers this list. The deleted event was not used as the current configuration."}})
+	}
 	return account, resolved, notes, sourceReports(original, resolved, notes), nil
 }
 
@@ -202,9 +271,10 @@ func loadCanonical(ctx context.Context, pool dbQuery, pubkey string) ([]canonica
 	return out, rows.Err()
 }
 
-// preferCanonical replaces a relay projection head when canonical replaceable
-// state has a newer winner. It does not downgrade a newer projection.
-func preferCanonical(heads []Head, winners []canonicalWinner) ([]Head, []sourceNote) {
+// preferCanonical uses canonical replaceable state when it is the NIP-01
+// winner, and also when the stored projection is a deleted event. A live
+// newer projection is left alone. A deleted canonical row is not installed.
+func preferCanonical(heads []Head, winners []canonicalWinner, deleted deletionView) ([]Head, []sourceNote) {
 	index := map[string]int{}
 	for i, head := range heads {
 		index[sourceKey(head.SourceKind, head.DTag)] = i
@@ -212,6 +282,9 @@ func preferCanonical(heads []Head, winners []canonicalWinner) ([]Head, []sourceN
 	var notes []sourceNote
 	for _, winner := range winners {
 		if winner.EventID == "" || !HandlesKind(winner.Kind) {
+			continue
+		}
+		if eventSuppressed(winner.EventID, winner.CreatedAt, winner.Kind, winner.DTag, deleted) {
 			continue
 		}
 		key := sourceKey(winner.Kind, winner.DTag)
@@ -229,9 +302,22 @@ func preferCanonical(heads []Head, winners []canonicalWinner) ([]Head, []sourceN
 		if head.EventID == winner.EventID {
 			continue
 		}
+		if eventSuppressed(head.EventID, head.CreatedAt, head.SourceKind, head.DTag, deleted) {
+			heads[position] = Head{
+				Pubkey: head.Pubkey, SourceKind: winner.Kind, DTag: winner.DTag,
+				EventID: winner.EventID, CreatedAt: winner.CreatedAt,
+				DeclarationSource: head.DeclarationSource,
+			}
+			notes = append(notes, sourceNote{kind: winner.Kind, dTag: winner.DTag, reason: Reason{Code: "projection_inconsistent", Text: "The stored projection is covered by a deletion. The canonical event remains authoritative and was used."}})
+			continue
+		}
 		if nostr.Supersedes(winner.CreatedAt, winner.EventID, head.CreatedAt, head.EventID) {
 			heads[position].EventID = winner.EventID
 			heads[position].CreatedAt = winner.CreatedAt
+			heads[position].ExplicitlyEmpty = false
+			heads[position].ClientSideOnly = false
+			heads[position].Truncated = false
+			heads[position].InvalidEndpoints = 0
 			notes = append(notes, sourceNote{kind: winner.Kind, dTag: winner.DTag, reason: Reason{Code: "projection_stale", Text: "The relay projection is older than the canonical replaceable winner. The canonical event was used."}})
 		}
 	}
@@ -377,6 +463,7 @@ func applyAuthoritative(pubkey string, heads []Head, members []Membership, index
 			}
 			if err != nil || parseErr != nil {
 				itemResolved.Complete = false
+				heads, members = dropCoordinate(heads, members, item.kind, item.dTag)
 				notes = append(notes, sourceNote{kind: item.kind, dTag: item.dTag, reason: Reason{Code: "source_unreadable", Text: "The authoritative event could not be parsed. No replacement was generated from it."}})
 			} else {
 				heads, members = replaceCoordinate(heads, members, parsed)
@@ -392,6 +479,11 @@ func applyAuthoritative(pubkey string, heads []Head, members []Membership, index
 		} else if !has {
 			itemResolved.Origin = "missing"
 			itemResolved.Complete = false
+		} else {
+			heads, members = dropCoordinate(heads, members, item.kind, item.dTag)
+			itemResolved.Complete = false
+			itemResolved.Origin = "indexed"
+			notes = append(notes, sourceNote{kind: item.kind, dTag: item.dTag, reason: Reason{Code: "source_unreadable", Text: "The authoritative event could not be loaded. No replacement was generated from the stored projection."}})
 		}
 		resolved[key] = itemResolved
 	}
@@ -425,8 +517,17 @@ func eventSuppressed(eventID string, created int64, kind int, dTag string, delet
 	if eventID != "" && deleted.ByEvent[eventID] {
 		return true
 	}
-	if ts, ok := deleted.ByCoord[sourceKey(kind, dTag)]; ok && created <= ts {
-		return true
+	if AddressableKind(kind) {
+		if ts, ok := deleted.ByCoord[sourceKey(kind, dTag)]; ok && created <= ts {
+			return true
+		}
+		return false
+	}
+	for key, ts := range deleted.ByCoord {
+		coordKind, _, ok := splitSourceKey(key)
+		if ok && coordKind == kind && created <= ts {
+			return true
+		}
 	}
 	return false
 }

@@ -697,7 +697,7 @@ func buildProposal(account AccountConfig, roles []builtRole, resolved map[string
 		if _, ok := keys[sourceKey(item.kind, item.dTag)]; !ok {
 			continue
 		}
-		if item.reason.Code == "projection_stale" || item.reason.Code == "projection_missing" {
+		if item.reason.Code == "projection_stale" || item.reason.Code == "projection_missing" || item.reason.Code == "projection_inconsistent" {
 			proposal.Warnings = append(proposal.Warnings, item.reason)
 			continue
 		}

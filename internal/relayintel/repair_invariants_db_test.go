@@ -376,6 +376,79 @@ func TestRepairRequiresRealProjections(t *testing.T) {
 	})
 }
 
+func TestPartialMembershipBlocksRepair(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	owner, lower, higher := repairIDs(13)
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: lower, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 10,
+		tags: [][]string{{"r", "wss://in.example", "read"}, {"r", "wss://out.example", "write"}},
+	})
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: higher, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 10,
+		tags: [][]string{{"r", "wss://short.example", "write"}},
+	})
+	insertCanonical(t, ctx, pool, owner, relayintel.KindPublicRelayList, "", higher, 10)
+	resetRepairCursor(t, ctx, pool)
+	callRepair(t, ctx, pool)
+	finishDerivation(t, ctx, pool, lower)
+	var matched bool
+	if err := pool.QueryRow(ctx, `
+			SELECT h.membership_count = d.membership_count
+			   AND h.membership_digest = d.membership_digest
+			   AND h.membership_count = 2
+			FROM relay_config_heads h
+			CROSS JOIN LATERAL relay_intel_membership_digest(h.pubkey, h.source_kind, h.d_tag) d
+			WHERE h.pubkey = $1 AND h.source_kind = 10002
+		`, owner).Scan(&matched); err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("stored membership digest does not match the projected rows")
+	}
+	reject := func(reason string) {
+		t.Helper()
+		markJobSucceeded(t, ctx, pool, lower)
+		callRepair(t, ctx, pool)
+		if status := repairStatus(t, ctx, pool, lower); status == "completed" {
+			t.Fatalf("%s completed the repair", reason)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+			DELETE FROM relay_role_memberships
+			WHERE pubkey = $1 AND role = 'public_inbox'
+		`, owner); err != nil {
+		t.Fatal(err)
+	}
+	reject("a missing membership")
+	finishDerivation(t, ctx, pool, lower)
+	if _, err := pool.Exec(ctx, `
+			INSERT INTO relay_role_memberships (
+				pubkey, role, url_key, source_kind, d_tag, endpoint_url, endpoint_type,
+				source_event_id, created_at, declaration_source, public_safe
+			) VALUES ($1, 'public_outbox', 'extra', 10002, '', 'wss://extra.example', 'nostr_relay', $2, 10, 'modern', true)
+		`, owner, lower); err != nil {
+		t.Fatal(err)
+	}
+	reject("an unexpected membership")
+	if _, err := pool.Exec(ctx, `DELETE FROM relay_role_memberships WHERE pubkey = $1 AND url_key = 'extra'`, owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+			UPDATE relay_role_memberships SET role = 'search'
+			WHERE pubkey = $1 AND role = 'public_outbox'
+		`, owner); err != nil {
+		t.Fatal(err)
+	}
+	reject("the wrong role")
+	finishDerivation(t, ctx, pool, lower)
+	markJobSucceeded(t, ctx, pool, lower)
+	callRepair(t, ctx, pool)
+	if status := repairStatus(t, ctx, pool, lower); status != "completed" {
+		t.Fatalf("restored projection status = %s", status)
+	}
+}
+
 func repairIDs(n int) (owner, left, right string) {
 	return repairHex(n*10 + 1), repairHex(n*10 + 2), repairHex(n*10 + 3)
 }

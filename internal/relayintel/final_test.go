@@ -75,13 +75,13 @@ func TestCanonicalWinnerReplacesAStaleProjection(t *testing.T) {
 	heads := []Head{{SourceKind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10}}
 	updated, notes := preferCanonical(heads, []canonicalWinner{{
 		Kind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
-	}})
+	}}, deletionView{})
 	if updated[0].EventID != "aaaaaaaa" || !reasonCodeOn(notesReasons(notes), "projection_stale") {
 		t.Fatalf("heads=%+v notes=%#v", updated, notes)
 	}
 	newer, none := preferCanonical([]Head{{SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 20}}, []canonicalWinner{{
 		Kind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10,
-	}})
+	}}, deletionView{})
 	if newer[0].EventID != "aaaaaaaa" || len(none) != 0 {
 		t.Fatalf("canonical older event replaced the projection: %+v %#v", newer, none)
 	}
@@ -492,7 +492,7 @@ func TestSourceReportShowsAStaleProjection(t *testing.T) {
 	after := []Head{{SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10}}
 	_, notes := preferCanonical(append([]Head(nil), before...), []canonicalWinner{{
 		Kind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
-	}})
+	}}, deletionView{})
 	resolved := map[string]resolvedSource{
 		sourceKey(KindPublicRelayList, ""): {EventID: after[0].EventID, Kind: KindPublicRelayList},
 	}
@@ -773,6 +773,47 @@ func stringIn(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestDeletedProjectionYieldsToAnOlderCanonicalEvent(t *testing.T) {
+	deleted := deletionView{ByEvent: map[string]bool{"bbbbbbbb": true}}
+	updated, notes := preferCanonical([]Head{{
+		SourceKind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 30,
+	}}, []canonicalWinner{{
+		Kind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
+	}}, deleted)
+	if updated[0].EventID != "aaaaaaaa" || updated[0].CreatedAt != 10 || !reasonCodeOn(notesReasons(notes), "projection_inconsistent") {
+		t.Fatalf("heads=%+v notes=%#v", updated, notes)
+	}
+}
+
+func TestDeletedProjectionYieldsToAHigherIDAtTheSameTime(t *testing.T) {
+	deleted := deletionView{ByEvent: map[string]bool{"aaaaaaaa": true}}
+	updated, notes := preferCanonical([]Head{{
+		SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10,
+	}}, []canonicalWinner{{
+		Kind: KindPublicRelayList, EventID: "bbbbbbbb", CreatedAt: 10,
+	}}, deleted)
+	if updated[0].EventID != "bbbbbbbb" || !reasonCodeOn(notesReasons(notes), "projection_inconsistent") {
+		t.Fatalf("heads=%+v notes=%#v", updated, notes)
+	}
+}
+
+func TestClientSourceStillSupersedesCanonical(t *testing.T) {
+	raw := eventRaw(t, KindPublicRelayList, "", [][]string{{"r", "wss://client.example", "write"}})
+	key := sourceKey(KindPublicRelayList, "")
+	heads := []Head{{SourceKind: KindPublicRelayList, EventID: "aaaaaaaa", CreatedAt: 10, DeclarationSource: SourceModern}}
+	indexed := map[string]json.RawMessage{"aaaaaaaa": raw}
+	client := map[string]SourceEvent{key: {Raw: raw, ID: "bbbbbbbb", Kind: KindPublicRelayList, CreatedAt: 20}}
+	_, resolved, _ := applyAuthoritative(strings.Repeat("ab", 32), heads, nil, indexed, client, deletionView{})
+	if resolved[key].Origin != "client" {
+		t.Fatalf("origin = %s", resolved[key].Origin)
+	}
+	gone := deletionView{ByEvent: map[string]bool{"bbbbbbbb": true}}
+	_, kept, _ := applyAuthoritative(strings.Repeat("ab", 32), heads, nil, indexed, client, gone)
+	if kept[key].Origin != "indexed" {
+		t.Fatalf("deleted client source origin = %s", kept[key].Origin)
+	}
 }
 
 func urlsOfSelected(result SelectResult) string {

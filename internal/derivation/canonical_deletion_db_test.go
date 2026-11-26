@@ -577,6 +577,67 @@ func TestListProjectionFollowsCanonicalAuthority(t *testing.T) {
 	}
 }
 
+func TestNutzapProjectionFollowsCanonicalAuthority(t *testing.T) {
+	ctx := context.Background()
+	pool := setupSchemaPool(t, ctx, testDatabaseURL(t))
+	derivationbootstrap.MustMigrate(t, ctx, pool, "nutzap-authority")
+	handlers := derivation.NewHandlers(pool)
+	pgStore := store.NewPostgresStore(pool)
+	base := time.Date(2026, 11, 26, 15, 0, 0, 0, time.UTC)
+	t.Cleanup(func() { derivation.SetProjectionReadBarrier(nil) })
+
+	pubkey := "nutzap-stale"
+	older := "nutzap-old"
+	newer := "nutzap-new"
+	insertPlain(t, ctx, pgStore, older, pubkey, 10019, 10, [][]string{{"relay", "wss://old.example"}, {"pubkey", "old-key"}}, "", base)
+	insertPlain(t, ctx, pgStore, newer, pubkey, 10019, 20, [][]string{{"relay", "wss://new.example"}, {"pubkey", "new-key"}}, "", base)
+	if err := handlers.UpdateReplaceableState(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := handlers.ProjectExtendedLists(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	derivation.SetProjectionReadBarrier(func(winner string) {
+		if winner != older {
+			return
+		}
+		derivation.SetProjectionReadBarrier(nil)
+		if err := handlers.UpdateReplaceableState(ctx, newer); err != nil {
+			t.Errorf("newer canonical: %v", err)
+		}
+		if err := handlers.ProjectExtendedLists(ctx, newer); err != nil {
+			t.Errorf("newer nutzap: %v", err)
+		}
+	})
+	if err := handlers.ProjectExtendedLists(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	var eventID, p2pk string
+	if err := pool.QueryRow(ctx, `SELECT event_id, p2pk FROM nutzap_info_latest WHERE pubkey = $1`, pubkey).Scan(&eventID, &p2pk); err != nil {
+		t.Fatal(err)
+	}
+	if eventID != newer || p2pk != "new-key" {
+		t.Fatalf("event=%s p2pk=%s", eventID, p2pk)
+	}
+
+	tombstoneEvent(t, ctx, pool, pubkey, newer, "tomb-nutzap", 40)
+	if _, err := pool.Exec(ctx, `
+		UPDATE replaceable_state SET event_id = $2, created_at = 10, updated_at = now()
+		WHERE pubkey = $1 AND kind = 10019 AND d_tag = ''
+	`, pubkey, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := handlers.ProjectExtendedLists(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT event_id, p2pk FROM nutzap_info_latest WHERE pubkey = $1`, pubkey).Scan(&eventID, &p2pk); err != nil {
+		t.Fatal(err)
+	}
+	if eventID != older || p2pk != "old-key" {
+		t.Fatalf("reconciled event=%s p2pk=%s", eventID, p2pk)
+	}
+}
+
 func insertPlain(t *testing.T, ctx context.Context, pgStore *store.PostgresStore, id, pubkey string, kind int, created int64, tags [][]string, content string, seen time.Time) {
 	t.Helper()
 	event := newEventForTest(id, pubkey, created, kind, tags, content, seen)
