@@ -208,15 +208,9 @@ func TestRepairLifecycleEdges(t *testing.T) {
 	if heads != 0 {
 		t.Fatal("profile repair required a relay projection")
 	}
-	// The lower id carries an unrelated d tag. Repair still selects it.
-	// Derivation stores ordinary replaceable rows by that tag, so this test
-	// only marks the queued job finished and checks the canonical winner.
-	if _, err := pool.Exec(ctx, `
-		UPDATE jobs SET status = 'succeeded', finished_at = now(), locked_at = NULL, locked_by = NULL
-		WHERE idempotency_key = $1
-	`, "derive_event_bundle:"+lower); err != nil {
-		t.Fatal(err)
-	}
+	// The lower id carries an unrelated d tag. Ordinary kinds ignore it, so
+	// derivation still writes the profile on the empty coordinate.
+	finishDerivation(t, ctx, pool, lower)
 	callRepair(t, ctx, pool)
 	var status string
 	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, lower).Scan(&status); err != nil {
@@ -224,6 +218,20 @@ func TestRepairLifecycleEdges(t *testing.T) {
 	}
 	if status != "completed" {
 		t.Fatalf("profile repair status = %s", status)
+	}
+	var profile string
+	if err := pool.QueryRow(ctx, `SELECT metadata_event_id FROM profiles_latest WHERE pubkey = $1`, pubkey).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile != lower {
+		t.Fatalf("profile projection = %s", profile)
+	}
+	var coordinates int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM replaceable_state WHERE pubkey = $1 AND kind = 0`, pubkey).Scan(&coordinates); err != nil {
+		t.Fatal(err)
+	}
+	if coordinates != 1 {
+		t.Fatalf("stray d tag created %d profile coordinates", coordinates)
 	}
 
 	resetRepairCursor(t, ctx, pool)

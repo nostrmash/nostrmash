@@ -29,6 +29,9 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if err := LockCoordinate(ctx, tx, head.Pubkey, head.SourceKind, head.DTag); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, $3)`, head.Pubkey, head.SourceKind, head.DTag); err != nil && !SchemaMissing(err) {
+		return fmt.Errorf("lock canonical coordinate: %w", err)
+	}
 	var locked string
 	err = tx.QueryRow(ctx, `
 		SELECT event_id FROM relay_config_heads
@@ -50,11 +53,11 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 			pubkey, source_kind, d_tag, event_id, created_at,
 			explicitly_empty, client_side_only, declaration_source,
 			invalid_endpoint_count, truncated, title, needs_replay
-		) VALUES (
-			$1, $2, $3, $4, $5,
+		)
+		SELECT $1, $2, $3, $4, $5,
 			$6, $7, $8,
 			$9, $10, $11, false
-		)
+		WHERE relay_intel_may_project($1, $2, $3, $4, $5, NULL::text, NULL::bigint)
 		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
 		SET event_id = EXCLUDED.event_id,
 		    created_at = EXCLUDED.created_at,
@@ -66,39 +69,11 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		    title = EXCLUDED.title,
 		    needs_replay = false,
 		    updated_at = now()
-		WHERE EXCLUDED.created_at > relay_config_heads.created_at
-		   OR (
-		       EXCLUDED.created_at = relay_config_heads.created_at
-		       AND EXCLUDED.event_id < relay_config_heads.event_id
-		   )
-		   OR EXCLUDED.event_id = relay_config_heads.event_id
-		   OR (
-		       EXISTS (
-		           SELECT 1 FROM replaceable_state rs
-		           WHERE rs.pubkey = EXCLUDED.pubkey
-		             AND rs.kind = EXCLUDED.source_kind
-		             AND rs.d_tag = EXCLUDED.d_tag
-		             AND rs.event_id = EXCLUDED.event_id
-		       )
-		       AND (
-		           EXISTS (
-		               SELECT 1 FROM deletion_events de
-		               WHERE de.target_event_id = relay_config_heads.event_id
-		                 AND de.deleter_pubkey = relay_config_heads.pubkey
-		           )
-		           OR EXISTS (
-		               SELECT 1 FROM deletion_addresses da
-		               WHERE da.pubkey = relay_config_heads.pubkey
-		                 AND da.kind = relay_config_heads.source_kind
-		                 AND da.created_at >= relay_config_heads.created_at
-		                 AND (
-		                     (relay_config_heads.source_kind >= 30000 AND relay_config_heads.source_kind < 40000 AND da.d_tag = relay_config_heads.d_tag)
-		                     OR relay_config_heads.source_kind < 30000
-		                     OR relay_config_heads.source_kind >= 40000
-		                 )
-		           )
-		       )
-		   )
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, EXCLUDED.source_kind, EXCLUDED.d_tag,
+		    EXCLUDED.event_id, EXCLUDED.created_at,
+		    relay_config_heads.event_id, relay_config_heads.created_at
+		)
 	`, head.Pubkey, head.SourceKind, head.DTag, head.EventID, head.CreatedAt,
 		head.ExplicitlyEmpty, head.ClientSideOnly, head.DeclarationSource,
 		head.InvalidEndpoints, head.Truncated, head.Title)
@@ -185,9 +160,16 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if err := LockCoordinate(ctx, tx, in.Pubkey, in.Kind, ""); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, in.Pubkey, in.Kind); err != nil && !SchemaMissing(err) {
+		return fmt.Errorf("lock canonical coordinate: %w", err)
+	}
+	blocked, err := deletionBlocks(ctx, tx, in.Pubkey, in.Kind, "", in.EventID, in.CreatedAt)
+	if err != nil || blocked {
+		return err
+	}
 	var existingID string
 	var existingCreated int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT event_id, created_at
 		FROM relay_config_heads
 		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
@@ -206,16 +188,16 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		Pubkey: in.Pubkey, SourceKind: in.Kind, EventID: in.EventID, CreatedAt: in.CreatedAt,
 		ExplicitlyEmpty: true, DeclarationSource: source,
 	}
-	if _, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO relay_config_heads (
 			pubkey, source_kind, d_tag, event_id, created_at,
 			explicitly_empty, client_side_only, declaration_source,
 			invalid_endpoint_count, truncated, title, needs_replay
-		) VALUES (
-			$1, $2, '', $3, $4,
+		)
+		SELECT $1, $2, '', $3, $4,
 			true, false, $5,
 			0, false, '', false
-		)
+		WHERE relay_intel_may_project($1, $2, '', $3, $4, NULL::text, NULL::bigint)
 		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
 		SET event_id = EXCLUDED.event_id,
 		    created_at = EXCLUDED.created_at,
@@ -225,14 +207,17 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		    truncated = false,
 		    needs_replay = false,
 		    updated_at = now()
-		WHERE EXCLUDED.created_at > relay_config_heads.created_at
-		   OR (
-		       EXCLUDED.created_at = relay_config_heads.created_at
-		       AND EXCLUDED.event_id < relay_config_heads.event_id
-		   )
-		   OR EXCLUDED.event_id = relay_config_heads.event_id
-	`, head.Pubkey, head.SourceKind, head.EventID, head.CreatedAt, head.DeclarationSource); err != nil {
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, EXCLUDED.source_kind, EXCLUDED.d_tag,
+		    EXCLUDED.event_id, EXCLUDED.created_at,
+		    relay_config_heads.event_id, relay_config_heads.created_at
+		)
+	`, head.Pubkey, head.SourceKind, head.EventID, head.CreatedAt, head.DeclarationSource)
+	if err != nil {
 		return fmt.Errorf("record cleared relay head: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM relay_role_memberships

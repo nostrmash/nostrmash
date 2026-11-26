@@ -58,7 +58,7 @@ func RepairCanonicalBatch(ctx context.Context, pool *pgxpool.Pool, batch int) er
 		batch = 200
 	}
 	var repaired int
-	if err := pool.QueryRow(ctx, `SELECT repair_replaceable_tie($1)`, batch).Scan(&repaired); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT repair_replaceable_tie($1, $2)`, batch, ProjectionEnabled()).Scan(&repaired); err != nil {
 		if SchemaMissing(err) || undefinedFunction(err) {
 			return nil
 		}
