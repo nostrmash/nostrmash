@@ -95,6 +95,22 @@ func RunCanonicalRepair(ctx context.Context, log Logger, pool *pgxpool.Pool, bat
 	}
 }
 
+func releaseSessionLock(conn *pgxpool.Conn, held bool, query string, args ...any) {
+	if conn == nil {
+		return
+	}
+	if held {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var released bool
+		err := conn.QueryRow(unlockCtx, query, args...).Scan(&released)
+		if err != nil || !released {
+			_ = conn.Conn().Close(context.Background())
+		}
+	}
+	conn.Release()
+}
+
 // ResetProjectionReconcile makes the next backfill tick walk relay heads again.
 // Process start uses this so projection that was off can catch up without
 // waiting out the idle interval.
@@ -118,16 +134,15 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 	if err != nil {
 		return false, err
 	}
+	locked := false
 	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtext('nostrmash-relay-intel-backfill'), $1::int)`, int32(kind))
-		conn.Release()
+		releaseSessionLock(conn, locked, `SELECT pg_advisory_unlock(hashtext('nostrmash-relay-intel-backfill'), $1::int)`, int32(kind))
 	}()
-	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('nostrmash-relay-intel-backfill'), $1::int)`, int32(kind)).Scan(&locked); err != nil {
+	var held bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('nostrmash-relay-intel-backfill'), $1::int)`, int32(kind)).Scan(&held); err != nil {
 		return false, wrapDB(err)
 	}
+	locked = held
 	if !locked {
 		return true, nil
 	}
@@ -242,16 +257,15 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 	if err != nil {
 		return err
 	}
+	locked := false
 	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtext('nostrmash-relay-intel-reconcile'))`)
-		conn.Release()
+		releaseSessionLock(conn, locked, `SELECT pg_advisory_unlock(hashtext('nostrmash-relay-intel-reconcile'))`)
 	}()
-	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('nostrmash-relay-intel-reconcile'))`).Scan(&locked); err != nil {
+	var held bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('nostrmash-relay-intel-reconcile'))`).Scan(&held); err != nil {
 		return wrapDB(err)
 	}
+	locked = held
 	if !locked {
 		return nil
 	}

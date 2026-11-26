@@ -592,6 +592,174 @@ func TestDeletionBackfillIgnoresOverflowAndStrayDTags(t *testing.T) {
 	}
 }
 
+func TestRepairKeepsARunningDerivationLock(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	pubkey := strings.Repeat("ab", 32)
+	lower := strings.Repeat("1", 64)
+	higher := strings.Repeat("9", 64)
+	newer := strings.Repeat("c", 64)
+	insertStoredEvent(t, ctx, pool, storedEvent{id: lower, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 40, tags: [][]string{{"r", "wss://kept.example"}}})
+	insertStoredEvent(t, ctx, pool, storedEvent{id: higher, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 40, tags: [][]string{{"r", "wss://dropped.example"}}})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+		VALUES ($1, 10002, '', $2, 40, 1)
+	`, pubkey, higher); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'running', attempts = 1, locked_by = 'worker-a', locked_at = now()
+		WHERE idempotency_key = $1
+	`, "derive_event_bundle:"+lower); err != nil {
+		t.Fatal(err)
+	}
+	if callRepair(t, ctx, pool) != 1 {
+		t.Fatal("running derivation was not recorded")
+	}
+	var status, lockedBy string
+	if err := pool.QueryRow(ctx, `SELECT status, locked_by FROM jobs WHERE idempotency_key = $1`, "derive_event_bundle:"+lower).Scan(&status, &lockedBy); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" || lockedBy != "worker-a" {
+		t.Fatalf("job status=%s locked_by=%s", status, lockedBy)
+	}
+	if jobsFor(t, ctx, pool, lower) != 1 {
+		t.Fatal("repair duplicated a derivation job")
+	}
+	var repairStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, lower).Scan(&repairStatus); err != nil {
+		t.Fatal(err)
+	}
+	if repairStatus != "running" {
+		t.Fatalf("repair status = %s", repairStatus)
+	}
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status, locked_by FROM jobs WHERE idempotency_key = $1`, "derive_event_bundle:"+lower).Scan(&status, &lockedBy); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" || lockedBy != "worker-a" {
+		t.Fatal("a second repair pass stole the lock")
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs SET status = 'pending', locked_by = NULL, locked_at = NULL WHERE idempotency_key = $1
+	`, "derive_event_bundle:"+lower); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE replaceable_state SET event_id = $2 WHERE pubkey = $1 AND kind = 10002
+	`, pubkey, higher); err != nil {
+		t.Fatal(err)
+	}
+	resetRepairCursor(t, ctx, pool)
+	callRepair(t, ctx, pool)
+	if jobsFor(t, ctx, pool, lower) != 1 {
+		t.Fatal("a pending job was duplicated")
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE idempotency_key = $1`, "derive_event_bundle:"+lower).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("pending job status = %s", status)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status = 'succeeded', finished_at = now() WHERE idempotency_key = $1`, "derive_event_bundle:"+lower); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE replaceable_state SET event_id = $2 WHERE pubkey = $1 AND kind = 10002`, pubkey, higher); err != nil {
+		t.Fatal(err)
+	}
+	resetRepairCursor(t, ctx, pool)
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status, COALESCE(locked_by, '') FROM jobs WHERE idempotency_key = $1`, "derive_event_bundle:"+lower).Scan(&status, &lockedBy); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || lockedBy != "" {
+		t.Fatalf("completed derivation was not replayed safely: status=%s lock=%q", status, lockedBy)
+	}
+
+	insertStoredEvent(t, ctx, pool, storedEvent{id: newer, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 80, tags: [][]string{{"r", "wss://newer.example"}}})
+	if _, err := pool.Exec(ctx, `
+		UPDATE replaceable_state SET event_id = $2, created_at = 80 WHERE pubkey = $1 AND kind = 10002
+	`, pubkey, newer); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, lower).Scan(&repairStatus); err != nil {
+		t.Fatal(err)
+	}
+	if repairStatus != "superseded" {
+		t.Fatalf("superseded status = %s", repairStatus)
+	}
+	if jobsFor(t, ctx, pool, lower) != 1 {
+		t.Fatal("a superseded repair started another replay")
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE replaceable_state SET event_id = $2, created_at = 40 WHERE pubkey = $1 AND kind = 10002
+	`, pubkey, lower); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs SET status = 'dead', attempts = max_attempts, finished_at = now() WHERE idempotency_key = $1
+	`, "derive_event_bundle:"+lower); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE relay_intel_repairs SET status = 'queued', finished_at = NULL, attempts = 5 WHERE winner_event_id = $1
+	`, lower); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	callRepair(t, ctx, pool)
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, lower).Scan(&repairStatus); err != nil {
+		t.Fatal(err)
+	}
+	if repairStatus != "failed" {
+		t.Fatalf("exhausted status = %s", repairStatus)
+	}
+	if jobsFor(t, ctx, pool, lower) != 1 {
+		t.Fatal("exhausted repair entered another retry")
+	}
+}
+
+func TestDeletedRepairUsesTheRemainingCanonicalEvent(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	pubkey := strings.Repeat("ef", 32)
+	loser := strings.Repeat("b", 64)
+	winner := strings.Repeat("a", 64)
+	third := strings.Repeat("d", 64)
+	insertStoredEvent(t, ctx, pool, storedEvent{id: winner, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 10, tags: [][]string{{"r", "wss://winner.example"}}})
+	insertStoredEvent(t, ctx, pool, storedEvent{id: loser, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 10, tags: [][]string{{"r", "wss://loser.example"}}})
+	insertStoredEvent(t, ctx, pool, storedEvent{id: third, pubkey: pubkey, kind: relayintel.KindPublicRelayList, created: 30, tags: [][]string{{"r", "wss://third.example"}}})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+		VALUES ($1, 10002, '', $2, 10, 1)
+	`, pubkey, loser); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO deletion_events (event_id, deleter_pubkey, target_event_id, created_at, derivation_version)
+		VALUES ($1, $2, $3, 40, 1)
+	`, strings.Repeat("e", 64), pubkey, winner); err != nil {
+		t.Fatal(err)
+	}
+	callRepair(t, ctx, pool)
+	if got := stateWinner(t, ctx, pool, pubkey, 10002, ""); got != third {
+		t.Fatalf("remaining winner = %s", got)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_intel_repairs WHERE winner_event_id = $1`, winner).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deleted" {
+		t.Fatalf("deleted repair status = %s", status)
+	}
+}
+
 func TestBackfillDoesNotDeadlockOnOneConnection(t *testing.T) {
 	ctx := context.Background()
 	pool := repairPool(t, ctx)
