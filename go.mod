@@ -5,7 +5,7 @@ go 1.26.11
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.5.1
 	github.com/btcsuite/btcd/btcutil v1.2.0
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/meilisearch/meilisearch-go v0.37.0
 	github.com/pemistahl/lingua-go v1.4.0
