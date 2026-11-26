@@ -85,6 +85,13 @@ func DefaultOptimizeRoles() []string {
 	return []string{RolePublicInbox, RolePublicOutbox, RoleDMInbox, RoleSearch}
 }
 
+// AddressableKind reports NIP-01 parameterized replaceable events.
+// Empty d tags are a real coordinate for these kinds. Ordinary replaceable
+// kinds ignore d tags.
+func AddressableKind(kind int) bool {
+	return kind >= 30000 && kind < 40000
+}
+
 // HandlesKind reports whether projection should read this event.
 func HandlesKind(kind int) bool {
 	switch kind {

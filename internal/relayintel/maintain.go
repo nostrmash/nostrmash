@@ -2,6 +2,7 @@ package relayintel
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -63,6 +64,11 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 			log.Info("relay_intel_probe_identity_ready")
 		}
 	}
+	if cfg.BackfillEnabled {
+		if err := ResetProjectionReconcile(ctx, pool); err != nil && !errors.Is(err, ErrNotReady) {
+			log.Error("relay_intel_reconcile_reset", "error", err.Error())
+		}
+	}
 	interval := 30 * time.Second
 	if cfg.BackfillEnabled && cfg.BackfillInterval > 0 && cfg.BackfillInterval < interval {
 		interval = cfg.BackfillInterval
@@ -74,7 +80,14 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 		now := time.Now()
 		if cfg.StatsEnabled && (lastStats.IsZero() || now.Sub(lastStats) >= cfg.StatsInterval) {
 			if err := RefreshStats(ctx, pool, exclude); err != nil {
-				log.Error("relay_intel_stats_refresh", "error", err.Error())
+				if errors.Is(err, ErrStatsBusy) {
+					log.Info("relay_intel_stats_refresh_skipped")
+				} else {
+					log.Error("relay_intel_stats_refresh", "error", err.Error())
+					if recErr := RecordStatsFailure(ctx, pool, err); recErr != nil && !errors.Is(recErr, ErrNotReady) {
+						log.Error("relay_intel_stats_failure_record", "error", recErr.Error())
+					}
+				}
 			} else {
 				lastStats = now
 			}

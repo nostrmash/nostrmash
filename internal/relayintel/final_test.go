@@ -338,6 +338,87 @@ func TestDiversityPreferenceDoesNotBlockSigning(t *testing.T) {
 	}
 }
 
+func TestMandatoryDiversityWithoutAnAlternativeStaysUnsatisfied(t *testing.T) {
+	only := scored("wss://only.example", 0.9, "host:only", map[string]float64{"a": 1})
+	selection := SelectResult{
+		Selected:             []SelectedRelay{{URL: only.URL}},
+		ConstraintsSatisfied: true, IndependentlySatisfied: true,
+	}
+	got := auditSelection(selection, []ScoredRelay{only}, nil, 1, 1, 1, Constraints{RequireDiversity: true})
+	if got.ConstraintsSatisfied || !reasonCode(got.Unsatisfied, "operator_concentration") {
+		t.Fatalf("single endpoint = %+v", got)
+	}
+	for _, reason := range got.Unsatisfied {
+		if reason.Code == "operator_concentration" && !strings.Contains(reason.Text, "No eligible relay") {
+			t.Fatalf("missing explanation: %s", reason.Text)
+		}
+	}
+	unknown := scored("wss://unknown.example", 0.8, "", map[string]float64{"a": 1})
+	unknownSel := SelectResult{Selected: []SelectedRelay{{URL: unknown.URL}}, ConstraintsSatisfied: true, IndependentlySatisfied: true}
+	unknownGot := auditSelection(unknownSel, []ScoredRelay{unknown}, nil, 1, 1, 1, Constraints{RequireDiversity: true})
+	if unknownGot.ConstraintsSatisfied || !reasonCode(unknownGot.Unsatisfied, "operator_ownership_unknown") {
+		t.Fatalf("unknown operator = %+v", unknownGot)
+	}
+	pinnedA := scored("wss://pin-a.example", 0.8, "host:pinned", map[string]float64{"a": 1})
+	pinnedB := scored("wss://pin-b.example", 0.7, "host:pinned", map[string]float64{"b": 1})
+	pinnedA.Pinned = true
+	pinnedB.Pinned = true
+	pinnedSel := SelectResult{
+		Selected:             []SelectedRelay{{URL: pinnedA.URL}, {URL: pinnedB.URL}},
+		ConstraintsSatisfied: true, IndependentlySatisfied: true,
+	}
+	pinnedGot := auditSelection(pinnedSel, []ScoredRelay{pinnedA, pinnedB}, nil, 1, 2, 1, Constraints{RequireDiversity: true})
+	if pinnedGot.ConstraintsSatisfied || !reasonCode(pinnedGot.Unsatisfied, "operator_concentration") {
+		t.Fatalf("pinned concentration = %+v", pinnedGot)
+	}
+}
+
+func TestVerifiedKeyPackageIsRequiredDuringEligibility(t *testing.T) {
+	min := 0.7
+	unknown := scored("wss://unknown.example", 0.9, "host:a", nil)
+	unknown.Role = RolePublicOutbox
+	unknown.Capabilities = map[string]Capability{
+		CapWriteRetrieve: {Name: CapWriteRetrieve, Status: StatusVerified, Confidence: 0.95},
+		CapKeyPackage:    {Name: CapKeyPackage, Status: StatusUnknown, Confidence: 0.9},
+	}
+	applyVerifiedKeyPackage(&unknown, RolePublicOutbox, min)
+	if unknown.Eligible {
+		unknown.IneligibleReason = primaryReason(unknown.Violations)
+		unknown.Eligible = false
+	}
+	if unknown.Eligible || !hasViolation(unknown, "keypackage_unverified") {
+		t.Fatalf("unknown keypackage stayed eligible: %+v", unknown.Violations)
+	}
+	advertised := unknown
+	advertised.URL = "wss://advertised.example"
+	advertised.Violations = nil
+	advertised.Eligible = true
+	advertised.Capabilities = map[string]Capability{
+		CapKeyPackage: {Name: CapKeyPackage, Status: StatusAdvertised, Confidence: 0.95},
+	}
+	applyVerifiedKeyPackage(&advertised, RolePublicOutbox, min)
+	if !hasViolation(advertised, "keypackage_unverified") {
+		t.Fatal("advertised keypackage satisfied a verified requirement")
+	}
+	verified := scored("wss://verified.example", 0.8, "host:b", nil)
+	verified.Capabilities = map[string]Capability{
+		CapKeyPackage: {Name: CapKeyPackage, Status: StatusVerified, Confidence: 0.9},
+	}
+	applyVerifiedKeyPackage(&verified, RoleKeyPackage, min)
+	if hasViolation(verified, "keypackage_unverified") {
+		t.Fatal("verified keypackage was rejected")
+	}
+	weak := verified
+	weak.URL = "wss://weak.example"
+	weak.Capabilities = map[string]Capability{
+		CapKeyPackage: {Name: CapKeyPackage, Status: StatusVerified, Confidence: 0.2},
+	}
+	applyVerifiedKeyPackage(&weak, RoleKeyPackage, min)
+	if !hasViolation(weak, "keypackage_unverified") {
+		t.Fatal("low verified confidence satisfied the minimum")
+	}
+}
+
 func TestKeyPackageConfidenceIsNotPublicWriteConfidence(t *testing.T) {
 	confidence := 0.9
 	maxOutbox := 4

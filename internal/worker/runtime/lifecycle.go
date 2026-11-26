@@ -295,6 +295,12 @@ func RunLifecycle(ctx context.Context, log Logger, cfg config.WorkerConfig, boot
 		registryController := relaycontrol.NewController(slogLogger, registryStore, bootstrap.Pool, cfg.RelayRegistry)
 		spawn(registryController.RunRefreshLoop)
 	}
+	if bootstrap.Pool != nil {
+		repairBatch := cfg.RelayIntel.BackfillBatch
+		spawn(func(c context.Context) {
+			relayintel.RunCanonicalRepair(c, log, bootstrap.Pool, repairBatch)
+		})
+	}
 	if cfg.RelayIntel.Enabled && (cfg.RelayIntel.StatsEnabled || cfg.RelayIntel.BackfillEnabled || cfg.RelayIntel.ActiveProbes) {
 		intelCfg := cfg.RelayIntel
 		spawn(func(c context.Context) {

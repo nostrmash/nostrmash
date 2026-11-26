@@ -591,7 +591,7 @@ func hardIneligible(relay ScoredRelay) bool {
 		}
 	}
 	switch relay.IneligibleReason {
-	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected", "excluded", "min_reliability", "min_capability_confidence":
+	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected", "excluded", "min_reliability", "min_capability_confidence", "keypackage_unverified":
 		return true
 	default:
 		return false
