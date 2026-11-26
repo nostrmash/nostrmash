@@ -290,35 +290,49 @@ func TestHistoricalMembershipMetadataUpgrade(t *testing.T) {
 
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, last string) {
 	t.Helper()
-	names := migrationNames(t)
-	for _, name := range names {
+	var names []string
+	for _, name := range migrationNames(t) {
 		if name > last {
 			break
 		}
-		applyMigrationFile(t, ctx, pool, name)
+		names = append(names, name)
 	}
+	applyMigrationFiles(t, ctx, pool, names)
 }
 
 func applyMigrationFile(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) {
 	t.Helper()
-	data, err := migrations.Files.ReadFile(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var schema string
-	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-		t.Fatal(err)
-	}
+	applyMigrationFiles(t, ctx, pool, []string{name})
+}
+
+func applyMigrationFiles(t *testing.T, ctx context.Context, pool *pgxpool.Pool, names []string) {
+	t.Helper()
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := dbmigrate.SetMigrationSearchPath(ctx, tx, schema, name == "000016_search_hardening.sql"); err != nil {
+	var schema string
+	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, string(data)); err != nil {
-		t.Fatalf("apply %s: %v", name, err)
+	// 000092 scans pg_constraint across the database. Another test's schema
+	// drop during that scan fails with "could not open relation with OID"
+	// unless this transaction holds the same lock as Migrate and test cleanup.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, dbmigrate.MigrationAdvisoryLockID); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		data, err := migrations.Files.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := dbmigrate.SetMigrationSearchPath(ctx, tx, schema, name == "000016_search_hardening.sql"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, string(data)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
