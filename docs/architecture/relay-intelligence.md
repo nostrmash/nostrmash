@@ -178,7 +178,7 @@ Migration `000133_relay_role_intelligence.sql` is additive. `000135_relay_intel_
 
 `000136_relay_intel_favorite_deletion.sql` adds kind 10012 to `backfill_deletion_addresses`. `000137_relay_intel_repair_membership.sql` replaces `repair_replaceable_tie` so a repaired coordinate drops memberships that still point at the losing event and marks the head truncated until that winning event is projected again. Neither function runs during deployment. Replay each promoted event before using role statistics for that coordinate. Events that were purged before the corrected tie-break cannot be reconstructed. Pause retention, run the repair in batches of at most 200, replay the promoted ids, confirm each head event id matches `replaceable_state`, then resume retention.
 
-`RELAY_INTEL_ENABLED=false` stops the API and the maintenance loop. It does not stop canonical replaceable-state updates, and kinds already in the ingest filter are still projected. Rows already written remain until deleted.
+`RELAY_INTEL_ENABLED=false` stops the API, the maintenance loop, and role-row projection. `RELAY_INTEL_PROJECTION_ENABLED=false` stops role-row projection while leaving the API on. Neither flag stops canonical replaceable-state updates. Rows already written remain until deleted. Backfill reads current `replaceable_state` winners rather than every historical event of the kind. An event that is not the stored winner is not projected by that walk.
 
 Metrics, all with bounded labels:
 

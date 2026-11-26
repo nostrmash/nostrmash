@@ -1,6 +1,7 @@
 package relayintel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -107,6 +108,55 @@ func notesReasons(notes []sourceNote) []Reason {
 		out = append(out, note.reason)
 	}
 	return out
+}
+
+func TestFinalAuditRejectsAThresholdTheSelectionKept(t *testing.T) {
+	weak := scored("wss://weak.example", 0.9, "host:weak", map[string]float64{"a": 1})
+	weak.Components.Reliability = 0.2
+	weak.Violations = []Violation{{Code: "min_reliability", Hard: true, ManualRetention: true, BlocksSigning: true}}
+	weak.IneligibleReason = "min_reliability"
+	strong := scored("wss://other.example", 0.4, "host:other", map[string]float64{"b": 1})
+	selection := SelectResult{
+		Selected:             []SelectedRelay{{URL: weak.URL}},
+		ConstraintsSatisfied: true,
+	}
+	audited := auditSelection(selection, []ScoredRelay{weak, strong}, nil, 1, 2, 1, Constraints{MinReliability: 0.5})
+	if audited.ConstraintsSatisfied || audited.IndependentlySatisfied || !reasonCode(audited.Unsatisfied, "min_reliability") {
+		t.Fatalf("audit = %+v", audited)
+	}
+}
+
+func TestUnrelatedEventsDoNotCrowdOutTheRequestedEvent(t *testing.T) {
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
+	var wanted map[string]any
+	if err := json.Unmarshal(raw, &wanted); err != nil {
+		t.Fatal(err)
+	}
+	noise := signedEvent(t, 1, 1_700_000_001, nil, "unrelated")
+	var other map[string]any
+	if err := json.Unmarshal(noise, &other); err != nil {
+		t.Fatal(err)
+	}
+	server := relayFrames(t, func(sub string, filter map[string]any) []any {
+		frames := make([]any, 0, 12)
+		for i := 0; i < 10; i++ {
+			frames = append(frames, []any{"EVENT", sub, other})
+		}
+		frames = append(frames, []any{"EVENT", sub, wanted}, []any{"EOSE", sub})
+		return frames
+	})
+	defer server.Close()
+	otherServer := relayFrames(t, func(sub string, filter map[string]any) []any {
+		return []any{[]any{"EVENT", sub, wanted}, []any{"EOSE", sub}}
+	})
+	defer otherServer.Close()
+	result, err := VerifyEvent(context.Background(), raw, []string{wsURL(server), wsURL(otherServer)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SampleVerified || result.ExactRetrievedCount != 2 || result.LatestAgreementCount != 2 {
+		t.Fatalf("noise crowded the match: %+v", result)
+	}
 }
 
 func TestKeepInvestigationsDoesNotRestoreExcludedRelays(t *testing.T) {
@@ -526,15 +576,6 @@ func containsSelected(selected []SelectedRelay, url string) bool {
 func stringIn(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
-func reasonCodeOn(reasons []Reason, code string) bool {
-	for _, reason := range reasons {
-		if reason.Code == code {
 			return true
 		}
 	}

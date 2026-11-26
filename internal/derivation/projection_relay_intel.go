@@ -18,6 +18,9 @@ import (
 // The write uses its own transaction so a retry after a committed sibling
 // projection is idempotent.
 func (h *Handlers) projectRelayIntelEvent(ctx context.Context, eventID string) error {
+	if !relayintel.ProjectionEnabled() {
+		return nil
+	}
 	if h == nil || h.pool == nil || eventID == "" {
 		return nil
 	}

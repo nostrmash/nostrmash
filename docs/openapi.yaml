@@ -876,6 +876,7 @@ paths:
                 tie_break: lower_event_id
                 preset: balanced
                 constraints_satisfied: true
+                independently_satisfied: true
                 fallbacks: [cohort_only]
                 cohort: { size: 40, truncated: false, trust_data: true, used: personalized }
                 proposal:
@@ -899,10 +900,12 @@ paths:
       tags: [public]
       summary: Read a published event back from named relays
       description: >
-        Read-only. The server does not publish the event and does not treat
-        one relay as global success. global_success requires a valid signature,
-        retrieval from at least two relays, agreement on the latest replaceable
-        version, and no timeout, conflict, or unavailable result.
+        Read-only. The server does not publish the event. sample_verified means
+        the checked relays returned the event and agreed on the latest
+        replaceable version. It is not network-wide propagation. global_success
+        is the deprecated alias of that sample result. exact_retrieved_count is
+        how many relays returned the submitted event. latest_agreement_count is
+        how many of those also agreed it is the latest version.
       requestBody:
         required: true
         content:
@@ -938,8 +941,11 @@ paths:
               example:
                 signature_valid: true
                 retrieved_count: 2
+                exact_retrieved_count: 2
+                latest_agreement_count: 2
                 agreement: true
                 partial: false
+                sample_verified: true
                 global_success: true
                 reason: ok
                 relays:

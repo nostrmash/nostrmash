@@ -6,7 +6,13 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_ENABLED",
 			Runtimes:     []string{"api", "worker"},
 			DefaultValue: "true",
-			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Apply migration 000133 before running a binary that projects role rows.",
+			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Turning this off also stops role-row projection. Canonical replaceable-state updates keep running. Apply migration 000133 before running a binary that projects role rows.",
+		},
+		{
+			Name:         "RELAY_INTEL_PROJECTION_ENABLED",
+			Runtimes:     []string{"worker"},
+			DefaultValue: "true",
+			Description:  "Write role membership rows while ingesting supported relay-list kinds. False stops that projection only. It does not stop replaceable-state updates, and RELAY_INTEL_ENABLED=false forces this off.",
 		},
 		{
 			Name:         "RELAY_INTEL_ALLOW_PRIVATE_NETWORK",

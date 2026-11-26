@@ -67,11 +67,12 @@ func backfillKind(ctx context.Context, pool *pgxpool.Pool, kind, batch int) (boo
 	}
 	metrics.SetRelayIntelBackfillDone(kind, 0)
 	rows, err := pool.Query(ctx, `
-		SELECT id, pubkey, created_at, content, raw_json::text
-		FROM events
-		WHERE kind = $1
-		  AND (created_at, id) > ($2, $3)
-		ORDER BY created_at ASC, id ASC
+		SELECT e.id, e.pubkey, e.created_at, e.content, e.raw_json::text
+		FROM replaceable_state rs
+		JOIN events e ON e.id = rs.event_id
+		WHERE rs.kind = $1
+		  AND (e.created_at, e.id) > ($2, $3)
+		ORDER BY e.created_at ASC, e.id ASC
 		LIMIT $4
 	`, kind, created, eventID, batch)
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 // even when the environment variable is present.
 type RelayIntelConfig struct {
 	Enabled             bool
+	ProjectionEnabled   bool
 	AllowPrivateNetwork bool
 	StatsEnabled        bool
 	StatsInterval       time.Duration
@@ -58,6 +59,7 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 	}
 	cfg := RelayIntelConfig{
 		Enabled:             getEnvBool("RELAY_INTEL_ENABLED", true),
+		ProjectionEnabled:   getEnvBool("RELAY_INTEL_PROJECTION_ENABLED", true),
 		AllowPrivateNetwork: getEnvBool("RELAY_INTEL_ALLOW_PRIVATE_NETWORK", false),
 		StatsEnabled:        getEnvBool("RELAY_INTEL_STATS_ENABLED", true),
 		StatsInterval:       statsInterval,
@@ -68,6 +70,9 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 		GiftwrapProbes:      getEnvBool("RELAY_INTEL_GIFTWRAP_PROBES", false),
 		ProbeGlobalPerHour:  perHour,
 		ProbeMinInterval:    probeInterval,
+	}
+	if !cfg.Enabled {
+		cfg.ProjectionEnabled = false
 	}
 	if cfg.GiftwrapProbes {
 		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_GIFTWRAP_PROBES is not implemented; leave it false")
