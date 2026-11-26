@@ -34,6 +34,7 @@ type BenchObservation struct {
 	Retrieved       *bool
 	Unauthenticated *bool
 	Authenticated   *bool
+	ObservedAt      time.Time
 }
 
 // BenchCompletion is the worker completion record. It is passed to the same
@@ -47,6 +48,7 @@ type BenchCompletion struct {
 	Endpoint         string
 	FollowCapability string
 	Metric           string
+	ObservedAt       time.Time
 	Writes           []BenchObservation
 	RetentionURL     string
 	RetentionEventID string
@@ -64,6 +66,7 @@ func benchCompletion(in BenchCompletion) probeCompletion {
 			Retrieved:       write.Retrieved,
 			Unauthenticated: write.Unauthenticated,
 			Authenticated:   write.Authenticated,
+			ObservedAt:      write.ObservedAt,
 		}
 	}
 	var retention *scheduledRetention
@@ -85,6 +88,7 @@ func benchCompletion(in BenchCompletion) probeCompletion {
 		Writes:           writes,
 		Retention:        retention,
 		Metric:           in.Metric,
+		ObservedAt:       in.ObservedAt,
 	}
 }
 
@@ -109,4 +113,19 @@ func BenchCommitProbe(ctx context.Context, pool *pgxpool.Pool, key, token string
 		return "error", err
 	}
 	return "committed", nil
+}
+
+// BenchDigestCost times resultDigest, the hash commitProbeResult stores on
+// the attempt. It does not write a row and it does not dial a relay.
+func BenchDigestCost(attemptID int64, urlKey, capability string, completion BenchCompletion, iterations int) (string, time.Duration) {
+	if iterations < 1 {
+		iterations = 1
+	}
+	mapped := benchCompletion(completion)
+	started := time.Now()
+	digest := ""
+	for i := 0; i < iterations; i++ {
+		digest = resultDigest(attemptID, urlKey, capability, mapped)
+	}
+	return digest, time.Since(started)
 }

@@ -31,12 +31,20 @@ func measureMixed(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 	events := operationalIntEnv("RELAY_INTEL_OPERATIONAL_MIXED_EVENTS", 200)
 	repeats := operationalIntEnv("RELAY_INTEL_OPERATIONAL_MIXED_REPEATS", 3)
 	windowMS := operationalIntEnv("RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS", 30000)
-	report.note(fmt.Sprintf("mixed workload offers %d events paced across %d ms, repeated %d times for baseline, relay intelligence without a full statistics refresh, and relay intelligence with one forced refresh", events, windowMS, repeats))
+	report.note(fmt.Sprintf("sustained mixed workload offers %d events paced across %d ms, repeated %d times for baseline, relay intelligence without a full statistics refresh, and relay intelligence with one forced refresh", events, windowMS, repeats))
 	modes := []string{"baseline", "relay_intel_on", "stats_refresh"}
 	runs := make([]any, 0, repeats*len(modes))
 	for pass := 1; pass <= repeats; pass++ {
 		for _, mode := range modes {
 			runs = append(runs, runMixedPass(t, ctx, pool, counter, people, events, windowMS, mode, pass))
+		}
+	}
+	burstRepeats := operationalIntEnv("RELAY_INTEL_OPERATIONAL_BURST_REPEATS", 2)
+	if burstRepeats > 0 {
+		report.note(fmt.Sprintf("burst mixed workload offers the same %d events with no pacing, repeated %d times for baseline and relay intelligence. It is a capacity comparison. It is not a maximum sustainable throughput.", events, burstRepeats))
+		for pass := 1; pass <= burstRepeats; pass++ {
+			runs = append(runs, runMixedPass(t, ctx, pool, counter, people, events, 0, "burst_baseline", pass))
+			runs = append(runs, runMixedPass(t, ctx, pool, counter, people, events, 0, "burst_relay_intel_on", pass))
 		}
 	}
 	report.mu.Lock()
@@ -48,7 +56,8 @@ func measureMixed(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, people benchPeople, events, windowMS int, mode string, pass int) map[string]any {
 	t.Helper()
 	t.Logf("mixed %s pass %d events %d window %dms", mode, pass, events, windowMS)
-	relayOn := mode != "baseline"
+	relayOn := mode != "baseline" && mode != "burst_baseline"
+	paced := windowMS > 0
 	relayintel.SetProjectionEnabled(relayOn)
 	defer relayintel.SetProjectionEnabled(true)
 	handlers := newBenchHandlers(t, pool)
@@ -210,7 +219,10 @@ func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 	if perWorker < 1 {
 		perWorker = 1
 	}
-	gap := time.Duration(windowMS) * time.Millisecond / time.Duration(perWorker)
+	var gap time.Duration
+	if paced {
+		gap = time.Duration(windowMS) * time.Millisecond / time.Duration(perWorker)
+	}
 	ingestDone := make(chan struct{})
 	var ingestWG sync.WaitGroup
 	for worker := 0; worker < 4; worker++ {
@@ -218,7 +230,7 @@ func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 		go func(n int) {
 			defer ingestWG.Done()
 			for i := 0; i < perWorker; i++ {
-				if time.Now().After(deadline) {
+				if paced && time.Now().After(deadline) {
 					return
 				}
 				key := keys[(n+i)%len(keys)]
@@ -248,7 +260,7 @@ func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 					continue
 				}
 				ingestOK.add()
-				if i+1 < perWorker {
+				if paced && i+1 < perWorker {
 					select {
 					case <-time.After(gap):
 					case <-stop:
@@ -338,8 +350,8 @@ func runMixedPass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter
 	stat1 := pool.Stat()
 	result := map[string]any{
 		"scenario": mode, "pass": pass, "events_attempted": perWorker * 4,
-		"offered_window_ms": windowMS,
-		"ingest_ok":         ingestOK.value(), "ingest_errors": ingestErr.value(),
+		"paced": paced, "offered_window_ms": windowMS,
+		"ingest_ok": ingestOK.value(), "ingest_errors": ingestErr.value(),
 		"derive_ok": deriveOK.value(), "derive_errors": deriveErr.value(),
 		"wall_ms": elapsed.Milliseconds(), "ingest_wall_ms": ingestWall.Milliseconds(),
 		"ingest_per_s":       float64(ingestOK.value()) / ingestWall.Seconds(),

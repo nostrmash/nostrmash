@@ -48,6 +48,43 @@ func TestOperationalRelayIntelligence(t *testing.T) {
 	}
 }
 
+// TestOperationalProbeCompletion measures the atomic completion path without
+// the account-scale fixture. It stays skipped unless the probe-only variable
+// is set, so the account-scale command does not run it twice.
+func TestOperationalProbeCompletion(t *testing.T) {
+	if os.Getenv("RELAY_INTEL_OPERATIONAL_PROBE_ONLY") == "" {
+		t.Skip("set RELAY_INTEL_OPERATIONAL_PROBE_ONLY=1 to measure atomic completion without the account-scale fixture")
+	}
+	ctx := context.Background()
+	pool, schema := openOperationalPool(t, ctx, &queryCounter{})
+	if err := dbmigrate.Migrate(ctx, pool, "bench"); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]any{
+		"generated_at":          time.Now().UTC().Format(time.RFC3339),
+		"commit":                strings.TrimSpace(commandOutput("git", "rev-parse", "HEAD")),
+		"implementation_commit": strings.TrimSpace(commandOutput("git", "rev-parse", "origin/feat/relay-capability-probes")),
+		"core_commit":           reviewedCoreCommit,
+		"core_incorporated":     commandOK("git", "merge-base", "--is-ancestor", reviewedCoreCommit, "HEAD"),
+		"schema":                schema,
+		"scope":                 "Atomic completion on an empty disposable schema. This is not the account-scale benchmark.",
+	}
+	measureAtomicCompletion(t, ctx, pool, out)
+	dir := operationalOutDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "probe-completion.json")
+	if err := os.WriteFile(path, append(raw, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("wrote %s", path)
+}
+
 func operationalScales() []int {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("RELAY_INTEL_OPERATIONAL_SCALE"))) {
 	case "small":
@@ -101,12 +138,18 @@ func (q *queryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryE
 
 func (q *queryCounter) snapshot() int64 { return q.n.Load() }
 
+// reviewedCoreCommit is the retention-index and membership-metadata commit.
+// The final account-scale run requires this commit in the capability branch.
+const reviewedCoreCommit = "31df4c808129f633593d7bcd605cb178dad40727"
+
 type opReport struct {
 	mu                   sync.Mutex
 	path                 string
 	GeneratedAt          string         `json:"generated_at"`
 	Commit               string         `json:"commit"`
 	ImplementationCommit string         `json:"implementation_commit"`
+	CoreCommit           string         `json:"core_commit"`
+	CoreIncorporated     bool           `json:"core_incorporated"`
 	Scale                string         `json:"scale"`
 	Accounts             int            `json:"accounts"`
 	Environment          map[string]any `json:"environment"`
@@ -130,6 +173,8 @@ func newOpReport(path, scale string, accounts int) *opReport {
 		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
 		Commit:               commit,
 		ImplementationCommit: implementation,
+		CoreCommit:           reviewedCoreCommit,
+		CoreIncorporated:     commandOK("git", "merge-base", "--is-ancestor", reviewedCoreCommit, "HEAD"),
 		Scale:                scale,
 		Accounts:             accounts,
 		Environment:          map[string]any{},
@@ -257,6 +302,12 @@ func commandOutput(name string, args ...string) string {
 		return ""
 	}
 	return string(out)
+}
+
+func commandOK(name string, args ...string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run() == nil
 }
 
 func openOperationalPool(t *testing.T, ctx context.Context, counter *queryCounter) (*pgxpool.Pool, string) {

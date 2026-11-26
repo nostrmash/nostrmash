@@ -12,10 +12,30 @@ export RELAY_INTEL_OPERATIONAL_OUT="${RELAY_INTEL_OPERATIONAL_OUT:-benchmarks/re
 export RELAY_INTEL_OPERATIONAL_MIXED_EVENTS="${RELAY_INTEL_OPERATIONAL_MIXED_EVENTS:-200}"
 export RELAY_INTEL_OPERATIONAL_MIXED_REPEATS="${RELAY_INTEL_OPERATIONAL_MIXED_REPEATS:-3}"
 export RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS="${RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS:-30000}"
+export RELAY_INTEL_OPERATIONAL_BURST_REPEATS="${RELAY_INTEL_OPERATIONAL_BURST_REPEATS:-2}"
 
 mkdir -p "$RELAY_INTEL_OPERATIONAL_OUT"
 echo "commit $(git rev-parse HEAD)"
 echo "implementation $(git rev-parse origin/feat/relay-capability-probes)"
+echo "core $(git rev-parse origin/fix/relay-intelligence)"
+CORE=31df4c808129f633593d7bcd605cb178dad40727
+if [ "${RELAY_INTEL_OPERATIONAL_COMPILE:-}" = "1" ]; then
+  compiled="${TMPDIR:-/tmp}/relayintelbench.test"
+  go test -tags relayintelbench -c -o "$compiled" ./internal/api/
+  rm -f "$compiled"
+  echo "tagged compile ok"
+  exit 0
+fi
+if git merge-base --is-ancestor "$CORE" HEAD; then
+  echo "core incorporated $CORE"
+  export RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL=1
+else
+  echo "core not incorporated $CORE"
+  if [ "${RELAY_INTEL_OPERATIONAL_ALLOW_PARTIAL:-}" != "1" ]; then
+    echo "refusing the account-scale benchmark until that core commit is in HEAD" >&2
+    exit 1
+  fi
+fi
 echo "scale $RELAY_INTEL_OPERATIONAL_SCALE"
 echo "output $RELAY_INTEL_OPERATIONAL_OUT"
 

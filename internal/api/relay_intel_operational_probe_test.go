@@ -19,8 +19,7 @@ import (
 func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Pool, out map[string]any) {
 	t.Helper()
 	resetProbeWindow(t, ctx, pool)
-	out["completion_digest"] = "The integrated implementation has no completion digest. There is no digest overhead to measure."
-	out["completion_path_note"] = "public_write and search use publishProbe. Gift-wrap, retention, replay, conflict, expiry, and concurrent completion use commitProbeResult, which publishProbe and gift-wrap storage both call. Neither path dials a relay."
+	out["completion_path_note"] = "public_write and search use publishProbe, which stamps the observation time and then calls commitProbeResult. Gift-wrap, retention, replay, same-status conflict, expiry, and concurrent completion call commitProbeResult directly. Neither path dials a relay. result_digest is the sha256 stored by that commit."
 
 	writeKey := "wss://write-finish.bench.example"
 	writeToken := claim(t, ctx, pool, writeKey, relayintel.CapWriteAccept, "write-finish.bench.example", "bench", 60, 1)
@@ -37,12 +36,14 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	var attemptStatus string
 	var finished bool
 	var leases int
-	_ = pool.QueryRow(ctx, `SELECT status, finished_at IS NOT NULL FROM relay_probe_attempts WHERE lease_token = $1`, writeToken).Scan(&attemptStatus, &finished)
+	var writeDigest string
+	_ = pool.QueryRow(ctx, `SELECT status, finished_at IS NOT NULL, COALESCE(result_digest, '') FROM relay_probe_attempts WHERE lease_token = $1`, writeToken).Scan(&attemptStatus, &finished, &writeDigest)
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_leases WHERE lease_token = $1`, writeToken).Scan(&leases)
 	out["public_write_completion"] = map[string]any{
 		"path": "publishProbe", "wall_ms": ms(time.Since(started)), "error": errorText(err),
 		"attempt_status": attemptStatus, "finished": finished, "lease_rows": leases,
-		"accepted": err == nil && finished && attemptStatus == "finished" && leases == 0,
+		"digest_bytes": len(writeDigest), "digest_nonempty": writeDigest != "",
+		"accepted": err == nil && finished && attemptStatus == "finished" && leases == 0 && writeDigest != "",
 	}
 
 	searchKey := "wss://search-finish.bench.example"
@@ -123,14 +124,16 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 		"path": "commitProbeResult", "wall_ms": ms(time.Since(started)), "outcome": scheduleOutcome, "error": errorText(scheduleErr),
 		"pending_rows": scheduled, "accepted": scheduleErr == nil && scheduled == 1,
 	}
+	if _, err := pool.Exec(ctx, `UPDATE relay_probe_followups SET check_after = now() WHERE event_id = $1`, eventID); err != nil {
+		t.Fatal(err)
+	}
 
 	var followID int64
 	var followKey, followURL string
 	err = pool.QueryRow(ctx, `
 		SELECT id, url_key, endpoint_url FROM relay_probe_followups
-		WHERE finished_at IS NULL AND status = 'pending' AND check_after <= now()
-		ORDER BY id LIMIT 1
-	`).Scan(&followID, &followKey, &followURL)
+		WHERE event_id = $1 AND capability = 'retention' AND finished_at IS NULL AND status = 'pending'
+	`, eventID).Scan(&followID, &followKey, &followURL)
 	if err != nil {
 		out["retention_followup_claim"] = map[string]any{"error": err.Error()}
 	} else {
@@ -168,10 +171,12 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 
 	replayKey := "wss://replay.bench.example"
 	replayToken := claim(t, ctx, pool, replayKey, relayintel.CapWriteAccept, "replay.bench.example", "bench", 60, 1)
+	replayAt := time.Now().UTC()
 	replay := relayintel.BenchCompletion{
 		AttemptStatus: "finished",
+		ObservedAt:    replayAt,
 		Writes: []relayintel.BenchObservation{
-			{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "ok_true", Confidence: 0.8},
+			{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "ok_true", Confidence: 0.8, ObservedAt: replayAt},
 		},
 	}
 	firstOutcome, firstErr := relayintel.BenchCommitProbe(ctx, pool, replayKey, replayToken, replay)
@@ -189,6 +194,34 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	out["conflicting_completion"] = map[string]any{
 		"path": "commitProbeResult", "wall_ms": ms(time.Since(started)), "outcome": conflictOutcome, "error": errorText(conflictErr),
 		"accepted": conflictOutcome == "error" && conflictErr != nil,
+	}
+
+	sameKey := "wss://same-status.bench.example"
+	sameToken := claim(t, ctx, pool, sameKey, relayintel.CapWriteAccept, "same-status.bench.example", "bench", 60, 1)
+	sameAt := time.Now().UTC()
+	sameStatus := relayintel.BenchCompletion{
+		AttemptStatus: "finished",
+		ObservedAt:    sameAt,
+		Writes: []relayintel.BenchObservation{
+			{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "ok_true", Confidence: 0.8, ObservedAt: sameAt},
+		},
+	}
+	sameFirst, sameFirstErr := relayintel.BenchCommitProbe(ctx, pool, sameKey, sameToken, sameStatus)
+	started = time.Now()
+	sameOutcome, sameErr := relayintel.BenchCommitProbe(ctx, pool, sameKey, sameToken, relayintel.BenchCompletion{
+		AttemptStatus: "finished",
+		ObservedAt:    sameAt,
+		Writes: []relayintel.BenchObservation{
+			{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "different_observation", Confidence: 0.8, ObservedAt: sameAt},
+		},
+	})
+	var sameSamples int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM relay_capability_samples WHERE url_key = $1`, sameKey).Scan(&sameSamples)
+	out["same_status_conflicting_completion"] = map[string]any{
+		"path": "commitProbeResult", "first_outcome": sameFirst, "first_error": errorText(sameFirstErr),
+		"wall_ms": ms(time.Since(started)), "outcome": sameOutcome, "error": errorText(sameErr),
+		"sample_rows": sameSamples,
+		"accepted":    sameFirst == "committed" && sameOutcome == "error" && sameErr != nil && sameSamples == 1,
 	}
 
 	expireKey := "wss://expire-complete.bench.example"
@@ -212,6 +245,7 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 
 	raceKey := "wss://race-complete.bench.example"
 	raceToken := claim(t, ctx, pool, raceKey, relayintel.CapWriteAccept, "race-complete.bench.example", "bench", 60, 1)
+	raceAt := time.Now().UTC()
 	var wg sync.WaitGroup
 	outcomes := make([]string, 8)
 	errs := make([]string, 8)
@@ -224,8 +258,9 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 			one := time.Now()
 			outcome, raceErr := relayintel.BenchCommitProbe(ctx, pool, raceKey, raceToken, relayintel.BenchCompletion{
 				AttemptStatus: "finished",
+				ObservedAt:    raceAt,
 				Writes: []relayintel.BenchObservation{
-					{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "race", Confidence: 0.8},
+					{Capability: relayintel.CapWriteAccept, Status: relayintel.StatusVerified, Detail: "race", Confidence: 0.8, ObservedAt: raceAt},
 				},
 			})
 			lats[n] = time.Since(one)
@@ -234,10 +269,13 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 		}(i)
 	}
 	wg.Wait()
-	committed := 0
+	committed, already := 0, 0
 	for _, outcome := range outcomes {
 		if outcome == "committed" {
 			committed++
+		}
+		if outcome == "already_completed" {
+			already++
 		}
 	}
 	var raceSamples int
@@ -245,7 +283,9 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	out["concurrent_completion"] = map[string]any{
 		"path": "commitProbeResult", "workers": 8, "wall_ms": ms(time.Since(raceStart)),
 		"outcomes": outcomes, "errors": nonempty(errs), "latencies_ms": durationsMS(lats),
-		"committed": committed, "sample_rows": raceSamples, "accepted": committed == 1 && raceSamples == 1,
+		"committed": committed, "already_completed": already, "sample_rows": raceSamples,
+		"accepted": committed == 1 && already == 7 && raceSamples == 1,
+		"note":     "All eight submissions use one observation time and the same writes. One commit is authoritative. The other seven must match that digest.",
 	}
 
 	var window, successes int
@@ -257,5 +297,26 @@ func measureAtomicCompletion(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	out["evidence_history"] = map[string]any{
 		"url_key": writeKey, "capability": relayintel.CapWriteAccept,
 		"recent_window": window, "recent_successes": successes, "aggregated": window > 0,
+	}
+
+	digest, digestWall := relayintel.BenchDigestCost(0, writeKey, relayintel.CapWriteAccept, write, 1000)
+	var giftBytes, digestColumn int64
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(sum(pg_column_size(s.*)), 0) FROM relay_capability_samples s WHERE url_key = $1`, giftKey).Scan(&giftBytes)
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(pg_column_size(result_digest), 0) FROM relay_probe_attempts WHERE lease_token = $1`, writeToken).Scan(&digestColumn)
+	perCall := time.Duration(0)
+	if digestWall > 0 {
+		perCall = digestWall / 1000
+	}
+	out["completion_digest"] = map[string]any{
+		"algorithm":                 "sha256 of the canonical completion JSON, including observation order after sorting",
+		"stored_hex_bytes":          len(writeDigest),
+		"stored_column_bytes":       digestColumn,
+		"stored_nonempty":           writeDigest != "",
+		"hash_iterations":           1000,
+		"hash_wall_ms":              ms(digestWall),
+		"hash_per_call":             perCall.String(),
+		"hash_is_64_hex":            len(digest) == 64,
+		"giftwrap_sample_row_bytes": giftBytes,
+		"note":                      "hash_wall_ms times resultDigest only, with no SQL. stored_hex_bytes is the digest commitProbeResult wrote for the public-write completion. Identical replay carries that digest. A same-status submission with a different observation does not.",
 	}
 }

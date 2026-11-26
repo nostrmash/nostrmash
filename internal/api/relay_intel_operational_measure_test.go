@@ -43,13 +43,20 @@ func runOperationalScale(t *testing.T, accounts int, outDir string) {
 		scale = "medium"
 	}
 	report := newOpReport(filepath.Join(outDir, "results-"+scale+".json"), scale, accounts)
-	report.note("Measurements use origin/feat/relay-capability-probes. Commits e8d305096c3612b16f8bc1f01de785034001d78c and 90eaa83fa5f63d94564756225444542fdc819fcf remain only on origin/fix/relay-intelligence. Their migration 000144 collides with 000144_relay_probe_evidence_fence.sql, so they are not included.")
+	report.note(fmt.Sprintf("Benchmark tooling commit %s. Capability commit %s. Core commit %s incorporated=%t.", report.Commit, report.ImplementationCommit, report.CoreCommit, report.CoreIncorporated))
 	report.Environment = collectEnvironment(ctx, pool, schema)
 	report.Environment["seed_session_work_mem"] = "64MB on the seed connection only"
 	report.save()
 	t.Logf("migrating schema %s", schema)
 	if err := dbmigrate.Migrate(ctx, pool, "bench"); err != nil {
 		t.Fatal(err)
+	}
+	membershipColumn := membershipColumnPresent(ctx, pool)
+	report.Environment["core_membership_column"] = membershipColumn
+	report.Environment["core_incorporated"] = report.CoreIncorporated
+	report.save()
+	if os.Getenv("RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL") == "1" && !membershipColumn {
+		t.Fatalf("final benchmark refused: core commit %s is not in this schema (relay_config_heads.membership_count is absent)", reviewedCoreCommit)
 	}
 	if err := derivation.EnsureRegisteredDerivations(ctx, pool); err != nil {
 		t.Fatal(err)
@@ -262,8 +269,12 @@ func pathID(path string) string {
 }
 
 func callPOST(fn func(http.ResponseWriter, *http.Request), body map[string]any) httpResult {
+	return callPOSTContext(context.Background(), fn, body)
+}
+
+func callPOSTContext(ctx context.Context, fn func(http.ResponseWriter, *http.Request), body map[string]any) httpResult {
 	encoded, _ := json.Marshal(body)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/relays/optimize", bytes.NewReader(encoded))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/relays/optimize", bytes.NewReader(encoded)).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	fn(rec, req)
 	return decodeRecorder(rec)
@@ -764,13 +775,31 @@ func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 	`); err != nil {
 		t.Fatal(err)
 	}
+	out["membership_metadata"] = measureMembershipMetadata(t, ctx, pool)
 	if planPath != "" {
+		out["retention_indexes_before_rebuild"] = listRetentionEventIndexes(ctx, pool)
+		out["retention_indexes_removed_for_baseline"] = dropRetentionEventIndexes(ctx, pool)
 		for key, value := range measureRetentionBreakdown(t, ctx, pool, planPath) {
 			out[key] = value
+		}
+		out["populated_index_build"] = measurePopulatedIndexBuild(ctx, pool, planPath)
+		indexedStart := time.Now()
+		indexedPlan, indexedErr := explainRollback(ctx, pool, "EXPLAIN (ANALYZE, BUFFERS, WAL) "+purgeSupersededSQL, int32(100), retentionKinds(), time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+		if err := os.WriteFile(planPath, appendFile(planPath, "\n## replaceable retention purge after event-id indexes\nRolled back. Indexes were built on this populated disposable schema.\n"+indexedPlan), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out["indexed_purge_plan_wall_ms"] = time.Since(indexedStart).Milliseconds()
+		out["indexed_purge_plan_trigger_lines"] = triggerLines(indexedPlan)
+		out["indexed_purge_buffers"] = bufferTotals(indexedPlan)
+		out["indexed_purge_seq_scans"] = scanLines(indexedPlan, "Seq Scan")
+		out["indexed_purge_index_scans"] = scanLines(indexedPlan, "Index Scan")
+		if indexedErr != nil {
+			out["indexed_purge_plan_error"] = indexedErr.Error()
 		}
 	}
 	purgeStart := time.Now()
 	wal2 := walLSN(ctx, pool)
+	purgeDB := dbCounters(ctx, pool)
 	purged, err := retention.New(pool).PurgeSupersededReplaceableEvents(ctx, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour), 100)
 	if err != nil {
 		out["replaceable_retention"] = map[string]any{"error": err.Error()}
@@ -778,7 +807,9 @@ func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 		out["replaceable_retention"] = map[string]any{
 			"wall_ms": time.Since(purgeStart).Milliseconds(), "deleted": purged,
 			"wal_bytes": walBytes(ctx, pool, wal2, walLSN(ctx, pool)),
+			"buffers":   dbDelta(purgeDB, dbCounters(ctx, pool)),
 			"limit":     100,
+			"indexes":   listRetentionEventIndexes(ctx, pool),
 		}
 	}
 	report.mu.Lock()
