@@ -152,6 +152,34 @@ func TestSelectKeepsPinsAndReportsConflicts(t *testing.T) {
 	}
 }
 
+func TestSelectReplacesOneRelayInsideAFullList(t *testing.T) {
+	members := []CohortMember{
+		{Pubkey: "a", Weight: 0.25, HasDeclaration: true},
+		{Pubkey: "b", Weight: 0.25, HasDeclaration: true},
+		{Pubkey: "c", Weight: 0.25, HasDeclaration: true},
+		{Pubkey: "d", Weight: 0.25, HasDeclaration: true},
+	}
+	a := scored("wss://a.example", 0.8, "host:a", map[string]float64{"a": 1})
+	b := scored("wss://b.example", 0.8, "host:b", map[string]float64{"b": 1})
+	c := scored("wss://c.example", 0.8, "host:c", map[string]float64{"c": 1})
+	d := scored("wss://d.example", 0.2, "host:d", map[string]float64{"a": 1})
+	e := scored("wss://e.example", 0.7, "host:e", map[string]float64{"d": 1})
+	for _, relay := range []*ScoredRelay{&a, &b, &c, &d} {
+		relay.Current = true
+	}
+	result := Select(SelectRequest{
+		Role: RolePublicInbox, Objective: ObjectiveCoverage,
+		Min: 4, Max: 4, RetainExisting: true, Hysteresis: 0.05, QualityBias: 0.01,
+		Members: members, Relays: []ScoredRelay{a, b, c, d, e},
+	})
+	if !containsURL(result, "wss://e.example") || containsURL(result, "wss://d.example") {
+		t.Fatalf("full list was not improved: %#v", result.Selected)
+	}
+	if !containsURL(result, "wss://a.example") || !containsURL(result, "wss://b.example") || !containsURL(result, "wss://c.example") {
+		t.Fatalf("swap removed the wrong relays: %#v", result.Selected)
+	}
+}
+
 func TestSelectAvoidsChurnForTinyOverlap(t *testing.T) {
 	current := scored("wss://current.example", 0.5, "host:current", map[string]float64{"a": 1})
 	current.Current = true

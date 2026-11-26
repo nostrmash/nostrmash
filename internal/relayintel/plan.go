@@ -36,6 +36,9 @@ type UnsignedEvent struct {
 	Tags             [][]string `json:"tags"`
 	BasedOnEventID   string     `json:"based_on_event_id,omitempty"`
 	BasedOnCreatedAt int64      `json:"based_on_created_at,omitempty"`
+	ProposalSafe     bool       `json:"proposal_safe"`
+	SourceOrigin     string     `json:"source_origin,omitempty"`
+	Change           string     `json:"change,omitempty"`
 	Note             string     `json:"note"`
 }
 

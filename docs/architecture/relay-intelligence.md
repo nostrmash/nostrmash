@@ -94,13 +94,13 @@ If the neighborhood is empty, scoring falls back to trust-weighted global adopti
 
 ## Optimizer
 
-`relay-opt-v1` is a deterministic greedy maximum-coverage selection. It does not take the highest individual scores.
+`relay-opt-v2` is a deterministic greedy maximum-coverage selection followed by at most four local swaps. It does not take the highest individual scores. A swap replaces one removable relay only when the whole selected set improves by more than the preset hysteresis.
 
 Pins are kept even when they are ineligible or they exceed the maximum. Preferred relays are added when they fit and are eligible. Excluded relays are dropped unless pinned, which yields `pinned_excluded`. A minimum larger than the maximum leaves that role unchanged with `min_exceeds_max`. Unmet minimums, ineligible preferred relays, and preferred relays that do not fit are returned in `unsatisfied_constraints`. They are not silently dropped.
 
 For inbox and outbox the objective is unique weighted coverage, blended with a small quality term from the preset. DM, search, and keypackage use a quality objective. Blossom's objective is `retain`: current servers stay, and a popularity add is returned as `investigate` with `blossom_popularity_not_sufficient`. Blocklists and relay sets are not optimized. Kind 10013 is never rewritten.
 
-`retain_existing` keeps current relays that are eligible, pinned, or custom, then fills remaining slots. After the minimum size is met, an additional relay is skipped when its marginal gain is below the preset hysteresis. A single failed probe does not remove a relay. Uncertain health becomes `investigate`, and that relay stays in the unsigned event.
+`retain_existing` keeps current relays that are not hard-ineligible, then fills remaining slots. Excluded, blocked, unsupported, and payment-rejected relays are not kept. After the minimum size is met, an additional relay is skipped when its marginal gain is below the preset hysteresis. A full list can still replace one relay when a swap clears that hysteresis. A single failed probe does not remove a relay. Uncertain health becomes `investigate`, and that relay stays in the unsigned event.
 
 Diversity uses the NIP-11 pubkey when one is stored, otherwise `host:<hostname>`. It scales marginal gain when the operator key is already selected. It is not an ownership claim and it is not an ASN lookup. No ownership is invented.
 
@@ -117,7 +117,13 @@ Presets are `balanced` (default), `creator`, `privacy`, `minimal`, `decentraliza
 
 Publishable proposals are patches of a complete signed source event. Content, including encrypted NIP-51 entries, is copied and never decrypted. Unknown tags and unknown `r` markers are kept. Optimizing only the inbox leaves the outbox tags in place, and the reverse. Blossom server order is kept for servers that stay. Kind 3 is never emitted. An unchanged list produces no event.
 
-`proposal_safe` is false when the source is missing, truncated, or not authoritative. The response can still contain recommendations, but it omits the replacement. `source_origin` is `indexed`, `client`, `missing`, or `absent_from_index`. Local absence is not a confirmed empty list. The client may pass `source_events` on `POST /api/v1/relays/optimize`. Those events are signature-checked and are not stored, cached, or logged. The client must read the latest source events again immediately before signing. A validated local event is not proof it is the newest on the network.
+`proposal_safe` is false when the source used for that request is missing, deleted, truncated, or not authoritative. Each unsigned event also has its own `proposal_safe`, `source_origin`, and `change` (`replacement` or `creation`). One safe event can sit next to a list that still needs a refresh. The response can still contain recommendations when the replacement is omitted.
+
+The optimizer and the patch use the same event. Indexed and caller-supplied events for one coordinate are ordered by NIP-01: newer `created_at` wins, and an equal timestamp keeps the lower event id. A valid signature does not make an older event win. A supplied event that loses is reported as `stale_source` and is not written over the newer indexed event. `source_events` are not stored, cached, or logged. Optimize and verify responses send `Cache-Control: no-store`.
+
+Local absence is not a confirmed empty list. `allow_create: true` is the only way to mint a first kind 10002 or kind 10050 when this index has no source. The client must still look for an existing event before signing. A deletion tombstone is not overridden by absence.
+
+The client must read the latest source events again immediately before signing. A validated local event is not proof it is the newest on the network.
 
 `based_on_event_id` and `based_on_created_at` identify the source that was patched. DM removal and keypackage replacement set `attention_required`. Historical DMs are not migrated. Modern KeyPackage discovery follows the NIP-65 write relays, so a public-outbox change can affect it. A kind 10051 replacement is emitted only when that legacy list is still the effective source.
 
@@ -140,7 +146,7 @@ All routes are under `/api/v1` and are off when `RELAY_INTEL_ENABLED=false`, whi
 
 Rankings, roles, and capabilities use the public-stats rate limit. The account and POST routes use the personalized limit. POST bodies are limited to 64KB and reject unknown JSON fields.
 
-`POST /api/v1/relays/verify` does not publish. `global_success` is true only when the signature is valid, the event was retrieved from at least two relays, the latest replaceable version agrees, and there is no conflict, timeout, or unavailable result. One relay is `insufficient_relay_sample`. A newer replacement is `conflict`. Invalid signatures return 200 with `signature_valid: false` and do not dial. Dialing uses the IP that passed the safety check, ignores `HTTP_PROXY`, and rejects redirects by not following a second host. Metadata and link-local targets are rejected.
+`POST /api/v1/relays/verify` does not publish. `sample_verified` is true only when the signature is valid, at least two relays returned the event, each of those relays finished with a matching EOSE, and for a replaceable event that same event is the latest valid version under NIP-01. Exact retrieval without a completed latest-version query is not agreement. A missing or malformed EOSE, a wrong subscription id, or a message budget exhausted before EOSE is incomplete. `global_success` is the old name for that sample and is not network-wide propagation. One relay is `insufficient_relay_sample`. A different latest event is `conflict`. Invalid signatures return 200 with `signature_valid: false` and do not dial. Addressable requests include the `#d` filter, including an empty `d`. Dialing uses the IP that passed the safety check, ignores `HTTP_PROXY`, and rejects redirects by not following a second host. Metadata and link-local targets are rejected.
 
 Public GET responses are cached in process for 30 seconds (rankings and capabilities for 2 minutes), with a 192-entry cap and singleflight. Optimize is never cached.
 
@@ -162,7 +168,7 @@ Relay URLs, NIP-11 documents, event bodies, and API parameters are untrusted. Di
 
 Environment variables are generated into [configuration.md](../configuration.md) under `RELAY_INTEL_*`. Defaults: enabled, private networks off, stats every 10 minutes, backfill 200 events every 5 seconds, active probes off, gift-wrap probes off.
 
-Migration `000133_relay_role_intelligence.sql` is additive. Rollback is dropping the new tables and removing kinds 10013, 10051, and 10102 from the purge cursor and `enqueue_superseded_replaceable` if those kinds must leave the retention function. Do not drop `relay_lists_latest`. The old popular API does not read the new tables.
+Migration `000133_relay_role_intelligence.sql` is additive. `000135_relay_intel_deletion_durability.sql` drops the foreign key from `deletion_addresses` to `events` so a purged kind-5 event does not remove the tombstone, fixes empty `d` so it is one coordinate rather than a wildcard, and records both NIP-65 roles as known when a kind 10002 head exists. `repair_replaceable_tie(limit)` promotes a still-stored lower event id. It is resumable, capped at 200 rows per call, and is not run during deployment. Replay each promoted event to refresh projections. Events already deleted under the old higher-id rule cannot be rebuilt from SQL. `backfill_deletion_addresses(limit)` copies address tags from kind-5 events that are still stored. It cannot recover deletions that were purged before the ledger existed. Rollback of the feature is dropping the new tables and removing kinds 10013, 10051, and 10102 from the purge cursor and `enqueue_superseded_replaceable` if those kinds must leave the retention function. Do not drop `relay_lists_latest`. The old popular API does not read the new tables. Purge of superseded replaceable events skips an id that is the current `replaceable_state` winner and removes that stale queue row.
 
 `RELAY_INTEL_ENABLED=false` stops the API and the worker loop. Rows already written remain until deleted.
 
@@ -183,7 +189,8 @@ Metrics, all with bounded labels:
 ## What this does not establish
 
 - Production query latency and table growth were not measured against a production database. The in-memory optimizer benchmark on an Apple M4 Pro, 500 cohort members and 40 candidate relays, is about 3.1 ms/op. SQL, cache, and pool time are extra.
-- Gift-wrap privacy cannot be verified here. Advertisement is not proof.
+- Gift-wrap privacy cannot be verified here. `RELAY_INTEL_GIFTWRAP_PROBES` still fails startup when set. Advertisement is not proof. Active probe budgets are still process-local and are not a cross-worker lease.
+- A kind 10002 that contains only write relays is a known empty read list. Cohort scoring treats a neighborhood with no relevant declarations as unknown, not as a precise personalized score.
 - Kind 10051 is historical. Current Marmot clients look for KeyPackages on NIP-65 write relays when a kind 10002 exists, including an empty one.
 - Coverage is overlap of stored declarations, not a delivery guarantee.
 - Propagation counts are not proof of intentional publication.

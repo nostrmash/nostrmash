@@ -15,7 +15,7 @@ const (
 	// ScoreVersion is the weighted scoring model.
 	ScoreVersion = "relay-score-v1"
 	// OptimizerVersion is the complementary-set selector.
-	OptimizerVersion = "relay-opt-v1"
+	OptimizerVersion = "relay-opt-v2"
 	// TieBreak is the NIP-01 replaceable-event rule.
 	// A newer created_at wins. The same created_at keeps the lower event id.
 	TieBreak     = "lower_event_id"
@@ -188,6 +188,10 @@ type EventInput struct {
 	CreatedAt int64
 	Content   string
 	Tags      [][]string
+	// EndpointLimit overrides the analytical projection cap for one parse.
+	// Zero uses MaxEndpointsPerEvent. A larger complete event is not truncated
+	// to the projection cap. Past the limit the result is marked truncated.
+	EndpointLimit int
 }
 
 // Head is the winning declaration for one address, including an explicit empty list.

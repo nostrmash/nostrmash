@@ -231,6 +231,10 @@ func Select(req SelectRequest) SelectResult {
 		})
 	}
 
+	if req.Objective != ObjectiveRetain {
+		selected = improveBySwap(selected, relays, seen, known, knownWeight, req)
+	}
+
 	result.Selected = annotate(selected, known, knownWeight)
 	result.ProposedCoverage = round3(coverageOf(selected, known, knownWeight))
 	result.Improvement = round3(result.ProposedCoverage - result.CurrentCoverage)
@@ -238,6 +242,77 @@ func Select(req SelectRequest) SelectResult {
 	finishDiversity(&result, selected)
 	result.Redundancy = redundancy(selected, known, knownWeight)
 	return result
+}
+
+func improveBySwap(selected, relays []ScoredRelay, seen map[string]struct{}, known map[string]float64, knownWeight float64, req SelectRequest) []ScoredRelay {
+	if len(selected) == 0 {
+		return selected
+	}
+	base := setObjective(selected, known, knownWeight, req)
+	for step := 0; step < 4; step++ {
+		threshold := req.Hysteresis
+		bestGain := threshold
+		dropIdx := -1
+		var add ScoredRelay
+		found := false
+		for i, current := range selected {
+			if current.Pinned {
+				continue
+			}
+			without := append(append([]ScoredRelay{}, selected[:i]...), selected[i+1:]...)
+			for _, alt := range relays {
+				if _, ok := seen[alt.URL]; ok {
+					continue
+				}
+				if hardIneligible(alt) && !alt.Pinned {
+					continue
+				}
+				if !alt.Eligible && !alt.Pinned && !alt.Custom {
+					continue
+				}
+				trial := append(append([]ScoredRelay{}, without...), alt)
+				gain := setObjective(trial, known, knownWeight, req) - base
+				if gain <= threshold {
+					continue
+				}
+				if !found || gain > bestGain+1e-9 || (abs(gain-bestGain) <= 1e-9 && relayLess(alt, add)) {
+					bestGain = gain
+					dropIdx = i
+					add = alt
+					found = true
+				}
+			}
+		}
+		if !found || dropIdx < 0 {
+			break
+		}
+		delete(seen, selected[dropIdx].URL)
+		selected = append(selected[:dropIdx], selected[dropIdx+1:]...)
+		selected = append(selected, add)
+		seen[add.URL] = struct{}{}
+		base = setObjective(selected, known, knownWeight, req)
+	}
+	return selected
+}
+
+func setObjective(selected []ScoredRelay, known map[string]float64, knownWeight float64, req SelectRequest) float64 {
+	score := coverageOf(selected, known, knownWeight)
+	if len(selected) == 0 || req.QualityBias == 0 {
+		return score
+	}
+	var quality float64
+	var counted int
+	for _, relay := range selected {
+		if relay.Score == nil {
+			continue
+		}
+		quality += *relay.Score
+		counted++
+	}
+	if counted == 0 {
+		return score
+	}
+	return score + req.QualityBias*quality/float64(counted)
 }
 
 func currentOnly(relays []ScoredRelay) []ScoredRelay {
@@ -495,7 +570,7 @@ func coverageDefinition(role string) string {
 
 func hardIneligible(relay ScoredRelay) bool {
 	switch relay.IneligibleReason {
-	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected":
+	case "search_unsupported", "dm_unsupported", "blocked_by_account", "payment_required", "auth_rejected", "excluded":
 		return true
 	default:
 		return false

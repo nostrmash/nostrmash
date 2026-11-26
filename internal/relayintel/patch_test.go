@@ -144,6 +144,49 @@ func TestPatchPreservesBlossomOrder(t *testing.T) {
 	}
 }
 
+func TestPatchKeepsTrailingFieldsAndUnrelatedURLs(t *testing.T) {
+	raw := eventRaw(t, KindPublicRelayList, "keep", [][]string{
+		{"r", "wss://a.example", "read", "hint"},
+		{"client", "nostr"},
+	})
+	result := Patch(PatchInput{
+		Source: raw, InboxOptimized: true, OutboxOptimized: true,
+		Inbox: []string{"wss://a.example"}, Outbox: []string{"wss://a.example"},
+	})
+	if !result.Safe || result.Event == nil {
+		t.Fatalf("result = %+v", result)
+	}
+	var relay []string
+	for _, tag := range result.Event.Tags {
+		if len(tag) > 0 && tag[0] == "r" {
+			relay = tag
+		}
+		if len(tag) > 0 && tag[0] == "client" && tag[1] != "nostr" {
+			t.Fatalf("client tag = %#v", tag)
+		}
+	}
+	if len(relay) < 4 || relay[3] != "hint" {
+		t.Fatalf("trailing field moved: %#v", relay)
+	}
+	blossom := eventRaw(t, KindBlossomServers, "", [][]string{
+		{"r", "wss://not-a-server.example"},
+		{"server", "https://a.example"},
+	})
+	kept := Patch(PatchInput{
+		Source: blossom, ListOptimized: true, TagName: "server",
+		Desired: []string{"https://a.example", "https://b.example"},
+	})
+	foundR := false
+	for _, tag := range kept.Event.Tags {
+		if tag[0] == "r" {
+			foundR = true
+		}
+	}
+	if !foundR {
+		t.Fatalf("unrelated r tag was treated as a blossom server: %#v", kept.Event.Tags)
+	}
+}
+
 func eventRaw(t *testing.T, kind int, content string, tags [][]string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{

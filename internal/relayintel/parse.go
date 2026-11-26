@@ -43,6 +43,13 @@ func Parse(in EventInput) (Parsed, error) {
 	}
 }
 
+func endpointCap(in EventInput) int {
+	if in.EndpointLimit > 0 {
+		return in.EndpointLimit
+	}
+	return MaxEndpointsPerEvent
+}
+
 func parsePrivate(in EventInput) Parsed {
 	// Kind 10013 is NIP-44 encrypted. Public tags are not a license to index
 	// private relay URLs. The client retrieves the original event itself.
@@ -91,7 +98,7 @@ func parseKind3(in EventInput) Parsed {
 			}
 			continue
 		}
-		if len(members) >= MaxEndpointsPerEvent {
+		if len(members) >= endpointCap(in) {
 			truncated = true
 			continue
 		}
@@ -151,7 +158,7 @@ func parseMarkedRelays(in EventInput, source, dTag string) Parsed {
 			invalid++
 			continue
 		}
-		if seen >= MaxEndpointsPerEvent {
+		if seen >= endpointCap(in) {
 			truncated = true
 			continue
 		}
@@ -242,7 +249,7 @@ func parsePlainList(in EventInput) (Parsed, error) {
 			invalid++
 			continue
 		}
-		if seen >= MaxEndpointsPerEvent {
+		if seen >= endpointCap(in) {
 			truncated = true
 			continue
 		}
@@ -293,7 +300,7 @@ func parseBlossom(in EventInput) Parsed {
 			invalid++
 			continue
 		}
-		if seen >= MaxEndpointsPerEvent {
+		if seen >= endpointCap(in) {
 			truncated = true
 			continue
 		}

@@ -142,6 +142,58 @@ func TestVerifyRejectsInternalTargets(t *testing.T) {
 	}
 }
 
+func TestVerifyIncompleteAndAddressableFilter(t *testing.T) {
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
+	var event map[string]any
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatal(err)
+	}
+	incomplete := relayFrames(t, func(sub string, filter map[string]any) []any {
+		frames := []any{[]any{"EVENT", sub, event}}
+		for i := 0; i < 20; i++ {
+			frames = append(frames, []any{"NOTICE", "pending"})
+		}
+		return frames
+	})
+	defer incomplete.Close()
+	result, err := VerifyEvent(context.Background(), raw, []string{wsURL(incomplete), wsURL(incomplete)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SampleVerified || result.GlobalSuccess || result.Reason == "ok" {
+		t.Fatalf("missing EOSE counted as verified: %+v", result)
+	}
+
+	set := signedEvent(t, KindRelaySet, 1_700_000_000, [][]string{{"d", "room:1"}, {"relay", "wss://set.example"}}, "")
+	var setEvent map[string]any
+	if err := json.Unmarshal(set, &setEvent); err != nil {
+		t.Fatal(err)
+	}
+	var sawD atomic.Bool
+	respond := func(filter map[string]any) map[string]any {
+		if _, ok := filter["ids"]; !ok {
+			if values, ok := filter["#d"].([]any); ok && len(values) == 1 && values[0] == "room:1" {
+				sawD.Store(true)
+			}
+		}
+		return setEvent
+	}
+	left := relayServer(t, respond)
+	right := relayServer(t, respond)
+	defer left.Close()
+	defer right.Close()
+	checked, err := VerifyEvent(context.Background(), set, []string{wsURL(left), wsURL(right)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawD.Load() {
+		t.Fatal("addressable latest query omitted #d")
+	}
+	if !checked.SampleVerified {
+		t.Fatalf("addressable sample = %+v", checked)
+	}
+}
+
 func signedEvent(t *testing.T, kind int, created int64, tags [][]string, content string) []byte {
 	t.Helper()
 	priv, err := btcec.NewPrivateKey()
@@ -201,6 +253,33 @@ func relayServer(t *testing.T, respond func(map[string]any) map[string]any) *htt
 			event := respond(filter)
 			_ = conn.WriteJSON([]any{"EVENT", sub, event})
 			_ = conn.WriteJSON([]any{"EOSE", sub})
+		}
+	}))
+}
+
+func relayFrames(t *testing.T, respond func(sub string, filter map[string]any) []any) *httptest.Server {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var frame []json.RawMessage
+		if json.Unmarshal(payload, &frame) != nil || len(frame) < 3 {
+			return
+		}
+		var sub string
+		_ = json.Unmarshal(frame[1], &sub)
+		var filter map[string]any
+		_ = json.Unmarshal(frame[2], &filter)
+		for _, item := range respond(sub, filter) {
+			_ = conn.WriteJSON(item)
 		}
 	}))
 }

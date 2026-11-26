@@ -72,6 +72,7 @@ type PlanRequest struct {
 	Supplied       []SuppliedRelay
 	IncludeRanking bool
 	SourceEvents   []json.RawMessage
+	AllowCreate    bool
 }
 
 // Meta is the version and freshness block on every response.
@@ -160,7 +161,11 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 	if err != nil {
 		return PlanResponse{}, err
 	}
-	account := EffectiveConfig(req.Pubkey, heads, members)
+	account, resolved, sourceNotes, err := s.resolveAccount(ctx, req.Pubkey, heads, members, sources)
+	if err != nil {
+		return PlanResponse{}, err
+	}
+	roles, foldNotes := foldSharedRoles(roles, account)
 	computedAt, statsReady, err := loadSnapshotTime(ctx, s.pool)
 	if err != nil {
 		return PlanResponse{}, err
@@ -353,7 +358,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			dst[item.URL] = item
 		}
 		for _, relay := range current.Relays {
-			addClass(mandatory, preparedURL{URL: relay.URL, Key: relay.URLKey, PublicSafe: relay.PublicSafe})
+			mandatory[relay.URL] = preparedURL{URL: relay.URL, Key: relay.URLKey, PublicSafe: relay.PublicSafe}
 		}
 		for _, item := range []map[string]preparedURL{pinned, preferred, custom, paid} {
 			for _, prepared := range item {
@@ -381,7 +386,11 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			}
 			addClass(optional, preparedURL{URL: normalized, Key: key, PublicSafe: safe})
 		}
-		ordered, err := prioritizeCandidates(mandatory, optional, maxCandidates)
+		rank := map[string]int{}
+		for endpoint, pubs := range byURL {
+			rank[endpoint] = len(pubs)
+		}
+		ordered, err := prioritizeCandidates(mandatory, optional, rank, maxCandidates)
 		if err != nil {
 			return PlanResponse{}, err
 		}
@@ -479,7 +488,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			}
 			input := ScoreInput{
 				Role: role, Weights: weights,
-				CohortCoverage: cohortCoverage, CohortKnown: cohort.Size > 0,
+				CohortCoverage: cohortCoverage, CohortKnown: knownWeight > 0,
 				MaxTrust: maxTrust, TrustWeighted: stat.Trust,
 				Users: stat.Users, MaxUsers: maxUsers,
 				Propagation: evidence.Propagation, Evidence: evidence,
@@ -521,6 +530,12 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			if _, banned := excluded[item.URL]; banned && isPinned {
 				out.ConstraintsSatisfied = false
 				out.Unsatisfied = append(out.Unsatisfied, Reason{Code: "pinned_excluded", Text: "A relay is both pinned and excluded. The pin was kept."})
+			}
+			if _, banned := excluded[item.URL]; banned && !isPinned {
+				relay.Eligible = false
+				if relay.IneligibleReason == "" {
+					relay.IneligibleReason = "excluded"
+				}
 			}
 			if relay.Score == nil {
 				thin++
@@ -589,20 +604,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		})
 	}
 
-	sourceIDs := make([]string, 0, 4)
-	if account.ModernEventID != "" {
-		sourceIDs = append(sourceIDs, account.ModernEventID)
-	}
-	for _, item := range builtRoles {
-		if item.source != "" {
-			sourceIDs = append(sourceIDs, item.source)
-		}
-	}
-	indexed, err := loadEventRaw(ctx, s.pool, sourceIDs)
-	if err != nil {
-		return PlanResponse{}, err
-	}
-	out.Proposal = buildProposal(account, builtRoles, indexed, sources, out.Proposal.Note)
+	out.Proposal = buildProposal(account, builtRoles, resolved, req.AllowCreate, sourceNotes, foldNotes, out.Proposal.Note)
 	if len(out.Fallbacks) == 0 && out.Cohort.Used == "personalized" {
 		out.Cohort.Used = "personalized"
 	}
@@ -622,8 +624,30 @@ type builtRole struct {
 	dTag         string
 }
 
-func buildProposal(account AccountConfig, roles []builtRole, indexed map[string]json.RawMessage, client map[string]SourceEvent, note string) Proposal {
+func buildProposal(account AccountConfig, roles []builtRole, resolved map[string]resolvedSource, allowCreate bool, notes []sourceNote, foldNotes []Reason, note string) Proposal {
 	proposal := Proposal{Note: note, Safe: true, SourceComplete: true}
+	keys := map[string]struct{}{}
+	for _, item := range roles {
+		if item.role == RolePublicInbox || item.role == RolePublicOutbox {
+			keys[sourceKey(KindPublicRelayList, "")] = struct{}{}
+		}
+		if item.kind != 0 {
+			keys[sourceKey(item.kind, item.dTag)] = struct{}{}
+		}
+	}
+	for _, item := range notes {
+		if _, ok := keys[sourceKey(item.kind, item.dTag)]; !ok {
+			continue
+		}
+		proposal.Blocking = append(proposal.Blocking, item.reason)
+		if item.reason.Code == "stale_source" {
+			proposal.RequiresReview = true
+		}
+	}
+	if len(foldNotes) > 0 {
+		proposal.RequiresReview = true
+		proposal.Blocking = append(proposal.Blocking, foldNotes...)
+	}
 	inboxOptimized, outboxOptimized := false, false
 	inbox := urlsOf(roleRelays(account, RolePublicInbox))
 	outbox := urlsOf(roleRelays(account, RolePublicOutbox))
@@ -647,13 +671,16 @@ func buildProposal(account AccountConfig, roles []builtRole, indexed map[string]
 		}
 	}
 	if inboxOptimized || outboxOptimized {
-		raw, origin, truncated := pickSource(indexed[account.ModernEventID], client[sourceKey(KindPublicRelayList, "")], publicTruncated || account.ModernPublic == AvailabilityMissing)
-		if account.ModernPublic == AvailabilityMissing && origin != "client" {
-			origin = "absent_from_index"
-			raw = nil
+		src := resolved[sourceKey(KindPublicRelayList, "")]
+		if src.Origin == "" {
+			src.Origin = "missing"
+		}
+		if publicTruncated {
+			src.Complete = false
 		}
 		result := Patch(PatchInput{
-			Source: raw, Origin: origin, Truncated: truncated, ExpectedPubkey: account.Pubkey,
+			Source: src.Raw, Origin: src.Origin, Truncated: !src.Complete && src.Origin != "missing" && src.Origin != "deleted",
+			AllowCreate: allowCreate && src.Origin == "missing", ExpectedPubkey: account.Pubkey,
 			ExpectedKind: KindPublicRelayList, InboxOptimized: inboxOptimized, OutboxOptimized: outboxOptimized,
 			Inbox: inbox, Outbox: outbox,
 		})
@@ -671,29 +698,16 @@ func buildProposal(account AccountConfig, roles []builtRole, indexed map[string]
 			proposal.Blocking = append(proposal.Blocking, Reason{Code: "keypackage_follows_outbox", Text: "KeyPackage discovery follows the public outbox. It was not written as a separate kind 10051 list."})
 			continue
 		}
-		if item.availability == AvailabilityMissing {
-			raw, origin, _ := pickSource(nil, client[sourceKey(item.kind, item.dTag)], true)
-			if origin != "client" {
-				proposal.Safe = false
-				proposal.SourceComplete = false
-				proposal.RequiresRefresh = true
-				proposal.SourceOrigin = "absent_from_index"
-				proposal.Blocking = append(proposal.Blocking, Reason{Code: "source_missing", Text: "This list is not in the local index. Supply the signed event before a replacement can be built."})
-				continue
-			}
-			result := Patch(PatchInput{
-				Source: raw, Origin: origin, ExpectedPubkey: account.Pubkey, ExpectedKind: item.kind,
-				ListOptimized: true, TagName: item.tag, Desired: item.urls,
-			})
-			applyPatch(&proposal, result)
-			if result.Event != nil {
-				proposal.Lists = append(proposal.Lists, *result.Event)
-			}
-			continue
+		src := resolved[sourceKey(item.kind, item.dTag)]
+		if src.Origin == "" {
+			src.Origin = "missing"
 		}
-		raw, origin, truncated := pickSource(indexed[item.source], client[sourceKey(item.kind, item.dTag)], item.truncated)
+		if item.truncated {
+			src.Complete = false
+		}
 		result := Patch(PatchInput{
-			Source: raw, Origin: origin, Truncated: truncated, ExpectedPubkey: account.Pubkey, ExpectedKind: item.kind,
+			Source: src.Raw, Origin: src.Origin, Truncated: !src.Complete && src.Origin != "missing" && src.Origin != "deleted",
+			AllowCreate: allowCreate && src.Origin == "missing", ExpectedPubkey: account.Pubkey, ExpectedKind: item.kind,
 			ListOptimized: true, TagName: item.tag, Desired: item.urls,
 		})
 		applyPatch(&proposal, result)
@@ -709,16 +723,6 @@ func buildProposal(account AccountConfig, roles []builtRole, indexed map[string]
 		proposal.Note = "No replacement event was generated. The proposed configuration matches the source, or no role produced a publishable change. " + note
 	}
 	return proposal
-}
-
-func pickSource(indexed json.RawMessage, client SourceEvent, truncated bool) (json.RawMessage, string, bool) {
-	if len(client.Raw) > 0 {
-		return client.Raw, "client", false
-	}
-	if len(indexed) > 0 {
-		return indexed, "indexed", truncated
-	}
-	return nil, "missing", truncated
 }
 
 func applyPatch(proposal *Proposal, result PatchResult) {
@@ -921,13 +925,18 @@ func (c Constraints) forRole(role string) Constraints {
 	return out
 }
 
-func prioritizeCandidates(mandatory, optional map[string]preparedURL, limit int) ([]preparedURL, error) {
+func prioritizeCandidates(mandatory, optional map[string]preparedURL, rank map[string]int, limit int) ([]preparedURL, error) {
 	required := mapValues(mandatory)
 	if len(required) > limit {
 		return nil, invalidf("pinned, current, and supplied relays exceed the candidate limit of %d", limit)
 	}
 	extra := mapValues(optional)
-	sort.Slice(extra, func(i, j int) bool { return extra[i].URL < extra[j].URL })
+	sort.Slice(extra, func(i, j int) bool {
+		if rank[extra[i].URL] != rank[extra[j].URL] {
+			return rank[extra[i].URL] > rank[extra[j].URL]
+		}
+		return extra[i].URL < extra[j].URL
+	})
 	out := make([]preparedURL, 0, limit)
 	seen := map[string]struct{}{}
 	for _, item := range required {
@@ -978,6 +987,8 @@ func reconcileSelection(selection SelectResult, scored map[string]ScoredRelay, m
 	selection.DistinctEndpoints = len(selection.Selected)
 	selection.ProposedCoverage = round3(coverageOf(relays, known, knownWeight))
 	selection.Improvement = round3(selection.ProposedCoverage - selection.CurrentCoverage)
+	selection.Redundancy = redundancy(relays, known, knownWeight)
+	finishDiversity(&selection, relays)
 	if maxCount > 0 && len(selection.Selected) > maxCount {
 		selection.ConstraintsSatisfied = false
 		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "retained_over_max", Text: "Keeping an investigated relay made the list longer than the maximum."})

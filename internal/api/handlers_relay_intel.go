@@ -106,6 +106,7 @@ func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
 			Roles:        body.Roles,
 			Supplied:     make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
 			SourceEvents: body.SourceEvents,
+			AllowCreate:  body.AllowCreate,
 		}
 		if body.Constraints != nil {
 			req.Constraints = constraintFromRequest(*body.Constraints)
@@ -140,6 +141,7 @@ type relayOptimizeRequest struct {
 	Constraints  *relayConstraintRequest `json:"constraints"`
 	Supplied     []relaySuppliedRequest  `json:"supplied_relays"`
 	SourceEvents []json.RawMessage       `json:"source_events"`
+	AllowCreate  bool                    `json:"allow_create"`
 }
 
 type relayConstraintRequest struct {
@@ -257,6 +259,10 @@ type relaySuppliedRequest struct {
 }
 
 func (h Handlers) serveRelayIntel(w http.ResponseWriter, r *http.Request, endpoint string, fn func(*relayintel.Service) (any, error)) {
+	if endpoint == "optimize" || endpoint == "verify" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("CDN-Cache-Control", "no-store")
+	}
 	started := time.Now()
 	svc, ok := h.relayIntelService(w, r)
 	if !ok {

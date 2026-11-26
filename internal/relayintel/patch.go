@@ -20,6 +20,7 @@ type PatchInput struct {
 	ListOptimized   bool
 	TagName         string
 	Desired         []string
+	AllowCreate     bool
 }
 
 // PatchResult is safe to hand to a client only when Safe is true and Event is set.
@@ -45,8 +46,16 @@ func Patch(in PatchInput) PatchResult {
 	if in.Origin == "" {
 		out.Origin = "missing"
 	}
+	if in.Origin == "deleted" {
+		out.Blocking = []Reason{{Code: "source_deleted", Text: "A deletion covers this list. A replacement was not generated from the deleted event."}}
+		out.RequiresRefresh = true
+		return out
+	}
 	if len(in.Source) == 0 {
-		out.Blocking = []Reason{{Code: "source_missing", Text: "No complete source event is available. Local absence is not a confirmed empty list."}}
+		if in.AllowCreate && in.ExpectedKind != 0 && in.ExpectedKind != 3 && in.ExpectedPubkey != "" {
+			return createReplacement(in)
+		}
+		out.Blocking = []Reason{{Code: "source_missing", Text: "No complete source event is available. Local absence is not a confirmed empty list. Creating a list requires allow_create."}}
 		out.RequiresRefresh = true
 		return out
 	}
@@ -108,10 +117,37 @@ func Patch(in PatchInput) PatchResult {
 	out.Event = &UnsignedEvent{
 		Kind: ev.Kind, Pubkey: strings.ToLower(ev.Pubkey), Content: ev.Content, Tags: tags,
 		BasedOnEventID: ev.ID, BasedOnCreatedAt: ev.CreatedAt, Note: note,
+		ProposalSafe: true, SourceOrigin: out.Origin, Change: "replacement",
 	}
 	out.Complete = true
 	out.Safe = true
 	return out
+}
+
+func createReplacement(in PatchInput) PatchResult {
+	var tags [][]string
+	switch {
+	case in.InboxOptimized || in.OutboxOptimized:
+		tags, _ = patchNIP65(nil, in)
+	case in.ListOptimized:
+		tags, _ = patchList(nil, in.TagName, in.Desired)
+	default:
+		return PatchResult{
+			Origin: "missing", RequiresRefresh: true,
+			Blocking: []Reason{{Code: "source_missing", Text: "No complete source event is available. Local absence is not a confirmed empty list."}},
+		}
+	}
+	if tags == nil {
+		tags = [][]string{}
+	}
+	note := "Unsigned new list. allow_create was set. Absence from this index is not proof the list is absent from the network. The client must check for an existing event before signing. This server does not sign or publish."
+	return PatchResult{
+		Safe: true, Complete: true, Origin: "create", RequiresReview: true,
+		Event: &UnsignedEvent{
+			Kind: in.ExpectedKind, Pubkey: strings.ToLower(in.ExpectedPubkey), Content: "", Tags: tags,
+			ProposalSafe: true, SourceOrigin: "create", Change: "creation", Note: note,
+		},
+	}
 }
 
 type relayMark struct {
@@ -182,7 +218,7 @@ func patchNIP65(source [][]string, in PatchInput) ([][]string, bool) {
 			tags = append(tags, append([]string(nil), tag...))
 			continue
 		}
-		if _, done := emitted[norm]; done {
+		if _, done := emitted[norm]; done && len(tag) <= 3 {
 			continue
 		}
 		read, write := finalRead[norm] != "", finalWrite[norm] != ""
@@ -320,17 +356,21 @@ func markerFor(read, write bool) string {
 }
 
 func setMarker(tag []string, marker string) []string {
+	next := append([]string(nil), tag...)
 	if marker == "" {
-		if len(tag) >= 3 && (tag[2] == "read" || tag[2] == "write") {
-			return append(append([]string{}, tag[:2]...), tag[3:]...)
+		if len(next) >= 3 && (next[2] == "read" || next[2] == "write") {
+			next[2] = ""
 		}
-		return tag
+		return next
 	}
-	if len(tag) < 3 {
-		return append(tag, marker)
+	if len(next) < 3 {
+		return append(next, marker)
 	}
-	tag[2] = marker
-	return tag
+	if next[2] == "read" || next[2] == "write" || strings.TrimSpace(next[2]) == "" {
+		next[2] = marker
+		return next
+	}
+	return append([]string{next[0], next[1], marker}, next[2:]...)
 }
 
 func markerTag(url, marker string) []string {
@@ -341,7 +381,7 @@ func markerTag(url, marker string) []string {
 }
 
 func managedTag(name, tagName string) bool {
-	return name == tagName || name == "r" || name == "server" || name == "relay"
+	return name == tagName
 }
 
 func canonicalRelay(raw string) (string, bool) {

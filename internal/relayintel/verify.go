@@ -133,7 +133,11 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 	for _, item := range result.Relays {
 		switch item.Outcome {
 		case "retrieved":
-			result.RetrievedCount++
+			if item.LatestVerified && item.LatestAgrees {
+				result.RetrievedCount++
+			} else {
+				unavailable++
+			}
 		case "timeout":
 			timeouts++
 		case "conflict":
@@ -144,7 +148,7 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 			unavailable++
 		}
 	}
-	result.Agreement = conflicts == 0 && result.RetrievedCount > 0
+	result.Agreement = conflicts == 0 && result.RetrievedCount > 0 && unavailable == 0 && missing == 0 && timeouts == 0
 	result.Partial = result.RetrievedCount > 0 && (missing > 0 || timeouts > 0 || unavailable > 0 || conflicts > 0)
 	switch {
 	case conflicts > 0:
@@ -166,9 +170,10 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 }
 
 var (
-	verifyGlobal = make(chan struct{}, 16)
-	verifyHostMu sync.Mutex
-	verifyHosts  = map[string]chan struct{}{}
+	verifyGlobal       = make(chan struct{}, 16)
+	verifyHostMu       sync.Mutex
+	verifyHosts        = map[string]chan struct{}{}
+	verifyHostOverflow = make(chan struct{}, 2)
 )
 
 func checkRelay(ctx context.Context, relayURL string, event *nostr.Event, allowPrivate bool) RelayCheck {
@@ -215,10 +220,15 @@ func checkRelay(ctx context.Context, relayURL string, event *nostr.Event, allowP
 		out.Outcome = "retrieved"
 		out.Retrieved = true
 		out.RetrievedID = event.ID
+		out.LatestVerified = true
+		out.LatestAgrees = true
 		out.Error = ""
 		return out
 	}
 	filter := map[string]any{"authors": []string{event.Pubkey}, "kinds": []int{event.Kind}, "limit": 8}
+	if event.Kind >= 30000 && event.Kind < 40000 {
+		filter["#d"] = []string{firstD(event.Tags)}
+	}
 	latest, latestErr := fetchEvents(queryCtx, relayURL, allowPrivate, filter)
 	winner := newestValid(latest, event.Pubkey, event.Kind, firstD(event.Tags), event.Kind >= 30000 && event.Kind < 40000)
 	if latestErr != nil || winner == nil {
@@ -246,10 +256,14 @@ func checkRelay(ctx context.Context, relayURL string, event *nostr.Event, allowP
 	out.LatestID = winner.ID
 	out.LatestCreatedAt = winner.CreatedAt
 	out.LatestVerified = true
-	if winner.ID != event.ID && nostr.Supersedes(winner.CreatedAt, winner.ID, event.CreatedAt, event.ID) {
+	if winner.ID != event.ID {
 		out.Outcome = "conflict"
-		out.Error = "newer_event"
 		out.LatestAgrees = false
+		if nostr.Supersedes(winner.CreatedAt, winner.ID, event.CreatedAt, event.ID) {
+			out.Error = "newer_event"
+		} else {
+			out.Error = "latest_disagreement"
+		}
 		if exact != nil {
 			out.Retrieved = true
 			out.RetrievedID = event.ID
@@ -291,8 +305,8 @@ func verifyHostSlot(host string) chan struct{} {
 	if slot, ok := verifyHosts[host]; ok {
 		return slot
 	}
-	if len(verifyHosts) > 1024 {
-		verifyHosts = map[string]chan struct{}{}
+	if len(verifyHosts) >= 1024 {
+		return verifyHostOverflow
 	}
 	slot := make(chan struct{}, 2)
 	verifyHosts[host] = slot
@@ -362,8 +376,11 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 			}
 			events = append(events, parsed.Event)
 		case "EOSE":
+			if len(frame) < 2 {
+				continue
+			}
 			var subID string
-			if len(frame) > 1 && json.Unmarshal(frame[1], &subID) == nil && subID != sub {
+			if json.Unmarshal(frame[1], &subID) != nil || subID != sub {
 				continue
 			}
 			return events, nil
@@ -375,7 +392,7 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 			continue
 		}
 	}
-	return events, nil
+	return events, errString("incomplete")
 }
 
 func dialRelay(ctx context.Context, relayURL string, allowPrivate bool, timeout time.Duration) (*websocket.Conn, error) {
@@ -414,6 +431,8 @@ func classifyDial(err error) string {
 		return "closed"
 	case strings.Contains(text, "metadata") || strings.Contains(text, "private") || strings.Contains(text, "link-local") || strings.Contains(text, "localhost"):
 		return "rejected"
+	case strings.Contains(text, "incomplete"):
+		return "incomplete"
 	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline") || strings.Contains(text, "context"):
 		return "timeout"
 	default:
