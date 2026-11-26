@@ -413,59 +413,179 @@ func privacyAssessment(caps map[string]Capability) string {
 func privacyReport(caps map[string]Capability, now time.Time) PrivacyReport {
 	assessment := privacyAssessmentAt(caps, now)
 	public := caps[CapGiftWrapPublic]
-	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
-	publicSeen := public.Status == StatusVerified || public.Status == StatusStale || public.Status == StatusObserved
-	return PrivacyReport{
-		Assessment:                 assessment,
-		RecipientRetrievalVerified: assessment == "recipient_only_verified",
-		GiftWrapAccepted:           caps[CapGiftWrapAccept].Status == StatusVerified,
-		ExposureConfirmed:          publicSeen,
-		ExposureUnresolved:         assessment == "previous_exposure_unresolved",
-		PrivateObservedAt:          private.ObservedAt,
-		ExposureObservedAt:         public.ObservedAt,
-		RecipientAuthVerified:      caps[CapAuthGiftWrap].Status == StatusVerified,
-		PublicationAuthVerified:    caps[CapAuthWrite].Status == StatusVerified,
-		Stale:                      assessment == "stale",
+	private := caps[CapGiftWrapPrivate]
+	publicSeen := exposureSeen(public) || exposureSeen(caps[CapGiftWrapUnauthExposure]) || exposureSeen(caps[CapGiftWrapAuthExposure])
+	unresolved := assessment == "publicly_accessible" || assessment == "previous_exposure_unresolved" || assessment == "conflicting_evidence"
+	report := PrivacyReport{
+		Assessment:                    assessment,
+		RecipientRetrievalVerified:    retrievalTri(caps[CapGiftWrapRecipient]),
+		GiftWrapAccepted:              claimTri(caps[CapGiftWrapAccept]),
+		ExposureConfirmed:             publicSeen,
+		ExposureUnresolved:            unresolved,
+		PrivateObservedAt:             private.ObservedAt,
+		ExposureObservedAt:            public.ObservedAt,
+		RecipientAuthVerified:         claimTri(caps[CapAuthRecipient]),
+		PublicationAuthVerified:       claimTri(caps[CapAuthGiftWrap]),
+		Stale:                         assessment == "stale",
+		Confidence:                    private.Confidence,
+		Freshness:                     private.Freshness,
+		EvidenceVersion:               private.EvidenceVersion,
+		RecipientExactVerified:        retrievalTri(caps[CapGiftWrapRecipientExact]),
+		RecipientTagVerified:          retrievalTri(caps[CapGiftWrapRecipientTag]),
+		UnauthenticatedExposure:       exposureTri(caps[CapGiftWrapUnauthExposure]),
+		AuthenticatedObserverExposure: exposureTri(caps[CapGiftWrapAuthExposure]),
+		Comprehensive:                 comprehensivePrivate(private, now) && assessment == "recipient_only_verified",
+		AccessPaths:                   accessPaths(caps),
 	}
+	if report.ExposureObservedAt == nil {
+		report.ExposureObservedAt = latestTime(caps[CapGiftWrapUnauthExposure].ObservedAt, caps[CapGiftWrapAuthExposure].ObservedAt)
+	}
+	if publicSeen && report.Confidence == 0 {
+		report.Confidence = public.Confidence
+		report.Freshness = public.Freshness
+	}
+	return report
 }
 
 func privacyAssessmentAt(caps map[string]Capability, now time.Time) string {
-	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
-	public := caps[CapGiftWrapPublic]
+	private := caps[CapGiftWrapPrivate]
 	privateAt := observedAt(private)
-	publicAt := observedAt(public)
-	publicSeen := public.Status == StatusVerified || public.Status == StatusStale || public.Status == StatusObserved
-	privateVerified := private.Status == StatusVerified
-	privateFresh := privateVerified && !staleAt(privateAt, now)
+	publicAt, publicFresh := newestExposure(caps, now)
+	publicSeen := !publicAt.IsZero()
+	comprehensive := private.EvidenceVersion >= ComprehensivePrivacyVersion
+	privateFresh := private.Status == StatusVerified && comprehensive && !staleAt(privateAt, now)
+	privateStale := comprehensive && (private.Status == StatusStale || (private.Status == StatusVerified && staleAt(privateAt, now)))
 	switch {
 	case publicSeen && privateFresh && privateAt.After(publicAt):
 		return "recipient_only_verified"
-	case publicSeen && privateVerified && privateAt.Equal(publicAt):
+	case publicSeen && privateFresh && privateAt.Equal(publicAt):
 		return "conflicting_evidence"
-	case publicSeen && (public.Status != StatusVerified || staleAt(publicAt, now)):
-		return "previous_exposure_unresolved"
-	case publicSeen:
+	case publicSeen && publicFresh:
 		return "publicly_accessible"
-	case privateVerified && staleAt(privateAt, now):
+	case publicSeen:
+		return "previous_exposure_unresolved"
+	case privateStale:
 		return "stale"
-	case privateVerified:
+	case privateFresh:
 		return "recipient_only_verified"
 	default:
 		return "privacy_unknown"
 	}
 }
 
-func newerCapability(left, right Capability) Capability {
-	if right.Status != StatusVerified && right.Status != StatusStale {
-		return left
+func newestExposure(caps map[string]Capability, now time.Time) (time.Time, bool) {
+	var at time.Time
+	fresh := false
+	for _, capability := range []string{CapGiftWrapPublic, CapGiftWrapUnauthExposure, CapGiftWrapAuthExposure} {
+		cap := caps[capability]
+		if !exposureSeen(cap) {
+			continue
+		}
+		seen := observedAt(cap)
+		if seen.IsZero() {
+			seen = now
+		}
+		if at.IsZero() || seen.After(at) {
+			at = seen
+			fresh = cap.Status == StatusVerified && !staleAt(seen, now)
+		}
 	}
-	if left.Status != StatusVerified && left.Status != StatusStale {
-		return right
+	return at, fresh
+}
+
+func comprehensivePrivate(cap Capability, now time.Time) bool {
+	return cap.EvidenceVersion >= ComprehensivePrivacyVersion && cap.Status == StatusVerified && !staleAt(observedAt(cap), now)
+}
+
+func exposureSeen(cap Capability) bool {
+	if cap.Source == "none" {
+		return false
 	}
-	if observedAt(right).After(observedAt(left)) {
-		return right
+	if cap.Status != StatusVerified && cap.Status != StatusStale && cap.Status != StatusObserved {
+		return false
 	}
-	return left
+	if cap.Retrieved != nil {
+		return *cap.Retrieved
+	}
+	return true
+}
+
+func claimTri(cap Capability) *bool {
+	switch cap.Status {
+	case StatusVerified:
+		return boolPtr(true)
+	case StatusUnsupported, StatusRestricted:
+		return boolPtr(false)
+	default:
+		return nil
+	}
+}
+
+func retrievalTri(cap Capability) *bool {
+	if cap.Status != StatusVerified {
+		if cap.Status == StatusUnsupported || cap.Status == StatusRestricted {
+			return boolPtr(false)
+		}
+		return nil
+	}
+	if cap.Retrieved != nil {
+		return cap.Retrieved
+	}
+	return boolPtr(true)
+}
+
+func exposureTri(cap Capability) *bool {
+	if cap.Retrieved != nil && (cap.Status == StatusVerified || cap.Status == StatusStale || cap.Status == StatusObserved) {
+		return cap.Retrieved
+	}
+	if exposureSeen(cap) {
+		return boolPtr(true)
+	}
+	if cap.Status == StatusUnsupported || cap.Status == StatusRestricted {
+		return boolPtr(false)
+	}
+	return nil
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func accessPaths(caps map[string]Capability) []AccessPath {
+	names := []struct{ name, capability string }{
+		{"recipient_exact", CapGiftWrapRecipientExact},
+		{"recipient_tag", CapGiftWrapRecipientTag},
+		{"observer_exact", CapGiftWrapObserverExact},
+		{"observer_tag", CapGiftWrapObserverTag},
+		{"anonymous_exact", CapGiftWrapAnonExact},
+		{"anonymous_tag", CapGiftWrapAnonTag},
+	}
+	var paths []AccessPath
+	for _, item := range names {
+		cap := caps[item.capability]
+		if cap.Status == "" || cap.Status == StatusUnknown || cap.Source == "none" || cap.Source == "" {
+			continue
+		}
+		paths = append(paths, AccessPath{
+			Name: item.name, Status: cap.Status, Retrieved: cap.Retrieved,
+			Unauthenticated: cap.Unauthenticated, Authenticated: cap.Authenticated,
+			ObservedAt: cap.ObservedAt, Confidence: cap.Confidence, Freshness: cap.Freshness,
+		})
+	}
+	return paths
+}
+
+func latestTime(values ...*time.Time) *time.Time {
+	var best *time.Time
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		if best == nil || value.After(*best) {
+			best = value
+		}
+	}
+	return best
 }
 
 func observedAt(cap Capability) time.Time {

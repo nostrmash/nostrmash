@@ -228,7 +228,14 @@ func loadObservations(ctx context.Context, pool *pgxpool.Pool, keys []string) (m
 		SELECT url_key, capability, status, confidence, source,
 		       COALESCE(detail->>'text', ''), sample_count,
 		       COALESCE((detail->>'recent_failures')::int, 0),
-		       COALESCE((detail->>'recent_window')::int, 0), observed_at
+		       COALESCE((detail->>'recent_successes')::int, 0),
+		       COALESCE((detail->>'recent_inconclusive')::int, 0),
+		       COALESCE((detail->>'recent_window')::int, 0),
+		       COALESCE((detail->>'evidence_version')::int, 0),
+		       CASE WHEN detail ? 'retrieved' THEN (detail->>'retrieved')::boolean ELSE NULL END,
+		       CASE WHEN detail ? 'unauthenticated' THEN (detail->>'unauthenticated')::boolean ELSE NULL END,
+		       CASE WHEN detail ? 'authenticated' THEN (detail->>'authenticated')::boolean ELSE NULL END,
+		       observed_at
 		FROM relay_capability_observations
 		WHERE url_key = ANY($1::text[])
 	`, keys)
@@ -240,7 +247,8 @@ func loadObservations(ctx context.Context, pool *pgxpool.Pool, keys []string) (m
 		var item Observation
 		if err := rows.Scan(
 			&item.URLKey, &item.Capability, &item.Status, &item.Confidence, &item.Source,
-			&item.Detail, &item.SampleCount, &item.RecentFailures, &item.RecentWindow, &item.ObservedAt,
+			&item.Detail, &item.SampleCount, &item.RecentFailures, &item.RecentSuccesses, &item.RecentInconclusive, &item.RecentWindow,
+			&item.EvidenceVersion, &item.Retrieved, &item.Unauthenticated, &item.Authenticated, &item.ObservedAt,
 		); err != nil {
 			return nil, err
 		}

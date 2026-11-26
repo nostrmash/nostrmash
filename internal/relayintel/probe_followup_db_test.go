@@ -224,9 +224,27 @@ func TestSyntheticAuthorIsVisibleFromTheDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	syntheticPubkeys.Delete(absent)
-	syntheticMisses.Store(absent, time.Now().Add(-time.Second))
+	syntheticMisses.Store(absent, syntheticMiss{Expires: time.Now().Add(-time.Second), Epoch: 1})
 	if !SyntheticAuthor(ctx, pool, absent) {
 		t.Fatal("an expired negative cache hid a newly registered identity")
+	}
+	fresh := strings.Repeat("78", 32)
+	if SyntheticAuthor(ctx, pool, fresh) {
+		t.Fatal("an unknown author was cached as synthetic before registration")
+	}
+	var cachedEpoch int64
+	if miss, ok := freshMiss(fresh); !ok {
+		t.Fatal("a confirmed absence was not negatively cached")
+	} else {
+		cachedEpoch = miss.Epoch
+	}
+	if err := registerSyntheticIdentity(ctx, pool, fresh); err != nil {
+		t.Fatal(err)
+	}
+	syntheticPubkeys.Delete(fresh)
+	syntheticMisses.Store(fresh, syntheticMiss{Expires: time.Now().Add(15 * time.Second), Epoch: cachedEpoch})
+	if !SyntheticAuthor(ctx, pool, fresh) {
+		t.Fatal("a fresh negative cache hid an identity registered by another worker")
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
@@ -288,7 +306,10 @@ func TestFollowupOwnershipAndRetryBounds(t *testing.T) {
 	`, strings.Repeat("33", 32)).Scan(&followupID); err != nil {
 		t.Fatal(err)
 	}
-	err := commitProbeResult(ctx, pool, "wss://owned.example", "lease-a", "completed", followupID, "completed", "wrong owner", 10, nil)
+	err := commitProbeResult(ctx, pool, "wss://owned.example", "lease-a", probeCompletion{
+		AttemptStatus: "completed", FollowupID: followupID, FollowStatus: "completed", FollowResult: "wrong owner",
+		Elapsed: 10, Endpoint: "wss://owned.example", FollowCapability: CapRetention,
+	})
 	if err == nil {
 		t.Fatal("a foreign lease completed the follow-up")
 	}
