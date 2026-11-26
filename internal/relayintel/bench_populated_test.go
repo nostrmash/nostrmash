@@ -29,7 +29,9 @@ func TestPopulatedRelayIntelCost(t *testing.T) {
 	}
 	accounts := 10000
 	if raw := os.Getenv("RELAY_INTEL_POPULATED_ACCOUNTS"); raw != "" {
-		fmt.Sscan(raw, &accounts)
+		if _, err := fmt.Sscan(raw, &accounts); err != nil {
+			accounts = 10000
+		}
 	}
 	if accounts < 100 {
 		accounts = 100
