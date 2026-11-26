@@ -44,12 +44,14 @@ type UnsignedEvent struct {
 
 // RolePlan is the optimizer output for one role.
 type RolePlan struct {
-	Role            string           `json:"role"`
-	Availability    string           `json:"availability"`
-	Fallback        string           `json:"fallback,omitempty"`
-	Selection       SelectResult     `json:"selection"`
-	Recommendations []Recommendation `json:"recommendations"`
-	Ranking         []ScoredRelay    `json:"ranking,omitempty"`
+	Role                string           `json:"role"`
+	Availability        string           `json:"availability"`
+	Fallback            string           `json:"fallback,omitempty"`
+	Selection           SelectResult     `json:"selection"`
+	Recommendations     []Recommendation `json:"recommendations"`
+	Ranking             []ScoredRelay    `json:"ranking,omitempty"`
+	CandidateLimit      int              `json:"candidate_limit,omitempty"`
+	CandidatesTruncated bool             `json:"candidates_truncated,omitempty"`
 }
 
 // BuildRecommendations turns a current list and a selected set into actions.
@@ -83,17 +85,41 @@ func BuildRecommendations(role string, current []DeclaredRelay, selected []Selec
 	}
 	usedAdd := map[string]struct{}{}
 	var out []Recommendation
+	var pendingRemove []string
 	for _, url := range removed {
 		if sustainedDown[url] {
 			if partner := bestPartner(url, added, usedAdd, scored); partner != "" {
 				usedAdd[partner] = struct{}{}
-				out = append(out, action(ActionReplace, role, url, partner, scored, "Sustained read failures plus overlapping coverage support a replacement.", marginal[partner]))
+				out = append(out, action(ActionReplace, role, url, partner, scored, "Sustained read failures plus overlapping coverage support a replacement.", scoreDelta(scored, url, partner)))
 				continue
 			}
 		}
 		if !sustainedDown[url] && needsLook(scored[url]) {
 			item := action(ActionInvestigate, role, url, "", scored, "Health looks uncertain. The relay stays until the failure is sustained.", 0)
 			out = append(out, item)
+			continue
+		}
+		pendingRemove = append(pendingRemove, url)
+	}
+	sort.Slice(pendingRemove, func(i, j int) bool {
+		return scoreOf(scored[pendingRemove[i]]) < scoreOf(scored[pendingRemove[j]])
+	})
+	addedByScore := append([]string{}, added...)
+	sort.Slice(addedByScore, func(i, j int) bool {
+		return scoreOf(scored[addedByScore[i]]) > scoreOf(scored[addedByScore[j]])
+	})
+	for _, url := range pendingRemove {
+		partner := ""
+		for _, candidate := range addedByScore {
+			if _, ok := usedAdd[candidate]; ok {
+				continue
+			}
+			partner = candidate
+			break
+		}
+		if partner != "" {
+			usedAdd[partner] = struct{}{}
+			out = append(out, action(ActionReplace, role, url, partner, scored, "Replacing this relay improves the selected set.", scoreDelta(scored, url, partner)))
 			continue
 		}
 		item := action(ActionRemove, role, url, "", scored, "The proposed set no longer needs this relay.", 0)
@@ -140,6 +166,17 @@ func BuildRecommendations(role string, current []DeclaredRelay, selected []Selec
 		return out[i].Suggested < out[j].Suggested
 	})
 	return out
+}
+
+func scoreOf(relay ScoredRelay) float64 {
+	if relay.Score == nil {
+		return 0
+	}
+	return *relay.Score
+}
+
+func scoreDelta(scored map[string]ScoredRelay, current, suggested string) float64 {
+	return scoreOf(scored[suggested]) - scoreOf(scored[current])
 }
 
 func needsLook(relay ScoredRelay) bool {

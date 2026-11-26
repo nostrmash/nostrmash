@@ -15,7 +15,7 @@ const (
 	// ScoreVersion is the weighted scoring model.
 	ScoreVersion = "relay-score-v1"
 	// OptimizerVersion is the complementary-set selector.
-	OptimizerVersion = "relay-opt-v2"
+	OptimizerVersion = "relay-opt-v3"
 	// TieBreak is the NIP-01 replaceable-event rule.
 	// A newer created_at wins. The same created_at keeps the lower event id.
 	TieBreak     = "lower_event_id"

@@ -46,8 +46,8 @@ func Patch(in PatchInput) PatchResult {
 	if in.Origin == "" {
 		out.Origin = "missing"
 	}
-	if in.Origin == "deleted" {
-		out.Blocking = []Reason{{Code: "source_deleted", Text: "A deletion covers this list. A replacement was not generated from the deleted event."}}
+	if in.Origin == "deleted" && !in.AllowCreate {
+		out.Blocking = []Reason{{Code: "source_deleted", Text: "A deletion covers this list. A replacement was not generated from the deleted event. Recreating it requires allow_recreate."}}
 		out.RequiresRefresh = true
 		return out
 	}
@@ -140,14 +140,96 @@ func createReplacement(in PatchInput) PatchResult {
 	if tags == nil {
 		tags = [][]string{}
 	}
+	origin, change := "create", "creation"
 	note := "Unsigned new list. allow_create was set. Absence from this index is not proof the list is absent from the network. The client must check for an existing event before signing. This server does not sign or publish."
+	if in.Origin == "deleted" {
+		origin, change = "recreate", "recreation"
+		note = "Unsigned recreation of a deleted list. allow_recreate was set. This server does not sign or publish."
+	}
 	return PatchResult{
-		Safe: true, Complete: true, Origin: "create", RequiresReview: true,
+		Safe: true, Complete: true, Origin: origin, RequiresReview: true,
 		Event: &UnsignedEvent{
 			Kind: in.ExpectedKind, Pubkey: strings.ToLower(in.ExpectedPubkey), Content: "", Tags: tags,
-			ProposalSafe: true, SourceOrigin: "create", Change: "creation", Note: note,
+			ProposalSafe: true, SourceOrigin: origin, Change: change, Note: note,
 		},
 	}
+}
+
+// confirmProposal parses the replacement with the same model used for the
+// current configuration. A patch that does not produce the selected relays
+// is not returned for signing.
+func confirmProposal(result PatchResult, in PatchInput) PatchResult {
+	if !result.Safe || result.Event == nil {
+		return result
+	}
+	eventID := result.EventID
+	if eventID == "" {
+		eventID = "proposal"
+	}
+	parsed, err := Parse(EventInput{
+		Pubkey: result.Event.Pubkey, EventID: eventID, Kind: result.Event.Kind, Content: result.Event.Content,
+		Tags: result.Event.Tags, EndpointLimit: maxAuthoritativeEndpoints,
+	})
+	if err != nil || parsed.Head.Truncated {
+		return rejectProposal(result)
+	}
+	switch {
+	case in.InboxOptimized || in.OutboxOptimized:
+		if in.InboxOptimized && !sameRelaySet(urlsForRole(parsed, RolePublicInbox), in.Inbox) {
+			return rejectProposal(result)
+		}
+		if in.OutboxOptimized && !sameRelaySet(urlsForRole(parsed, RolePublicOutbox), in.Outbox) {
+			return rejectProposal(result)
+		}
+	case in.ListOptimized:
+		if !sameRelaySet(urlsForRole(parsed, ""), in.Desired) {
+			return rejectProposal(result)
+		}
+	}
+	return result
+}
+
+func rejectProposal(result PatchResult) PatchResult {
+	result.Safe = false
+	result.Complete = false
+	result.RequiresReview = true
+	result.Event = nil
+	result.Blocking = append(result.Blocking, Reason{Code: "proposal_mismatch", Text: "The replacement event does not contain the selected relays. It was not returned for signing."})
+	return result
+}
+
+func urlsForRole(parsed Parsed, role string) []string {
+	out := make([]string, 0, len(parsed.Members))
+	for _, member := range parsed.Members {
+		if role != "" && member.Role != role {
+			continue
+		}
+		out = append(out, member.EndpointURL)
+	}
+	return out
+}
+
+func sameRelaySet(got, want []string) bool {
+	left, right := map[string]struct{}{}, map[string]struct{}{}
+	for _, raw := range got {
+		if norm, ok := canonicalRelay(raw); ok {
+			left[norm] = struct{}{}
+		}
+	}
+	for _, raw := range want {
+		if norm, ok := canonicalRelay(raw); ok {
+			right[norm] = struct{}{}
+		}
+	}
+	if len(left) != len(right) {
+		return false
+	}
+	for item := range left {
+		if _, ok := right[item]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type relayMark struct {
@@ -381,7 +463,12 @@ func markerTag(url, marker string) []string {
 }
 
 func managedTag(name, tagName string) bool {
-	return name == tagName
+	if name == tagName {
+		return true
+	}
+	// Relay-list kinds accept a historical r tag as well as relay.
+	// Blossom stays on server, so an r tag there is left untouched.
+	return tagName == "relay" && name == "r"
 }
 
 func canonicalRelay(raw string) (string, bool) {

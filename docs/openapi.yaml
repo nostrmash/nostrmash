@@ -747,7 +747,7 @@ paths:
               example:
                 algorithm: relay-intel-v1
                 score_version: relay-score-v1
-                optimizer_version: relay-opt-v2
+                optimizer_version: relay-opt-v3
                 tie_break: lower_event_id
                 role: public_outbox
                 positive_adoption: true
@@ -872,7 +872,7 @@ paths:
               example:
                 algorithm: relay-intel-v1
                 score_version: relay-score-v1
-                optimizer_version: relay-opt-v2
+                optimizer_version: relay-opt-v3
                 tie_break: lower_event_id
                 preset: balanced
                 constraints_satisfied: true

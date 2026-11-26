@@ -385,6 +385,13 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 			}
 			return events, nil
 		case "CLOSED":
+			if len(frame) < 2 {
+				continue
+			}
+			var subID string
+			if json.Unmarshal(frame[1], &subID) != nil || subID != sub {
+				continue
+			}
 			return events, errClosed
 		case "AUTH":
 			return events, errAuth
@@ -444,6 +451,8 @@ func outcomeFor(code string) string {
 	switch code {
 	case "timeout":
 		return "timeout"
+	case "closed":
+		return "closed"
 	case "rejected", "auth_required":
 		return "rejected"
 	default:
@@ -457,9 +466,13 @@ func replaceableKind(kind int) bool {
 
 func firstD(tags [][]string) string {
 	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == "d" {
-			return tag[1]
+		if len(tag) == 0 || tag[0] != "d" {
+			continue
 		}
+		if len(tag) < 2 {
+			return ""
+		}
+		return tag[1]
 	}
 	return ""
 }

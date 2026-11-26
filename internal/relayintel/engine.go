@@ -73,6 +73,7 @@ type PlanRequest struct {
 	IncludeRanking bool
 	SourceEvents   []json.RawMessage
 	AllowCreate    bool
+	AllowRecreate  bool
 }
 
 // Meta is the version and freshness block on every response.
@@ -109,6 +110,8 @@ type Proposal struct {
 	SourceCreatedAt int64           `json:"source_created_at,omitempty"`
 	RequiresRefresh bool            `json:"requires_refresh"`
 	RequiresReview  bool            `json:"requires_review"`
+	ReadyToSign     bool            `json:"ready_to_sign"`
+	Warnings        []Reason        `json:"warnings,omitempty"`
 	Blocking        []Reason        `json:"blocking_reasons,omitempty"`
 }
 
@@ -123,12 +126,21 @@ type PlanResponse struct {
 	Proposal             Proposal     `json:"proposal"`
 	ConstraintsSatisfied bool         `json:"constraints_satisfied"`
 	Unsatisfied          []Reason     `json:"unsatisfied_constraints,omitempty"`
+	Shared               []SharedRole `json:"shared_configuration,omitempty"`
+}
+
+// SharedRole says two roles are one underlying list.
+type SharedRole struct {
+	Roles []string `json:"roles"`
+	Kind  int      `json:"kind"`
+	Note  string   `json:"note"`
 }
 
 type preparedURL struct {
 	URL        string
 	Key        string
 	PublicSafe bool
+	Global     bool
 }
 
 func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, error) {
@@ -157,15 +169,11 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		}
 	}
 
-	heads, members, err := loadAccount(ctx, s.pool, req.Pubkey)
+	account, resolved, sourceNotes, err := s.resolveAccount(ctx, req.Pubkey, sources)
 	if err != nil {
 		return PlanResponse{}, err
 	}
-	account, resolved, sourceNotes, err := s.resolveAccount(ctx, req.Pubkey, heads, members, sources)
-	if err != nil {
-		return PlanResponse{}, err
-	}
-	roles, foldNotes := foldSharedRoles(roles, account)
+	roles, foldNotes := foldSharedRoles(roles, account, &req.Constraints)
 	computedAt, statsReady, err := loadSnapshotTime(ctx, s.pool)
 	if err != nil {
 		return PlanResponse{}, err
@@ -375,7 +383,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 					return PlanResponse{}, err
 				}
 				for _, stat := range stats {
-					addClass(optional, preparedURL{URL: stat.URL, Key: stat.URLKey, PublicSafe: true})
+					addClass(optional, preparedURL{URL: stat.URL, Key: stat.URLKey, PublicSafe: true, Global: true})
 				}
 			}
 		}
@@ -384,13 +392,33 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			if !ok {
 				continue
 			}
-			addClass(optional, preparedURL{URL: normalized, Key: key, PublicSafe: safe})
+			item := preparedURL{URL: normalized, Key: key, PublicSafe: safe}
+			if prev, ok := optional[normalized]; ok {
+				item.Global = prev.Global
+			}
+			addClass(optional, item)
+		}
+		memberWeight := map[string]float64{}
+		for _, member := range roleMembers {
+			if member.Weight > 0 {
+				memberWeight[member.Pubkey] = member.Weight
+			}
 		}
 		rank := map[string]int{}
 		for endpoint, pubs := range byURL {
-			rank[endpoint] = len(pubs)
+			var score float64
+			for pub := range pubs {
+				score += memberWeight[pub]
+			}
+			if score == 0 {
+				rank[endpoint] = len(pubs)
+				continue
+			}
+			rank[endpoint] = int(score*10000) + len(pubs)
 		}
-		ordered, err := prioritizeCandidates(mandatory, optional, rank, maxCandidates)
+		ordered, truncated, err := prioritizeCandidates(mandatory, optional, rank, maxCandidates)
+		plan.CandidateLimit = maxCandidates
+		plan.CandidatesTruncated = truncated
 		if err != nil {
 			return PlanResponse{}, err
 		}
@@ -517,14 +545,20 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			relay.PaidAccess = isPaid
 			relay.Custom = isCustom
 			relay.Covers = covers
-			if rc.MinReliability > 0 && relay.Components.Reliability < rc.MinReliability && !isPinned {
-				relay.Eligible = false
-				relay.IneligibleReason = "min_reliability"
+			if rc.MinReliability > 0 && relay.Components.Reliability < rc.MinReliability {
+				if relay.IneligibleReason == "" {
+					relay.IneligibleReason = "min_reliability"
+				}
+				if !isPinned {
+					relay.Eligible = false
+				}
 			}
-			if rc.MinCapabilityConfidence > 0 && capabilityConfidence(role, relay.Capabilities) < rc.MinCapabilityConfidence && !isPinned {
-				relay.Eligible = false
+			if rc.MinCapabilityConfidence > 0 && capabilityConfidence(role, relay.Capabilities) < rc.MinCapabilityConfidence {
 				if relay.IneligibleReason == "" {
 					relay.IneligibleReason = "min_capability_confidence"
+				}
+				if !isPinned {
+					relay.Eligible = false
 				}
 			}
 			if _, banned := excluded[item.URL]; banned && isPinned {
@@ -573,7 +607,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			}
 		}
 		preview := BuildRecommendations(role, current.Relays, selection.Selected, scoredByURL, down)
-		selection.Selected, _ = keepInvestigations(selection.Selected, preview)
+		selection.Selected, _ = keepInvestigations(selection.Selected, preview, scoredByURL)
 		selection = reconcileSelection(selection, scoredByURL, roleMembers, maxCount)
 		recs := BuildRecommendations(role, current.Relays, selection.Selected, scoredByURL, down)
 		if role == RoleFavorite || role == RoleRelaySet || role == RoleDMInbox || role == RoleKeyPackage {
@@ -604,7 +638,17 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		})
 	}
 
-	out.Proposal = buildProposal(account, builtRoles, resolved, req.AllowCreate, sourceNotes, foldNotes, out.Proposal.Note)
+	out.Proposal = buildProposal(account, builtRoles, resolved, req.AllowCreate, req.AllowRecreate, sourceNotes, foldNotes, out.Proposal.Note)
+	if len(foldNotes) > 0 {
+		out.Shared = []SharedRole{{
+			Roles: []string{RolePublicOutbox, RoleKeyPackage},
+			Kind:  KindPublicRelayList,
+			Note:  foldNotes[0].Text,
+		}}
+	}
+	out.Proposal.ReadyToSign = out.Proposal.Safe && out.Proposal.SourceComplete && out.ConstraintsSatisfied &&
+		!out.Proposal.RequiresRefresh && !out.Proposal.RequiresReview &&
+		(out.Proposal.PublicRelays != nil || len(out.Proposal.Lists) > 0)
 	if len(out.Fallbacks) == 0 && out.Cohort.Used == "personalized" {
 		out.Cohort.Used = "personalized"
 	}
@@ -624,7 +668,7 @@ type builtRole struct {
 	dTag         string
 }
 
-func buildProposal(account AccountConfig, roles []builtRole, resolved map[string]resolvedSource, allowCreate bool, notes []sourceNote, foldNotes []Reason, note string) Proposal {
+func buildProposal(account AccountConfig, roles []builtRole, resolved map[string]resolvedSource, allowCreate, allowRecreate bool, notes []sourceNote, foldNotes []Reason, note string) Proposal {
 	proposal := Proposal{Note: note, Safe: true, SourceComplete: true}
 	keys := map[string]struct{}{}
 	for _, item := range roles {
@@ -644,9 +688,13 @@ func buildProposal(account AccountConfig, roles []builtRole, resolved map[string
 			proposal.RequiresReview = true
 		}
 	}
-	if len(foldNotes) > 0 {
-		proposal.RequiresReview = true
-		proposal.Blocking = append(proposal.Blocking, foldNotes...)
+	for _, note := range foldNotes {
+		if note.Code == "shared_constraint_conflict" {
+			proposal.RequiresReview = true
+			proposal.Blocking = append(proposal.Blocking, note)
+			continue
+		}
+		proposal.Warnings = append(proposal.Warnings, note)
 	}
 	inboxOptimized, outboxOptimized := false, false
 	inbox := urlsOf(roleRelays(account, RolePublicInbox))
@@ -678,12 +726,13 @@ func buildProposal(account AccountConfig, roles []builtRole, resolved map[string
 		if publicTruncated {
 			src.Complete = false
 		}
-		result := Patch(PatchInput{
+		input := PatchInput{
 			Source: src.Raw, Origin: src.Origin, Truncated: !src.Complete && src.Origin != "missing" && src.Origin != "deleted",
-			AllowCreate: allowCreate && src.Origin == "missing", ExpectedPubkey: account.Pubkey,
+			AllowCreate: (allowCreate && src.Origin == "missing") || (allowRecreate && src.Origin == "deleted"), ExpectedPubkey: account.Pubkey,
 			ExpectedKind: KindPublicRelayList, InboxOptimized: inboxOptimized, OutboxOptimized: outboxOptimized,
 			Inbox: inbox, Outbox: outbox,
-		})
+		}
+		result := confirmProposal(Patch(input), input)
 		applyPatch(&proposal, result)
 		if result.Event != nil {
 			proposal.PublicRelays = result.Event
@@ -705,11 +754,12 @@ func buildProposal(account AccountConfig, roles []builtRole, resolved map[string
 		if item.truncated {
 			src.Complete = false
 		}
-		result := Patch(PatchInput{
+		input := PatchInput{
 			Source: src.Raw, Origin: src.Origin, Truncated: !src.Complete && src.Origin != "missing" && src.Origin != "deleted",
-			AllowCreate: allowCreate && src.Origin == "missing", ExpectedPubkey: account.Pubkey, ExpectedKind: item.kind,
+			AllowCreate: (allowCreate && src.Origin == "missing") || (allowRecreate && src.Origin == "deleted"), ExpectedPubkey: account.Pubkey, ExpectedKind: item.kind,
 			ListOptimized: true, TagName: item.tag, Desired: item.urls,
-		})
+		}
+		result := confirmProposal(Patch(input), input)
 		applyPatch(&proposal, result)
 		if result.Event != nil {
 			proposal.Lists = append(proposal.Lists, *result.Event)
@@ -925,39 +975,79 @@ func (c Constraints) forRole(role string) Constraints {
 	return out
 }
 
-func prioritizeCandidates(mandatory, optional map[string]preparedURL, rank map[string]int, limit int) ([]preparedURL, error) {
+func prioritizeCandidates(mandatory, optional map[string]preparedURL, rank map[string]int, limit int) ([]preparedURL, bool, error) {
 	required := mapValues(mandatory)
 	if len(required) > limit {
-		return nil, invalidf("pinned, current, and supplied relays exceed the candidate limit of %d", limit)
+		return nil, false, invalidf("pinned, current, and supplied relays exceed the candidate limit of %d", limit)
 	}
 	extra := mapValues(optional)
 	sort.Slice(extra, func(i, j int) bool {
 		if rank[extra[i].URL] != rank[extra[j].URL] {
 			return rank[extra[i].URL] > rank[extra[j].URL]
 		}
+		if extra[i].Global != extra[j].Global {
+			return extra[i].Global
+		}
 		return extra[i].URL < extra[j].URL
 	})
 	out := make([]preparedURL, 0, limit)
 	seen := map[string]struct{}{}
-	for _, item := range required {
+	add := func(item preparedURL) bool {
 		if _, ok := seen[item.URL]; ok {
-			continue
+			return false
+		}
+		if len(out) >= limit {
+			return false
 		}
 		seen[item.URL] = struct{}{}
 		out = append(out, item)
+		return true
+	}
+	for _, item := range required {
+		add(item)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].URL < out[j].URL })
+	room := limit - len(out)
+	reserve := 0
+	if room > 4 {
+		reserve = room / 4
+		if reserve > 20 {
+			reserve = 20
+		}
+	}
+	personalBudget := room - reserve
+	added := 0
+	for _, item := range extra {
+		if added >= personalBudget {
+			break
+		}
+		if add(item) {
+			added++
+		}
+	}
+	for _, item := range extra {
+		if !item.Global {
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		add(item)
+	}
 	for _, item := range extra {
 		if len(out) >= limit {
 			break
 		}
-		if _, ok := seen[item.URL]; ok {
-			continue
-		}
-		seen[item.URL] = struct{}{}
-		out = append(out, item)
+		add(item)
 	}
-	return out, nil
+	unique := map[string]struct{}{}
+	for _, item := range required {
+		unique[item.URL] = struct{}{}
+	}
+	for _, item := range extra {
+		unique[item.URL] = struct{}{}
+	}
+	return out, len(unique) > len(out), nil
 }
 
 func mapValues(items map[string]preparedURL) []preparedURL {
@@ -979,9 +1069,20 @@ func reconcileSelection(selection SelectResult, scored map[string]ScoredRelay, m
 	}
 	relays := make([]ScoredRelay, 0, len(selection.Selected))
 	for _, item := range selection.Selected {
-		if relay, ok := scored[item.URL]; ok {
-			relays = append(relays, relay)
+		relay, ok := scored[item.URL]
+		if !ok {
+			continue
 		}
+		if relay.IneligibleReason == "blocked_by_account" || (hardIneligible(relay) && !relay.Pinned) {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: relay.IneligibleReason, Text: "A prohibited relay was removed from the final list."})
+			continue
+		}
+		if relay.Pinned && relay.IneligibleReason != "" {
+			selection.ConstraintsSatisfied = false
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "pinned_ineligible", Text: "A pinned relay conflicts with " + relay.IneligibleReason + ". The pin was kept for review."})
+		}
+		relays = append(relays, relay)
 	}
 	selection.Selected = annotate(relays, known, knownWeight)
 	selection.DistinctEndpoints = len(selection.Selected)
@@ -1196,7 +1297,7 @@ func selectedURLs(selected []SelectedRelay) []string {
 	return out
 }
 
-func keepInvestigations(selected []SelectedRelay, recs []Recommendation) ([]SelectedRelay, []string) {
+func keepInvestigations(selected []SelectedRelay, recs []Recommendation, scored map[string]ScoredRelay) ([]SelectedRelay, []string) {
 	have := map[string]struct{}{}
 	for _, relay := range selected {
 		have[relay.URL] = struct{}{}
@@ -1206,6 +1307,17 @@ func keepInvestigations(selected []SelectedRelay, recs []Recommendation) ([]Sele
 			continue
 		}
 		if _, ok := have[rec.Current]; ok {
+			continue
+		}
+		relay, ok := scored[rec.Current]
+		if !ok {
+			continue
+		}
+		// Uncertain health is not permission to keep an excluded or blocked relay.
+		if relay.IneligibleReason == "excluded" || relay.IneligibleReason == "blocked_by_account" {
+			continue
+		}
+		if hardIneligible(relay) && !relay.Pinned {
 			continue
 		}
 		selected = append(selected, SelectedRelay{URL: rec.Current, Current: true})

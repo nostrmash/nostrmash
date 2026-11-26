@@ -118,10 +118,19 @@ func Select(req SelectRequest) SelectResult {
 
 	var pins []ScoredRelay
 	for _, relay := range relays {
-		if relay.Pinned {
-			pins = append(pins, relay)
-			add(relay)
+		if !relay.Pinned {
+			continue
 		}
+		if relay.IneligibleReason == "blocked_by_account" {
+			result.ConstraintsSatisfied = false
+			result.Unsatisfied = append(result.Unsatisfied, Reason{
+				Code: "blocked_by_account",
+				Text: "A pinned relay is on the account blocklist. The block was not overridden.",
+			})
+			continue
+		}
+		pins = append(pins, relay)
+		add(relay)
 	}
 	if len(pins) > req.Max {
 		result.ConstraintsSatisfied = false
@@ -132,7 +141,7 @@ func Select(req SelectRequest) SelectResult {
 	}
 	excludedPins := 0
 	for _, relay := range relays {
-		if relay.Pinned && !relay.Eligible {
+		if relay.Pinned && !relay.Eligible && relay.IneligibleReason != "blocked_by_account" {
 			excludedPins++
 		}
 	}
@@ -177,9 +186,18 @@ func Select(req SelectRequest) SelectResult {
 
 	if req.RetainExisting {
 		for _, relay := range relays {
-			if relay.Current && !hardIneligible(relay) && (relay.Eligible || relay.Pinned || relay.Custom || relay.Current) {
-				add(relay)
+			if !relay.Current {
+				continue
 			}
+			if hardIneligible(relay) && !relay.Pinned {
+				result.ConstraintsSatisfied = false
+				result.Unsatisfied = append(result.Unsatisfied, Reason{
+					Code: relay.IneligibleReason,
+					Text: "A current relay was not kept because it is excluded, blocked, or otherwise prohibited.",
+				})
+				continue
+			}
+			add(relay)
 		}
 	}
 	currentCoverage := coverageOf(currentOnly(relays), known, knownWeight)
@@ -188,7 +206,7 @@ func Select(req SelectRequest) SelectResult {
 	// Drop unpinned current relays when the list is over the cap, worst unique
 	// contribution first. Pins stay even when that leaves the list too large.
 	for len(selected) > req.Max {
-		idx := worstDropIndex(selected, known, knownWeight)
+		idx := worstDropIndex(selected, known, knownWeight, req)
 		if idx < 0 || selected[idx].Pinned {
 			break
 		}
@@ -250,7 +268,7 @@ func improveBySwap(selected, relays []ScoredRelay, seen map[string]struct{}, kno
 	}
 	base := setObjective(selected, known, knownWeight, req)
 	for step := 0; step < 4; step++ {
-		threshold := req.Hysteresis
+		threshold := swapThreshold(req, len(selected))
 		bestGain := threshold
 		dropIdx := -1
 		var add ScoredRelay
@@ -264,7 +282,7 @@ func improveBySwap(selected, relays []ScoredRelay, seen map[string]struct{}, kno
 				if _, ok := seen[alt.URL]; ok {
 					continue
 				}
-				if hardIneligible(alt) && !alt.Pinned {
+				if alt.IneligibleReason == "blocked_by_account" || (hardIneligible(alt) && !alt.Pinned) {
 					continue
 				}
 				if !alt.Eligible && !alt.Pinned && !alt.Custom {
@@ -295,10 +313,27 @@ func improveBySwap(selected, relays []ScoredRelay, seen map[string]struct{}, kno
 	return selected
 }
 
+func swapThreshold(req SelectRequest, size int) float64 {
+	if size < 1 {
+		size = 1
+	}
+	// Hysteresis is defined on a full-list change. A one-relay swap is
+	// compared with the same threshold divided across the current slots,
+	// so a large quality or coverage gain in one relay can clear it.
+	return req.Hysteresis / float64(size)
+}
+
 func setObjective(selected []ScoredRelay, known map[string]float64, knownWeight float64, req SelectRequest) float64 {
-	score := coverageOf(selected, known, knownWeight)
-	if len(selected) == 0 || req.QualityBias == 0 {
-		return score
+	coverage := coverageOf(selected, known, knownWeight)
+	if len(selected) == 0 {
+		return coverage
+	}
+	bias := req.QualityBias
+	if bias < 0 {
+		bias = 0
+	}
+	if bias > 1 {
+		bias = 1
 	}
 	var quality float64
 	var counted int
@@ -309,10 +344,39 @@ func setObjective(selected []ScoredRelay, known map[string]float64, knownWeight 
 		quality += *relay.Score
 		counted++
 	}
-	if counted == 0 {
-		return score
+	mean := 0.0
+	if counted > 0 {
+		mean = quality / float64(counted)
 	}
-	return score + req.QualityBias*quality/float64(counted)
+	base := (1-bias)*coverage + bias*mean
+	if req.Objective == ObjectiveQuality {
+		base = (1-bias)*mean + bias*coverage
+	}
+	return base - diversityPenalty(selected, req.DiversityFactor)
+}
+
+func diversityPenalty(selected []ScoredRelay, factor float64) float64 {
+	if len(selected) < 2 || factor >= 1 {
+		return 0
+	}
+	if factor < 0 {
+		factor = 0
+	}
+	counts := map[string]int{}
+	for _, relay := range selected {
+		key := relay.OperatorKey
+		if key == "" {
+			key = relay.URL
+		}
+		counts[key]++
+	}
+	extra := 0
+	for _, count := range counts {
+		if count > 1 {
+			extra += count - 1
+		}
+	}
+	return (1 - factor) * float64(extra) / float64(len(selected))
 }
 
 func currentOnly(relays []ScoredRelay) []ScoredRelay {
@@ -333,7 +397,7 @@ func bestAddition(selected, relays []ScoredRelay, seen map[string]struct{}, know
 		if _, ok := seen[relay.URL]; ok {
 			continue
 		}
-		if hardIneligible(relay) && !relay.Pinned {
+		if relay.IneligibleReason == "blocked_by_account" || (hardIneligible(relay) && !relay.Pinned) {
 			continue
 		}
 		if !relay.Eligible && !relay.Pinned && !relay.Custom && !relay.Current {
@@ -350,41 +414,8 @@ func bestAddition(selected, relays []ScoredRelay, seen map[string]struct{}, know
 }
 
 func marginal(selected []ScoredRelay, relay ScoredRelay, known map[string]float64, knownWeight float64, req SelectRequest) float64 {
-	coverageGain := 0.0
-	if knownWeight > 0 {
-		var added float64
-		for pubkey, weight := range known {
-			if covers(selected, pubkey) || !coversOne(relay, pubkey) {
-				continue
-			}
-			added += weight
-		}
-		coverageGain = added / knownWeight
-	}
-	repeat := operatorRepeat(selected, relay)
-	if repeat && req.Objective != ObjectiveQuality {
-		coverageGain *= req.DiversityFactor
-	}
-	quality := 0.0
-	if relay.Score != nil {
-		quality = *relay.Score
-	} else if relay.Pinned || relay.Custom {
-		quality = 0.5
-	}
-	switch req.Objective {
-	case ObjectiveQuality:
-		gain := (1-req.QualityBias)*quality + req.QualityBias*coverageGain
-		if repeat {
-			gain *= req.DiversityFactor
-		}
-		return gain
-	default:
-		bias := req.QualityBias
-		if bias <= 0 {
-			bias = 0.15
-		}
-		return (1-bias)*coverageGain + bias*quality
-	}
+	trial := append(append([]ScoredRelay{}, selected...), relay)
+	return setObjective(trial, known, knownWeight, req) - setObjective(selected, known, knownWeight, req)
 }
 
 func covers(selected []ScoredRelay, pubkey string) bool {
@@ -458,41 +489,21 @@ func without(selected []ScoredRelay, skip int) []ScoredRelay {
 	return out
 }
 
-func worstDropIndex(selected []ScoredRelay, known map[string]float64, knownWeight float64) int {
+func worstDropIndex(selected []ScoredRelay, known map[string]float64, knownWeight float64, req SelectRequest) int {
+	base := setObjective(selected, known, knownWeight, req)
 	worst := -1
-	worstUnique := 2.0
+	worstLoss := 0.0
 	for i, relay := range selected {
 		if relay.Pinned {
 			continue
 		}
-		unique := 0.0
-		if knownWeight > 0 {
-			var only float64
-			for pubkey, weight := range known {
-				if coversOne(relay, pubkey) && !covers(without(selected, i), pubkey) {
-					only += weight
-				}
-			}
-			unique = only / knownWeight
-		}
-		if worst < 0 || unique < worstUnique-1e-9 || (abs(unique-worstUnique) <= 1e-9 && relay.URL > selected[worst].URL) {
+		loss := base - setObjective(without(selected, i), known, knownWeight, req)
+		if worst < 0 || loss < worstLoss-1e-9 || (abs(loss-worstLoss) <= 1e-9 && relay.URL > selected[worst].URL) {
 			worst = i
-			worstUnique = unique
+			worstLoss = loss
 		}
 	}
 	return worst
-}
-
-func operatorRepeat(selected []ScoredRelay, relay ScoredRelay) bool {
-	if relay.OperatorKey == "" {
-		return false
-	}
-	for _, item := range selected {
-		if item.OperatorKey == relay.OperatorKey {
-			return true
-		}
-	}
-	return false
 }
 
 func finishDiversity(result *SelectResult, selected []ScoredRelay) {

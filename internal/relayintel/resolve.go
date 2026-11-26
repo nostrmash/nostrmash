@@ -3,9 +3,10 @@ package relayintel
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 	"github.com/nostrmash/nostrmash/internal/nostr"
 )
 
@@ -37,7 +38,16 @@ type deletionView struct {
 	ByCoord map[string]int64
 }
 
-func (s *Service) resolveAccount(ctx context.Context, pubkey string, heads []Head, members []Membership, client map[string]SourceEvent) (AccountConfig, map[string]resolvedSource, []sourceNote, error) {
+func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[string]SourceEvent) (AccountConfig, map[string]resolvedSource, []sourceNote, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return AccountConfig{}, nil, nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	heads, members, err := loadAccount(ctx, tx, pubkey)
+	if err != nil {
+		return AccountConfig{}, nil, nil, err
+	}
 	ids := make([]string, 0, len(heads)+len(client))
 	for _, head := range heads {
 		if head.EventID != "" {
@@ -49,19 +59,22 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, heads []Hea
 			ids = append(ids, item.ID)
 		}
 	}
-	indexed, err := loadEventRaw(ctx, s.pool, ids)
+	indexed, err := loadEventRaw(ctx, tx, ids)
 	if err != nil {
 		return AccountConfig{}, nil, nil, err
 	}
-	deleted, err := loadDeletions(ctx, s.pool, pubkey, ids)
+	deleted, err := loadDeletions(ctx, tx, pubkey, ids)
 	if err != nil {
+		return AccountConfig{}, nil, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return AccountConfig{}, nil, nil, err
 	}
 	account, resolved, notes := applyAuthoritative(pubkey, heads, members, indexed, client, deleted)
 	return account, resolved, notes, nil
 }
 
-func loadDeletions(ctx context.Context, pool *pgxpool.Pool, pubkey string, ids []string) (deletionView, error) {
+func loadDeletions(ctx context.Context, pool dbQuery, pubkey string, ids []string) (deletionView, error) {
 	view := deletionView{ByEvent: map[string]bool{}, ByCoord: map[string]int64{}}
 	rows, err := pool.Query(ctx, `
 		SELECT kind, d_tag, max(created_at)
@@ -218,7 +231,30 @@ func applyAuthoritative(pubkey string, heads []Head, members []Membership, index
 		}
 		resolved[key] = itemResolved
 	}
+	for key, created := range deleted.ByCoord {
+		if _, ok := resolved[key]; ok {
+			continue
+		}
+		kind, dTag, ok := splitSourceKey(key)
+		if !ok || created < 0 {
+			continue
+		}
+		resolved[key] = resolvedSource{Origin: "deleted", Kind: kind, DTag: dTag}
+		notes = append(notes, sourceNote{kind: kind, dTag: dTag, reason: Reason{Code: "source_deleted", Text: "A deletion covers this list. The deleted event was not used as the current configuration."}})
+	}
 	return EffectiveConfig(pubkey, heads, members), resolved, notes
+}
+
+func splitSourceKey(key string) (int, string, bool) {
+	kindText, dTag, ok := strings.Cut(key, "\x00")
+	if !ok {
+		return 0, "", false
+	}
+	kind, err := strconv.Atoi(kindText)
+	if err != nil {
+		return 0, "", false
+	}
+	return kind, dTag, true
 }
 
 func eventSuppressed(eventID string, created int64, kind int, dTag string, deleted deletionView) bool {
@@ -274,7 +310,7 @@ func dropCoordinate(heads []Head, members []Membership, kind int, dTag string) (
 	return nextHeads, nextMembers
 }
 
-func foldSharedRoles(roles []string, account AccountConfig) ([]string, []Reason) {
+func foldSharedRoles(roles []string, account AccountConfig, constraints *Constraints) ([]string, []Reason) {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(roles))
 	hasKeyPackage := false
@@ -301,8 +337,89 @@ func foldSharedRoles(roles []string, account AccountConfig) ([]string, []Reason)
 	if _, ok := seen[RolePublicOutbox]; !ok {
 		next = append(next, RolePublicOutbox)
 	}
-	return next, []Reason{{
+	notes := []Reason{{
 		Code: "keypackage_follows_outbox",
 		Text: "KeyPackage discovery uses the public outbox. This request optimized that shared kind 10002 list instead of emitting a separate kind 10051 list. A messaging client must publish a new KeyPackage after the outbox changes.",
 	}}
+	notes = append(notes, mergeKeyPackageConstraints(constraints)...)
+	return next, notes
+}
+
+// mergeKeyPackageConstraints copies KeyPackage pins, exclusions, and counts
+// onto the public outbox, which is the list a modern client actually publishes.
+func mergeKeyPackageConstraints(c *Constraints) []Reason {
+	if c == nil || len(c.ByRole) == 0 {
+		return nil
+	}
+	kp, ok := c.ByRole[RoleKeyPackage]
+	if !ok {
+		return nil
+	}
+	ob := c.ByRole[RolePublicOutbox]
+	var notes []Reason
+	if pins := unionStrings(c.Pinned, derefStrings(ob.Pinned), derefStrings(kp.Pinned)); ob.Pinned != nil || kp.Pinned != nil {
+		ob.Pinned = &pins
+	}
+	if excluded := unionStrings(derefStrings(ob.Excluded), derefStrings(kp.Excluded)); ob.Excluded != nil || kp.Excluded != nil {
+		ob.Excluded = &excluded
+	}
+	switch {
+	case kp.Max != nil && ob.Max != nil && *kp.Max != *ob.Max:
+		smaller := *kp.Max
+		if *ob.Max < smaller {
+			smaller = *ob.Max
+		}
+		ob.Max = &smaller
+		notes = append(notes, Reason{Code: "shared_constraint_conflict", Text: "The public outbox and KeyPackage roles asked for different maximum sizes. The smaller maximum was used."})
+	case kp.Max != nil && ob.Max == nil:
+		value := *kp.Max
+		ob.Max = &value
+	}
+	if kp.Min != nil && ob.Max != nil && *kp.Min > *ob.Max {
+		notes = append(notes, Reason{Code: "shared_constraint_conflict", Text: "The KeyPackage minimum is larger than the shared outbox maximum. Both requirements cannot be met."})
+	} else if kp.Min != nil && (ob.Min == nil || *kp.Min > *ob.Min) {
+		value := *kp.Min
+		ob.Min = &value
+	}
+	if kp.MinCapabilityConfidence != nil && (ob.MinCapabilityConfidence == nil || *kp.MinCapabilityConfidence > *ob.MinCapabilityConfidence) {
+		value := *kp.MinCapabilityConfidence
+		ob.MinCapabilityConfidence = &value
+	}
+	if ob.AuthRead == "" {
+		ob.AuthRead = kp.AuthRead
+	} else if kp.AuthRead != "" && kp.AuthRead != ob.AuthRead {
+		notes = append(notes, Reason{Code: "shared_constraint_conflict", Text: "The public outbox and KeyPackage roles disagree about read authentication."})
+	}
+	if ob.AuthWrite == "" {
+		ob.AuthWrite = kp.AuthWrite
+	} else if kp.AuthWrite != "" && kp.AuthWrite != ob.AuthWrite {
+		notes = append(notes, Reason{Code: "shared_constraint_conflict", Text: "The public outbox and KeyPackage roles disagree about write authentication."})
+	}
+	if c.ByRole == nil {
+		c.ByRole = map[string]RoleConstraints{}
+	}
+	c.ByRole[RolePublicOutbox] = ob
+	return notes
+}
+
+func derefStrings(value *[]string) []string {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func unionStrings(groups ...[]string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, group := range groups {
+		for _, item := range group {
+			if _, ok := seen[item]; ok {
+				continue
+			}
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	return out
 }

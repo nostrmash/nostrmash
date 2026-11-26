@@ -101,12 +101,13 @@ func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
 			return nil, input("pubkey must be 64 hex characters or an npub")
 		}
 		req := relayintel.PlanRequest{
-			Pubkey:       pubkey,
-			Preset:       body.Preset,
-			Roles:        body.Roles,
-			Supplied:     make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
-			SourceEvents: body.SourceEvents,
-			AllowCreate:  body.AllowCreate,
+			Pubkey:        pubkey,
+			Preset:        body.Preset,
+			Roles:         body.Roles,
+			Supplied:      make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
+			SourceEvents:  body.SourceEvents,
+			AllowCreate:   body.AllowCreate,
+			AllowRecreate: body.AllowRecreate,
 		}
 		if body.Constraints != nil {
 			req.Constraints = constraintFromRequest(*body.Constraints)
@@ -135,13 +136,14 @@ func (h Handlers) PostRelayVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 type relayOptimizeRequest struct {
-	Pubkey       string                  `json:"pubkey"`
-	Preset       string                  `json:"preset"`
-	Roles        []string                `json:"roles"`
-	Constraints  *relayConstraintRequest `json:"constraints"`
-	Supplied     []relaySuppliedRequest  `json:"supplied_relays"`
-	SourceEvents []json.RawMessage       `json:"source_events"`
-	AllowCreate  bool                    `json:"allow_create"`
+	Pubkey        string                  `json:"pubkey"`
+	Preset        string                  `json:"preset"`
+	Roles         []string                `json:"roles"`
+	Constraints   *relayConstraintRequest `json:"constraints"`
+	Supplied      []relaySuppliedRequest  `json:"supplied_relays"`
+	SourceEvents  []json.RawMessage       `json:"source_events"`
+	AllowCreate   bool                    `json:"allow_create"`
+	AllowRecreate bool                    `json:"allow_recreate"`
 }
 
 type relayConstraintRequest struct {

@@ -223,19 +223,31 @@ func ScoreRelay(in ScoreInput) ScoredRelay {
 		out.IneligibleReason = "blocked_by_account"
 		out.Reasons = append(out.Reasons, Reason{Code: "blocked_by_account", Text: "This account's public blocked-relay list names this endpoint."})
 	}
-	if ineligible != "" && !in.Pinned {
-		out.Eligible = false
+	if ineligible != "" {
 		out.IneligibleReason = ineligible
+		if in.Pinned {
+			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this relay for review, but it does not meet the role requirement."})
+		} else {
+			out.Eligible = false
+		}
 	}
-	if in.FreeOnly && !in.PaidAccess && !in.Pinned && paymentRestricted(in, caps) {
-		out.Eligible = false
+	if in.FreeOnly && !in.PaidAccess && paymentRestricted(in, caps) {
 		out.IneligibleReason = "payment_required"
 		out.Reasons = append(out.Reasons, Reason{Code: "payment_required", Text: "The relay advertises a payment requirement and this request asked for free relays."})
+		if !in.Pinned {
+			out.Eligible = false
+		} else {
+			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this paid relay for review. The payment conflict is still reported."})
+		}
 	}
-	if !in.Pinned && authRejected(in, caps) {
-		out.Eligible = false
+	if authRejected(in, caps) {
 		out.IneligibleReason = "auth_rejected"
 		out.Reasons = append(out.Reasons, Reason{Code: "auth_rejected", Text: "Authentication does not match the requested read or write preference."})
+		if !in.Pinned {
+			out.Eligible = false
+		} else {
+			out.Reasons = append(out.Reasons, Reason{Code: "pinned_ineligible", Text: "A pin keeps this relay for review. The authentication conflict is still reported."})
+		}
 	}
 
 	if confidence < 0.25 && !in.Pinned {

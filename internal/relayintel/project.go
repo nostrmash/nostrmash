@@ -154,26 +154,53 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		FROM relay_config_heads
 		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
 	`, in.Pubkey, in.Kind).Scan(&existingID, &existingCreated)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil
-		}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("load relay config head: %w", err)
 	}
-	if !wins(in.CreatedAt, in.EventID, existingCreated, existingID) {
+	if err == nil && !wins(in.CreatedAt, in.EventID, existingCreated, existingID) {
 		return nil
+	}
+	source := SourceModern
+	if in.Kind == KindLegacyContact {
+		source = SourceLegacy
+	}
+	head := Head{
+		Pubkey: in.Pubkey, SourceKind: in.Kind, EventID: in.EventID, CreatedAt: in.CreatedAt,
+		ExplicitlyEmpty: true, DeclarationSource: source,
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO relay_config_heads (
+			pubkey, source_kind, d_tag, event_id, created_at,
+			explicitly_empty, client_side_only, declaration_source,
+			invalid_endpoint_count, truncated, title
+		) VALUES (
+			$1, $2, '', $3, $4,
+			true, false, $5,
+			0, false, ''
+		)
+		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
+		SET event_id = EXCLUDED.event_id,
+		    created_at = EXCLUDED.created_at,
+		    explicitly_empty = true,
+		    declaration_source = EXCLUDED.declaration_source,
+		    invalid_endpoint_count = 0,
+		    truncated = false,
+		    updated_at = now()
+		WHERE EXCLUDED.created_at > relay_config_heads.created_at
+		   OR (
+		       EXCLUDED.created_at = relay_config_heads.created_at
+		       AND EXCLUDED.event_id < relay_config_heads.event_id
+		   )
+		   OR EXCLUDED.event_id = relay_config_heads.event_id
+	`, head.Pubkey, head.SourceKind, head.EventID, head.CreatedAt, head.DeclarationSource); err != nil {
+		return fmt.Errorf("record cleared relay head: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM relay_role_memberships
 		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
-	`, in.Pubkey, in.Kind); err != nil {
+		  AND created_at <= $3
+	`, in.Pubkey, in.Kind, in.CreatedAt); err != nil {
 		return fmt.Errorf("delete cleared memberships: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM relay_config_heads
-		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
-	`, in.Pubkey, in.Kind); err != nil {
-		return fmt.Errorf("delete cleared head: %w", err)
 	}
 	return nil
 }
