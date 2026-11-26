@@ -222,5 +222,8 @@ func splitRelayCoordinate(value string) (kind int, pubkey, dTag string, ok bool)
 	if len(dTag) > 1024 {
 		return 0, "", "", false
 	}
+	if !relayintel.AddressableKind(kind) {
+		dTag = ""
+	}
 	return kind, pubkey, dTag, true
 }

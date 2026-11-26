@@ -25,6 +25,7 @@ func TestSplitRelayCoordinate(t *testing.T) {
 		{name: "addressable pubkey too short", value: "30023:" + strings.Repeat("a", 63) + ":name", ok: false},
 		{name: "d tag too long", value: "30023:" + pubkey + ":" + longTag, ok: false},
 		{name: "replaceable without d", value: "10002:" + pubkey, kind: 10002, pubkey: strings.ToLower(pubkey), ok: true},
+		{name: "replaceable ignores stray d", value: "3:" + pubkey + ":unrelated", kind: 3, pubkey: strings.ToLower(pubkey), dTag: "", ok: true},
 		{name: "addressable keeps colons in d", value: "30023:" + pubkey + ":name:with:colon", kind: 30023, pubkey: strings.ToLower(pubkey), dTag: "name:with:colon", ok: true},
 	}
 

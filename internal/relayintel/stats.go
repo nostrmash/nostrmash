@@ -12,6 +12,9 @@ import (
 	"github.com/nostrmash/nostrmash/internal/metrics"
 )
 
+// ErrStatsBusy means another worker already holds the statistics refresh lock.
+var ErrStatsBusy = errors.New("relay intelligence statistics refresh is already running")
+
 // RefreshStats rebuilds role aggregates from relay_role_memberships.
 // excludePubkey drops the synthetic probe identity so probes do not become adoption.
 func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string) error {
@@ -23,6 +26,14 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('nostrmash-relay-intel-stats'))`).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return ErrStatsBusy
+	}
+	started := time.Now()
 
 	if _, err := tx.Exec(ctx, `DELETE FROM relay_role_stats`); err != nil {
 		return fmt.Errorf("clear relay role stats: %w", err)
@@ -159,13 +170,15 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 	kindJSON, _ := json.Marshal(kindCounts)
 	roleJSON, _ := json.Marshal(roleCounts)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO relay_intel_snapshot (id, computed_at, kind_counts, role_declarers)
-		VALUES (true, now(), $1::jsonb, $2::jsonb)
+		INSERT INTO relay_intel_snapshot (id, computed_at, kind_counts, role_declarers, last_duration_ms, last_error)
+		VALUES (true, now(), $1::jsonb, $2::jsonb, $3, NULL)
 		ON CONFLICT (id) DO UPDATE
 		SET computed_at = EXCLUDED.computed_at,
 		    kind_counts = EXCLUDED.kind_counts,
-		    role_declarers = EXCLUDED.role_declarers
-	`, kindJSON, roleJSON); err != nil {
+		    role_declarers = EXCLUDED.role_declarers,
+		    last_duration_ms = EXCLUDED.last_duration_ms,
+		    last_error = NULL
+	`, kindJSON, roleJSON, time.Since(started).Milliseconds()); err != nil {
 		return fmt.Errorf("upsert relay intel snapshot: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -189,4 +202,24 @@ func StatsAge(ctx context.Context, pool *pgxpool.Pool, now time.Time) (time.Dura
 		now = time.Now()
 	}
 	return now.Sub(computed), true, nil
+}
+
+// RecordStatsFailure stores the latest statistics error without moving the
+// last successful computed_at timestamp.
+func RecordStatsFailure(ctx context.Context, pool *pgxpool.Pool, cause error) error {
+	if pool == nil || cause == nil {
+		return nil
+	}
+	text := cause.Error()
+	if len(text) > 500 {
+		text = text[:500]
+	}
+	_, err := pool.Exec(ctx, `
+		INSERT INTO relay_intel_snapshot (id, computed_at, last_error, last_failure_at)
+		VALUES (true, now(), $1, now())
+		ON CONFLICT (id) DO UPDATE
+		SET last_error = EXCLUDED.last_error,
+		    last_failure_at = EXCLUDED.last_failure_at
+	`, text)
+	return wrapDB(err)
 }

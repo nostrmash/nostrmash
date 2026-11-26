@@ -124,21 +124,42 @@ candidates AS (
           AND rs.kind = e.kind
           AND rs.created_at = e.created_at
           AND rs.event_id > e.id
-          AND rs.d_tag = COALESCE((
-            SELECT et.value
-            FROM event_tags et
-            WHERE et.event_id = e.id
-              AND et.tag_name = 'd'
-              AND et.value_index = 0
-            ORDER BY et.tag_index ASC
-            LIMIT 1
-          ), '')
+          AND (
+            (e.kind >= 30000 AND e.kind < 40000 AND rs.d_tag = COALESCE((
+                SELECT et.value
+                FROM event_tags et
+                WHERE et.event_id = e.id
+                  AND et.tag_name = 'd'
+                  AND et.value_index = 0
+                ORDER BY et.tag_index ASC
+                LIMIT 1
+            ), ''))
+            OR e.kind < 30000
+            OR e.kind >= 40000
+          )
       )
       AND NOT EXISTS (
         SELECT 1
         FROM relay_intel_repairs repair
         WHERE repair.winner_event_id = e.id
-          AND repair.status = 'pending'
+          AND repair.status IN ('pending', 'queued', 'running')
+          AND (
+            EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+                  AND rs.event_id IN (repair.winner_event_id, repair.loser_event_id)
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+            )
+          )
       )
     ORDER BY p.created_at ASC, p.event_id ASC
     LIMIT @row_limit

@@ -1345,6 +1345,7 @@ type RelayConfigHead struct {
 	Truncated            bool
 	Title                string
 	UpdatedAt            pgtype.Timestamptz
+	NeedsReplay          bool
 }
 
 type RelayCoverageChange struct {
@@ -1426,13 +1427,37 @@ type RelayIntelRepair struct {
 	Status        string
 	CreatedAt     pgtype.Timestamptz
 	UpdatedAt     pgtype.Timestamptz
+	JobID         pgtype.Int8
+	Attempts      int32
+	LastError     pgtype.Text
+	FinishedAt    pgtype.Timestamptz
 }
 
 type RelayIntelSnapshot struct {
-	ID            bool
-	ComputedAt    pgtype.Timestamptz
-	KindCounts    []byte
-	RoleDeclarers []byte
+	ID             bool
+	ComputedAt     pgtype.Timestamptz
+	KindCounts     []byte
+	RoleDeclarers  []byte
+	LastDurationMs pgtype.Int8
+	LastError      pgtype.Text
+	LastFailureAt  pgtype.Timestamptz
+}
+
+type RelayIntelWorkCursor struct {
+	WorkName        string
+	CursorPubkey    string
+	CursorKind      int32
+	CursorDTag      string
+	CursorCreatedAt int64
+	CursorEventID   string
+	CursorTag       string
+	Idle            bool
+	NextRunAt       pgtype.Timestamptz
+	LastCompletedAt pgtype.Timestamptz
+	LastDurationMs  pgtype.Int8
+	LastError       pgtype.Text
+	LastRows        int64
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type RelayListStatsDaily struct {

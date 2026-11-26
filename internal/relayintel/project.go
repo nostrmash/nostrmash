@@ -49,11 +49,11 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		INSERT INTO relay_config_heads (
 			pubkey, source_kind, d_tag, event_id, created_at,
 			explicitly_empty, client_side_only, declaration_source,
-			invalid_endpoint_count, truncated, title
+			invalid_endpoint_count, truncated, title, needs_replay
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
-			$9, $10, $11
+			$9, $10, $11, false
 		)
 		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
 		SET event_id = EXCLUDED.event_id,
@@ -64,6 +64,7 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		    invalid_endpoint_count = EXCLUDED.invalid_endpoint_count,
 		    truncated = EXCLUDED.truncated,
 		    title = EXCLUDED.title,
+		    needs_replay = false,
 		    updated_at = now()
 		WHERE EXCLUDED.created_at > relay_config_heads.created_at
 		   OR (
@@ -119,11 +120,21 @@ func deletionBlocks(ctx context.Context, tx pgx.Tx, pubkey string, kind int, dTa
 		}
 		return false, fmt.Errorf("check event deletion: %w", err)
 	}
-	err = tx.QueryRow(ctx, `
+	addressSQL := `
 		SELECT 1 FROM deletion_addresses
-		WHERE pubkey = $1 AND kind = $2 AND d_tag = $3 AND created_at >= $4
+		WHERE pubkey = $1 AND kind = $2 AND created_at >= $4 AND d_tag = $3
 		LIMIT 1
-	`, pubkey, kind, dTag, createdAt).Scan(&one)
+	`
+	addressArgs := []any{pubkey, kind, dTag, createdAt}
+	if !AddressableKind(kind) {
+		addressSQL = `
+			SELECT 1 FROM deletion_addresses
+			WHERE pubkey = $1 AND kind = $2 AND created_at >= $3
+			LIMIT 1
+		`
+		addressArgs = []any{pubkey, kind, createdAt}
+	}
+	err = tx.QueryRow(ctx, addressSQL, addressArgs...).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -172,11 +183,11 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		INSERT INTO relay_config_heads (
 			pubkey, source_kind, d_tag, event_id, created_at,
 			explicitly_empty, client_side_only, declaration_source,
-			invalid_endpoint_count, truncated, title
+			invalid_endpoint_count, truncated, title, needs_replay
 		) VALUES (
 			$1, $2, '', $3, $4,
 			true, false, $5,
-			0, false, ''
+			0, false, '', false
 		)
 		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
 		SET event_id = EXCLUDED.event_id,
@@ -185,6 +196,7 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		    declaration_source = EXCLUDED.declaration_source,
 		    invalid_endpoint_count = 0,
 		    truncated = false,
+		    needs_replay = false,
 		    updated_at = now()
 		WHERE EXCLUDED.created_at > relay_config_heads.created_at
 		   OR (

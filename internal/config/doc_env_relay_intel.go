@@ -6,7 +6,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_ENABLED",
 			Runtimes:     []string{"api", "worker"},
 			DefaultValue: "true",
-			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Turning this off also stops role-row projection. Canonical replaceable-state updates keep running. Apply migration 000133 before running a binary that projects role rows.",
+			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Turning this off also stops role-row projection, statistics, and backfill. Canonical replaceable-state updates, historical tie repair, and deletion-address backfill keep running. Apply migration 000133 before running a binary that projects role rows.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROJECTION_ENABLED",
@@ -36,7 +36,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_BACKFILL_ENABLED",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "true",
-			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again.",
+			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. Turning this off does not stop historical tie repair or deletion-address backfill. Re-enabling it walks relay heads that are missing or stale.",
 		},
 		{
 			Name:         "RELAY_INTEL_BACKFILL_BATCH",
