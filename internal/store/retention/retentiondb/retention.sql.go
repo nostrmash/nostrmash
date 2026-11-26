@@ -645,6 +645,29 @@ candidates AS (
             OR (j.status = 'dead' AND j.updated_at > $4)
           )
       )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM replaceable_state rs
+        WHERE rs.pubkey = e.pubkey
+          AND rs.kind = e.kind
+          AND rs.created_at = e.created_at
+          AND rs.event_id > e.id
+          AND rs.d_tag = COALESCE((
+            SELECT et.value
+            FROM event_tags et
+            WHERE et.event_id = e.id
+              AND et.tag_name = 'd'
+              AND et.value_index = 0
+            ORDER BY et.tag_index ASC
+            LIMIT 1
+          ), '')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM relay_intel_repairs repair
+        WHERE repair.winner_event_id = e.id
+          AND repair.status = 'pending'
+      )
     ORDER BY p.created_at ASC, p.event_id ASC
     LIMIT $1
 ),

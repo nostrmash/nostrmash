@@ -3,6 +3,7 @@ package relayintel
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -33,25 +34,103 @@ type sourceNote struct {
 	reason Reason
 }
 
+// SourceReport is the locally known relationship between a projection head
+// and the canonical replaceable winner.
+type SourceReport struct {
+	Kind              int    `json:"kind"`
+	DTag              string `json:"d_tag,omitempty"`
+	ProjectionEventID string `json:"projection_event_id,omitempty"`
+	CanonicalEventID  string `json:"canonical_event_id,omitempty"`
+	Status            string `json:"status"`
+	RequiresRefresh   bool   `json:"requires_refresh"`
+	Note              string `json:"note,omitempty"`
+}
+
+func sourceReports(before []Head, resolved map[string]resolvedSource, notes []sourceNote) []SourceReport {
+	projection := map[string]string{}
+	for _, head := range before {
+		projection[sourceKey(head.SourceKind, head.DTag)] = head.EventID
+	}
+	noteBy := map[string]Reason{}
+	for _, note := range notes {
+		noteBy[sourceKey(note.kind, note.dTag)] = note.reason
+	}
+	keys := map[string]struct{}{}
+	for key := range projection {
+		keys[key] = struct{}{}
+	}
+	for key := range resolved {
+		keys[key] = struct{}{}
+	}
+	out := make([]SourceReport, 0, len(keys))
+	for key := range keys {
+		kind, dTag, ok := splitSourceKey(key)
+		if !ok {
+			continue
+		}
+		item := resolved[key]
+		status, refresh := "current", false
+		if reason, found := noteBy[key]; found {
+			switch reason.Code {
+			case "projection_stale":
+				status, refresh = "stale", true
+			case "projection_missing":
+				status, refresh = "missing", true
+			case "source_deleted":
+				status, refresh = "deleted", true
+			case "source_too_large":
+				status, refresh = "too_large", true
+			case "source_unreadable":
+				status, refresh = "unreadable", true
+			case "stale_source":
+				status, refresh = "stale_client", true
+			}
+		}
+		canonical := item.EventID
+		if projection[key] != "" && canonical != "" && projection[key] != canonical && status == "current" {
+			status, refresh = "stale", true
+		}
+		if projection[key] == "" && canonical != "" && status == "current" {
+			status, refresh = "missing", true
+		}
+		text := ""
+		if reason, found := noteBy[key]; found {
+			text = reason.Text
+		}
+		out = append(out, SourceReport{
+			Kind: kind, DTag: dTag, ProjectionEventID: projection[key], CanonicalEventID: canonical,
+			Status: status, RequiresRefresh: refresh, Note: text,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind == out[j].Kind {
+			return out[i].DTag < out[j].DTag
+		}
+		return out[i].Kind < out[j].Kind
+	})
+	return out
+}
+
 type deletionView struct {
 	ByEvent map[string]bool
 	ByCoord map[string]int64
 }
 
-func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[string]SourceEvent) (AccountConfig, map[string]resolvedSource, []sourceNote, error) {
+func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[string]SourceEvent) (AccountConfig, map[string]resolvedSource, []sourceNote, []SourceReport, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	heads, members, err := loadAccount(ctx, tx, pubkey)
 	if err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
 	winners, err := loadCanonical(ctx, tx, pubkey)
 	if err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
+	original := append([]Head(nil), heads...)
 	heads, canonNotes := preferCanonical(heads, winners)
 	ids := make([]string, 0, len(heads)+len(client))
 	for _, head := range heads {
@@ -66,18 +145,18 @@ func (s *Service) resolveAccount(ctx context.Context, pubkey string, client map[
 	}
 	indexed, err := loadEventRaw(ctx, tx, ids)
 	if err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
 	deleted, err := loadDeletions(ctx, tx, pubkey, ids)
 	if err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return AccountConfig{}, nil, nil, err
+		return AccountConfig{}, nil, nil, nil, err
 	}
 	account, resolved, notes := applyAuthoritative(pubkey, heads, members, indexed, client, deleted)
 	notes = append(notes, canonNotes...)
-	return account, resolved, notes, nil
+	return account, resolved, notes, sourceReports(original, resolved, notes), nil
 }
 
 type canonicalWinner struct {
@@ -443,7 +522,6 @@ func mergeKeyPackageConstraints(c *Constraints) []Reason {
 			smaller = *ob.Max
 		}
 		ob.Max = &smaller
-		notes = append(notes, Reason{Code: "shared_constraint_conflict", Text: "The public outbox and KeyPackage roles asked for different maximum sizes. The smaller maximum was used."})
 	case kp.Max != nil && ob.Max == nil:
 		value := *kp.Max
 		ob.Max = &value
@@ -453,10 +531,6 @@ func mergeKeyPackageConstraints(c *Constraints) []Reason {
 	} else if kp.Min != nil && (ob.Min == nil || *kp.Min > *ob.Min) {
 		value := *kp.Min
 		ob.Min = &value
-	}
-	if kp.MinCapabilityConfidence != nil && (ob.MinCapabilityConfidence == nil || *kp.MinCapabilityConfidence > *ob.MinCapabilityConfidence) {
-		value := *kp.MinCapabilityConfidence
-		ob.MinCapabilityConfidence = &value
 	}
 	if kp.MinReliability != nil && (ob.MinReliability == nil || *kp.MinReliability > *ob.MinReliability) {
 		value := *kp.MinReliability

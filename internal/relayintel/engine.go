@@ -29,6 +29,7 @@ type Constraints struct {
 	MinReliability          float64
 	MinCapabilityConfidence float64
 	Diversity               *float64
+	RequireDiversity        bool
 	RetainExisting          *bool
 	Weights                 Weights
 	HasWeights              bool
@@ -52,6 +53,7 @@ type RoleConstraints struct {
 	MinReliability          *float64
 	MinCapabilityConfidence *float64
 	Diversity               *float64
+	RequireDiversity        *bool
 	RetainExisting          *bool
 	Weights                 *Weights
 }
@@ -118,15 +120,16 @@ type Proposal struct {
 // PlanResponse is a full optimization for one pubkey.
 type PlanResponse struct {
 	Meta
-	Pubkey               string       `json:"pubkey"`
-	Preset               string       `json:"preset"`
-	PresetVersion        string       `json:"preset_version"`
-	Cohort               CohortReport `json:"cohort"`
-	Roles                []RolePlan   `json:"roles"`
-	Proposal             Proposal     `json:"proposal"`
-	ConstraintsSatisfied bool         `json:"constraints_satisfied"`
-	Unsatisfied          []Reason     `json:"unsatisfied_constraints,omitempty"`
-	Shared               []SharedRole `json:"shared_configuration,omitempty"`
+	Pubkey               string         `json:"pubkey"`
+	Preset               string         `json:"preset"`
+	PresetVersion        string         `json:"preset_version"`
+	Cohort               CohortReport   `json:"cohort"`
+	Sources              []SourceReport `json:"sources,omitempty"`
+	Roles                []RolePlan     `json:"roles"`
+	Proposal             Proposal       `json:"proposal"`
+	ConstraintsSatisfied bool           `json:"constraints_satisfied"`
+	Unsatisfied          []Reason       `json:"unsatisfied_constraints,omitempty"`
+	Shared               []SharedRole   `json:"shared_configuration,omitempty"`
 }
 
 // SharedRole says two roles are one underlying list.
@@ -169,7 +172,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		}
 	}
 
-	account, resolved, sourceNotes, err := s.resolveAccount(ctx, req.Pubkey, sources)
+	account, resolved, sourceNotes, reports, err := s.resolveAccount(ctx, req.Pubkey, sources)
 	if err != nil {
 		return PlanResponse{}, err
 	}
@@ -250,6 +253,7 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			Size: cohort.Size, Truncated: cohort.Truncated, TrustData: cohort.Trusted,
 			Used: "personalized",
 		},
+		Sources:  reports,
 		Proposal: Proposal{Note: "Unsigned preview. This server does not sign or publish. The client sets created_at, id, and sig, then checks propagation with POST /api/v1/relays/verify."},
 	}
 	if !statsReady {
@@ -612,6 +616,9 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		selection.Selected, _ = keepInvestigations(selection.Selected, preview, scoredByURL)
 		selection = reconcileSelection(selection, scoredByURL, roleMembers, maxCount)
 		selection = auditSelection(selection, scored, pinnedURLs(pinned), minCount, maxCount, diversity, rc)
+		if role == RolePublicOutbox {
+			selection = auditKeyPackageCapability(selection, scored, req.Constraints)
+		}
 		recs := BuildRecommendations(role, current.Relays, selection.Selected, scoredByURL, down)
 		if role == RoleFavorite || role == RoleRelaySet || role == RoleDMInbox || role == RoleKeyPackage {
 			for i := range recs {
@@ -973,6 +980,9 @@ func (c Constraints) forRole(role string) Constraints {
 	if item.Diversity != nil {
 		out.Diversity = item.Diversity
 	}
+	if item.RequireDiversity != nil {
+		out.RequireDiversity = *item.RequireDiversity
+	}
 	if item.RetainExisting != nil {
 		out.RetainExisting = item.RetainExisting
 	}
@@ -1153,10 +1163,6 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 			selection.ConstraintsSatisfied = false
 			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "min_capability_confidence", Text: "A selected relay is below the requested capability confidence."})
 		}
-		if rc.FreeOnly && relay.PaidAccess && !reasonCodeOn(selection.Unsatisfied, "payment_required") {
-			selection.ConstraintsSatisfied = false
-			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "payment_required", Text: "A selected relay requires payment and the request asked for free relays."})
-		}
 	}
 	for _, pin := range pins {
 		if _, ok := chosen[pin]; !ok {
@@ -1174,9 +1180,16 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 		selection.ConstraintsSatisfied = false
 		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "retained_over_max", Text: "The final list is longer than the requested maximum."})
 	}
-	if diversity > 0 && diversity < 1 && len(selection.Selected) >= 2 && concentrated(selection.Selected, byURL) && diverseAlternative(selection.Selected, byURL) && !reasonCodeOn(selection.Unsatisfied, "operator_concentration") {
-		selection.ConstraintsSatisfied = false
-		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "operator_concentration", Text: "The final list uses one operator even though a different eligible operator was available."})
+	if diversity > 0 && diversity < 1 && len(selection.Selected) >= 2 && concentrated(selection.Selected, byURL) && diverseAlternative(selection.Selected, byURL) {
+		reason := Reason{Code: "operator_concentration", Text: "The final list uses one operator even though a different eligible operator was available. Diversity stays a preference unless require_operator_diversity is set."}
+		if rc.RequireDiversity {
+			if !reasonCodeOn(selection.Unsatisfied, "operator_concentration") {
+				selection.ConstraintsSatisfied = false
+				selection.Unsatisfied = append(selection.Unsatisfied, reason)
+			}
+		} else if !reasonCodeOn(selection.Qualifications, "operator_concentration") {
+			selection.Qualifications = append(selection.Qualifications, reason)
+		}
 	}
 	if thin {
 		selection.IndependentlySatisfied = false
@@ -1247,11 +1260,42 @@ func capabilityConfidence(role string, caps map[string]Capability) float64 {
 		return caps[CapSearch].Confidence
 	case RoleDMInbox:
 		return caps[CapGiftWrap].Confidence
-	case RolePublicOutbox, RoleKeyPackage:
+	case RoleKeyPackage:
+		return caps[CapKeyPackage].Confidence
+	case RolePublicOutbox:
 		return caps[CapWriteRetrieve].Confidence
 	default:
 		return caps[CapRead].Confidence
 	}
+}
+
+// auditKeyPackageCapability checks Marmot transport on the shared outbox.
+// Kind 1 write confidence is not a substitute.
+func auditKeyPackageCapability(selection SelectResult, scored []ScoredRelay, constraints Constraints) SelectResult {
+	item, ok := constraints.ByRole[RoleKeyPackage]
+	if !ok || item.MinCapabilityConfidence == nil || *item.MinCapabilityConfidence <= 0 {
+		return selection
+	}
+	minConfidence := *item.MinCapabilityConfidence
+	byURL := map[string]ScoredRelay{}
+	for _, relay := range scored {
+		byURL[relay.URL] = relay
+	}
+	for _, chosen := range selection.Selected {
+		relay, found := byURL[chosen.URL]
+		kp := relay.Capabilities[CapKeyPackage]
+		if !found || kp.Status != StatusVerified || kp.Confidence < minConfidence {
+			selection.ConstraintsSatisfied = false
+			selection.IndependentlySatisfied = false
+			if !reasonCodeOn(selection.Unsatisfied, "keypackage_unverified") {
+				selection.Unsatisfied = append(selection.Unsatisfied, Reason{
+					Code: "keypackage_unverified",
+					Text: "KeyPackage transport is not verified at the requested confidence. Public event publishing was not used as a substitute.",
+				})
+			}
+		}
+	}
+	return selection
 }
 
 func validAuth(value string) bool {
