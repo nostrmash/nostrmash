@@ -1,12 +1,93 @@
 # Relay intelligence measurements
 
-Final measurements were executed on 26 November 2026 against implementation `3163b9d50d8a3acd432e069da25eda5e49606bf8` (`origin/feat/relay-capability-probes`, "Merge branch 'fix/relay-intelligence' into feat/relay-capability-probes"). That commit includes the shared identity epoch and atomic probe completion. `git rev-parse HEAD` at the start of the run was `ed19d29d926e8692f7cc8a3df3424caef0f9fab4`, which is the merge of that implementation into this branch. The JSON `commit` field is that parent. The benchmark tooling and these result files are commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`.
+## Final integrated run
 
-Two later commits remain only on `origin/fix/relay-intelligence` and are not in this measurement: `e8d305096c3612b16f8bc1f01de785034001d78c` (deleted-event canonical repair) and `90eaa83fa5f63d94564756225444542fdc819fcf` (OpenAPI optimizer checks). Their migration is also numbered `000144`, which already belongs to `000144_relay_probe_evidence_fence.sql` on the capability branch.
+The account-scale run against the indexed retention implementation has not been executed.
 
-The earlier 10,000- and 100,000-account run, against `16d258aea7582cca13a1a1d2fa053af5ad6f4e61`, is preserved under `benchmarks/relay-intelligence/operational/historical/16d258aea7582cca13a1a1d2fa053af5ad6f4e61/` and in the historical sections below. Those numbers are not relabeled as the final implementation.
+On 26 November 2026 the capability tip was `caaef7b2ad005ca56c17ecf288c72d9f169f58b3` ("Keep incomplete gift-wrap checks unknown and identify completions by their result"). The reviewed core commit `31df4c808129f633593d7bcd605cb178dad40727` ("Keep a deleted projection from hiding the remaining canonical winner") is the tip of `origin/fix/relay-intelligence` and is not an ancestor of `origin/feat/relay-capability-probes`. That core commit adds `relay_config_heads.membership_count`, the membership digest, and the four event-id indexes. Its migration is numbered `000145_relay_intel_membership_and_retention.sql`. The capability branch already uses `000145` for `000145_relay_probe_evidence_fence.sql`, so the benchmark branch does not renumber or apply that migration itself.
 
-Final artifacts:
+Attempted check:
+
+```sh
+git fetch origin feat/relay-capability-probes fix/relay-intelligence
+git merge-base --is-ancestor 31df4c808129f633593d7bcd605cb178dad40727 origin/feat/relay-capability-probes
+```
+
+The ancestor check failed. The account-scale command was then run and refused:
+
+```sh
+scripts/relay_intel_operational_bench.sh
+```
+
+```text
+commit e08c441f8cbef2b299a3af4459813c79886a4609
+implementation caaef7b2ad005ca56c17ecf288c72d9f169f58b3
+core 31df4c808129f633593d7bcd605cb178dad40727
+core not incorporated 31df4c808129f633593d7bcd605cb178dad40727
+refusing the account-scale benchmark until that core commit is in HEAD
+```
+
+Exit status 1. No 10,000-account or 100,000-account fixture was seeded for this sign-off. The 870 ms and 7,995 ms purge figures remain the unindexed measurements from `3163b9d50d8a3acd432e069da25eda5e49606bf8`. There is no indexed account-scale after number.
+
+Benchmark tooling commit: `e08c441f8cbef2b299a3af4459813c79886a4609`.
+Capability commit incorporated into that tooling: `caaef7b2ad005ca56c17ecf288c72d9f169f58b3`.
+Core commit required before the account-scale run: `31df4c808129f633593d7bcd605cb178dad40727`.
+
+Tagged compile, which ordinary CI does not perform:
+
+```sh
+RELAY_INTEL_OPERATIONAL_COMPILE=1 scripts/relay_intel_operational_bench.sh
+```
+
+That command printed `tagged compile ok` and exited 0.
+
+What stays unmeasured until the capability branch contains `31df4c8`:
+
+- Indexed purge latency, trigger time, buffers, WAL, and index use at 10,000 and 100,000 accounts.
+- Populated index-build duration, index size, WAL, and lock wait. The benchmark drops and recreates the four indexes on the disposable schema after seeding. That code path did not run.
+- Historical heads with `membership_count = -1`. The column is absent, so discovery and reconciliation throughput are not reported.
+- API, optimization, statistics refresh, burst derivation, and storage on the integrated schema.
+- Whether a four-request optimize limit exists. `PostRelayOptimize` in this tree has no concurrency limit. The overload scenario is implemented and was not executed.
+
+The previous unindexed account-scale artifacts are preserved at `benchmarks/relay-intelligence/operational/historical/3163b9d50d8a3acd432e069da25eda5e49606bf8/` and are still the files in `benchmarks/relay-intelligence/operational/results-*.json` and `plans-*.txt`. The sections from "Previous measurements (3163b9d)" through the 16d258a history describe that run.
+
+## Completion digest measurement
+
+This measurement uses the completion-digest implementation in `caaef7b2ad005ca56c17ecf288c72d9f169f58b3`. Core commit `31df4c8` does not change `internal/relayintel/probe.go`. The run is an empty disposable schema, not the account fixture. Raw output: `benchmarks/relay-intelligence/operational/probe-completion.json`. The JSON `commit` field is tooling commit `e08c441f8cbef2b299a3af4459813c79886a4609`.
+
+```sh
+export TEST_DATABASE_URL=postgres://nostrmash:nostrmash@127.0.0.1:5432/nostrmash?sslmode=disable
+export RELAY_INTEL_OPERATIONAL_PROBE_ONLY=1
+go test -tags relayintelbench ./internal/api/ -run TestOperationalProbeCompletion -count=1 -timeout 20m
+```
+
+Every row below was accepted. Public-write and search go through `publishProbe`. The other completions call `commitProbeResult`. No path dialed a relay.
+
+| Operation | Result | Wall |
+|---|---|---:|
+| Public write | finished, lease removed, 64-hex digest stored | 9.985 ms |
+| Search | one sample | 2.651 ms |
+| Gift-wrap, seven writes | committed, evidence version 2 | 11.861 ms |
+| Structured privacy read | `recipient_only_verified`, comprehensive | 3.773 ms |
+| Retention follow-up scheduled | one pending row | 3.657 ms |
+| Retention follow-up completed | status `completed` | 3.177 ms |
+| Identical replay, same observation time | `already_completed`, one sample | 1.503 ms |
+| Same status, different observation | rejected, one sample kept | 0.928 ms |
+| Different status | rejected | 0.767 ms |
+| Expired lease | rejected, zero samples | 0.873 ms |
+| Eight identical concurrent completions | one commit, seven `already_completed`, one sample | 12.183 ms |
+
+`resultDigest` over 1,000 iterations took 1.344 µs per call. The stored digest is 64 hex characters and 65 bytes on the attempt row. The seven gift-wrap sample rows occupy 1,064 bytes. That hash cost does not account for the commit wall time. Identical replay matches only when the observation time is the same value that was stored. A second submission with the same status and a different observation detail is a conflict.
+
+The 3163b9d completion table below predates this digest. Use this table for the digest implementation.
+
+## Previous measurements (3163b9d)
+
+These measurements were executed on 26 November 2026 against implementation `3163b9d50d8a3acd432e069da25eda5e49606bf8`. `git rev-parse HEAD` at the start of that run was `ed19d29d926e8692f7cc8a3df3424caef0f9fab4`. The result files were committed in `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. They predate the completion digest and the retention indexes. Copies are in `benchmarks/relay-intelligence/operational/historical/3163b9d50d8a3acd432e069da25eda5e49606bf8/`.
+
+The earlier 10,000- and 100,000-account run, against `16d258aea7582cca13a1a1d2fa053af5ad6f4e61`, is preserved under `benchmarks/relay-intelligence/operational/historical/16d258aea7582cca13a1a1d2fa053af5ad6f4e61/` and in the historical sections below.
+
+Previous artifacts, still the files in the operational directory until the indexed run replaces them:
 
 - `benchmarks/relay-intelligence/operational/results-small.json`
 - `benchmarks/relay-intelligence/operational/results-medium.json`
@@ -15,9 +96,9 @@ Final artifacts:
 
 A 500,000-account run was not executed.
 
-## How to reproduce the final run
+## How to reproduce the 3163b9d run
 
-The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
+The current `scripts/relay_intel_operational_bench.sh` refuses this run until core commit `31df4c808129f633593d7bcd605cb178dad40727` is in HEAD. The command below is how the 3163b9d results were produced, at tooling commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
 
 ```sh
 docker compose -p nostrmash up -d --no-deps postgres meilisearch
@@ -39,7 +120,7 @@ Both scales took 17 minutes 41 seconds of test time (334s at 10,000 accounts, 72
 
 ## Environment
 
-Same host and Postgres settings as the historical run. Recorded again in the final JSON.
+Same host and Postgres settings as the 16d258a run. Recorded in the 3163b9d JSON.
 
 | Item | Value |
 |---|---|
@@ -104,7 +185,7 @@ Relay Intelligence samples in the same windows, which mix dense recommendations 
 
 WAL for the three refresh passes was 132 MB, 24 MB, and 32 MB. The first pass is an outlier next to the Relay Intelligence passes that skipped the refresh (48 MB, 27 MB, 22 MB). Baseline passes were 5–10 MB. Do not treat 132 MB as the steady refresh cost.
 
-This offered rate does not saturate derivation. Every scenario derived all 200 events. The historical burst, which showed about 17–20% lower derivation throughput with projection on, was not repeated on the final code. The final run answers a different question: a real 27 s refresh overlapped sustained ingest and API traffic without a separate latency spike.
+This offered rate does not saturate derivation. Every scenario derived all 200 events. The historical burst, which showed about 17–20% lower derivation throughput with projection on, was not repeated on 3163b9d. This run answers a different question: a real 27 s refresh overlapped sustained ingest and API traffic without a separate latency spike.
 
 Incremental aggregation is not justified by this measurement. The refresh remains acceptable at 1.10 million effective memberships on a 10 minute interval. A loaded refresh already reaches 28 s, so an alert at 30 s would fire on this fixture. Investigate `last_duration_ms` above 45 s. That threshold is an estimate above the measured 28 s, not a failure that was observed.
 
@@ -129,7 +210,7 @@ No change to the exclusion rule is recommended. An in-process epoch cache would 
 
 ## Atomic probe completion
 
-There is no completion digest in this implementation.
+These 3163b9d figures predate `result_digest`. The digest measurement is in "Completion digest measurement" above.
 
 Public-write and search completion call `publishProbe`. Gift-wrap, retention scheduling, retention completion, replay, conflict, expired-lease rejection, and concurrent completion call `commitProbeResult`, which `publishProbe` and gift-wrap storage both call. Neither path dialed a relay. Every listed outcome was accepted at both scales.
 
@@ -151,7 +232,7 @@ Public-write and search completion call `publishProbe`. Gift-wrap, retention sch
 
 ## Optimization cost
 
-Single-request medians on the final code match the historical run. At 100,000 accounts, sparse optimize was 12 ms, multi-role 26 ms, dense cohort 83 ms, and maximum-list 151 ms. Maximum-list allocation stayed about 27 MB per request. Dense and maximum-list requests still issue 32 and 48 statements.
+Single-request medians on 3163b9d match the 16d258a run. At 100,000 accounts, sparse optimize was 12 ms, multi-role 26 ms, dense cohort 83 ms, and maximum-list 151 ms. Maximum-list allocation stayed about 27 MB per request. Dense and maximum-list requests still issue 32 and 48 statements.
 
 Concurrent waves of four requests, same fixture:
 
@@ -168,15 +249,15 @@ Query count scales with the number of requests. There is no extra per-request SQ
 
 Existing profile and event handlers were unchanged in shape: profile median 0.43 ms, event median 2.87 ms, at 100,000 accounts.
 
-## Final operational recommendations
+## Recommendations from the 3163b9d run
 
-Measured conclusions are separated from estimates.
+These settings come from the unindexed run. They are not reissued as the indexed-retention sign-off. Retention batch size stays at or below 25 until the indexed purge is measured at 100,000 accounts. The other starting values are unchanged because the integrated schema was not measured.
 
 | Setting | Recommendation |
 |---|---|
-| Projection | Leave it on for the initial rollout. At 6.7 events/s the final code derived every event with projection on or off, with no lock waits and no pool exhaustion. The historical 17–20% derivation-capacity loss was a burst on the previous implementation and was not remeasured here. |
+| Projection | Leave it on for the initial rollout. At 6.7 events/s the 3163b9d code derived every event with projection on or off, with no lock waits and no pool exhaustion. The historical 17–20% derivation-capacity loss was a burst on 16d258a and was not remeasured here. |
 | Statistics interval | Keep 10 minutes. Idle refresh is 17.6 s and a refresh under this sustained load is 27–28 s at 1.10 million effective memberships. Incremental aggregation is not justified by the latency impact, which was not visible in the before/during/after split. |
-| Backfill | Keep batch 200 and a 5 second interval only while the reconcile cursor is idle. The final plan for an empty reconcile of the medium replaceable set was 590 ms. Do not reset that cursor on a timer. |
+| Backfill | Keep batch 200 and a 5 second interval only while the reconcile cursor is idle. The 3163b9d plan for an empty reconcile of the medium replaceable set was 590 ms. Do not reset that cursor on a timer. |
 | Historical repair | Keep the cursor and the hour idle. This was not the retention bottleneck. |
 | Reconcile frequency | The 15 minute idle after a short page stays appropriate. |
 | Retention batch | Until the missing foreign-key indexes exist, keep the batch at or below 25. A batch of 100 held the statement for 8.0 s at 100,000 accounts. The interval can stay on the existing maintenance tick after the indexes land. Raising the batch before that is not supported. |
@@ -186,9 +267,9 @@ Measured conclusions are separated from estimates.
 | Probe budget and cooldown | Unchanged. Claim cost is not a reason to raise public-relay budgets. The per-host cap stays 4/hour. The long cooldown still rejects an expired lease. Active probes stay disabled for the initial core rollout. |
 | Evidence and identity retention | Attempts still age out at 7 days inside the claim function. Samples stay bounded by the probe budget. Identities are one row per probe key. The epoch row is a single shared counter. |
 
-## Remaining limitations
+## Remaining limitations of the 3163b9d run
 
-- `e8d3050` and `90eaa83` are not in the measured tree.
+- The indexed account-scale run is blocked on core commit `31df4c808129f633593d7bcd605cb178dad40727` not yet being on the capability branch. `e8d3050` and `90eaa83` are now ancestors of capability tip `caaef7b`, through merge `e52a24d`. They were not in the 3163b9d measurement.
 - 500,000 accounts was not run.
 - PostgreSQL shared buffers were not flushed.
 - The mixed workload was paced at about 6.7 events/s. It does not replace the historical saturating burst.
