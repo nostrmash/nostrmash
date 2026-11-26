@@ -66,11 +66,21 @@ func (h *Handlers) RefreshEcosystemDailyRollup(ctx context.Context) error {
 					JOIN events e2 ON e2.id = er2.event_id
 					WHERE er2.seen_at >= $1::date
 					  AND er2.seen_at < $1::date + interval '1 day'
+					  AND NOT EXISTS (
+					      SELECT 1 FROM relay_probe_identities spi
+					      WHERE spi.pubkey = e2.pubkey
+					        AND (spi.expires_at IS NULL OR spi.expires_at > now())
+					  )
 					GROUP BY er2.relay_url, e2.kind
 				) per_kind
 				GROUP BY per_kind.relay_url
 			) kind_mix ON kind_mix.relay_url = er.relay_url
 			WHERE er.seen_at >= $1::date AND er.seen_at < $1::date + interval '1 day'
+			  AND NOT EXISTS (
+			      SELECT 1 FROM relay_probe_identities spi
+			      WHERE spi.pubkey = e.pubkey
+			        AND (spi.expires_at IS NULL OR spi.expires_at > now())
+			  )
 			GROUP BY er.relay_url, kind_mix.mix
 			ON CONFLICT (day, relay_url) DO UPDATE
 			SET events_seen = EXCLUDED.events_seen,
@@ -91,7 +101,13 @@ func (h *Handlers) RefreshEcosystemDailyRollup(ctx context.Context) error {
 			JOIN event_relays b
 			  ON b.event_id = a.event_id
 			 AND b.relay_url > a.relay_url
+			JOIN events overlap_event ON overlap_event.id = a.event_id
 			WHERE a.seen_at >= $1::date
+			  AND NOT EXISTS (
+			      SELECT 1 FROM relay_probe_identities spi
+			      WHERE spi.pubkey = overlap_event.pubkey
+			        AND (spi.expires_at IS NULL OR spi.expires_at > now())
+			  )
 			  AND a.seen_at < $1::date + interval '1 day'
 			  AND b.seen_at >= $1::date
 			  AND b.seen_at < $1::date + interval '1 day'

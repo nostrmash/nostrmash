@@ -23,8 +23,14 @@ func (h *Handlers) SyncMeilisearch(ctx context.Context, eventID string) error {
 		return fmt.Errorf("event id is required")
 	}
 	var pubkey string
-	if err := h.pool.QueryRow(ctx, `SELECT pubkey FROM events WHERE id = $1`, eventID).Scan(&pubkey); err == nil && relayintel.SyntheticAuthor(ctx, h.pool, pubkey) {
-		return nil
+	if err := h.pool.QueryRow(ctx, `SELECT pubkey FROM events WHERE id = $1`, eventID).Scan(&pubkey); err == nil {
+		synthetic, lookupErr := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+		if lookupErr != nil {
+			return fmt.Errorf("synthetic identity: %w", lookupErr)
+		}
+		if synthetic {
+			return nil
+		}
 	}
 	started := time.Now()
 	if err := h.meili.SyncEvent(ctx, h.pool, eventID); err != nil {
