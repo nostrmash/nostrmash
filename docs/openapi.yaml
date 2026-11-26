@@ -786,8 +786,10 @@ paths:
             Advertised, observed, verified, unsupported, unknown, stale, and
             restricted capabilities. A successful kind-0 EOSE is read_subscription
             only. NIP-11 support for NIP-17, NIP-42, or NIP-50 is advertised,
-            not verified. giftwrap is verified only when a synthetic recipient
-            retrieved the event and a completed observer query did not.
+            not verified. giftwrap_private is comprehensive only at evidence version 2,
+            after the recipient exact-id and recipient-tag subscriptions
+            retrieve the event while authenticated and the observer and
+            anonymous paths do not. A nil privacy boolean is unknown, not false.
             giftwrap_accept, giftwrap_private, and giftwrap_public are separate.
             A kind 1 write does not verify keypackage. This request performs no network I/O.
           content:
@@ -799,14 +801,24 @@ paths:
                   search: { status: advertised, confidence: 0.4, source: nip11, detail: "NIP-50 is advertised and has not been verified" }
                   giftwrap: { status: unknown, confidence: 0.15, source: none }
                 privacy:
-                  assessment: privacy_unknown
-                  recipient_retrieval_verified: false
-                  gift_wrap_accepted: false
-                  exposure_confirmed: false
-                  exposure_unresolved: false
-                  recipient_auth_verified: false
-                  publication_auth_verified: false
+                  assessment: publicly_accessible
+                  recipient_retrieval_verified: true
+                  gift_wrap_accepted: true
+                  exposure_confirmed: true
+                  exposure_unresolved: true
+                  recipient_auth_verified: true
+                  publication_auth_verified: null
                   stale: false
+                  confidence: 0.8
+                  freshness: fresh
+                  evidence_version: 2
+                  recipient_exact_verified: true
+                  recipient_tag_verified: true
+                  unauthenticated_exposure: true
+                  authenticated_observer_exposure: false
+                  comprehensive: false
+                  access_paths:
+                    - { name: recipient_exact, status: verified, retrieved: true, unauthenticated: true, authenticated: true, confidence: 0.7, freshness: fresh }
         '400':
           $ref: '#/components/responses/Error'
         '404':

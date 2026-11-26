@@ -82,19 +82,34 @@ func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minIn
 	}, pub, nil
 }
 
-// Once probes at most one approved relay.
+// Once probes at most one approved relay. Retention follow-ups take one turn
+// in four so they cannot occupy every cycle while publication work is waiting.
 func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 	if p == nil || pool == nil {
 		return nil
 	}
 	p.turn++
-	if followed, err := p.followOne(ctx, pool); err != nil || followed {
+	followFirst := p.turn%4 == 0
+	if followFirst {
+		if followed, err := p.followOne(ctx, pool); err != nil || followed {
+			return err
+		}
+	}
+	if ran, err := p.probePrimary(ctx, pool); err != nil || ran {
 		return err
 	}
+	if !followFirst {
+		_, err := p.followOne(ctx, pool)
+		return err
+	}
+	return nil
+}
+
+func (p *probeState) probePrimary(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	if p.giftwrap && p.turn%2 == 0 {
 		probed, err := p.probeOneGiftWrap(ctx, pool)
 		if err != nil || probed {
-			return err
+			return probed, err
 		}
 	}
 	rows, err := pool.Query(ctx, `
@@ -122,7 +137,7 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		LIMIT 50
 	`, p.allowlist, int(p.minInterval.Seconds()))
 	if err != nil {
-		return wrapDB(err)
+		return false, wrapDB(err)
 	}
 	defer rows.Close()
 	type candidate struct{ url, key, role string }
@@ -130,13 +145,15 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 	for rows.Next() {
 		var item candidate
 		if err := rows.Scan(&item.url, &item.key, &item.role); err != nil {
-			return err
+			return false, err
 		}
 		picks = append(picks, item)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		rows.Close()
+		return false, err
 	}
+	rows.Close()
 	for _, item := range picks {
 		capability := CapWriteAccept
 		if item.role == RoleSearch {
@@ -149,19 +166,18 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		if !ok {
 			continue
 		}
+		var probeErr error
 		if item.role == RoleSearch {
-			p.search(ctx, pool, item.url, item.key, token)
+			probeErr = p.search(ctx, pool, item.url, item.key, token)
 		} else {
-			p.write(ctx, pool, item.url, item.key, token)
+			probeErr = p.write(ctx, pool, item.url, item.key, token)
 		}
-		p.finish(ctx, pool, token)
-		return nil
+		return true, probeErr
 	}
 	if p.giftwrap && p.turn%2 == 1 {
-		_, err = p.probeOneGiftWrap(ctx, pool)
-		return err
+		return p.probeOneGiftWrap(ctx, pool)
 	}
-	return nil
+	return false, nil
 }
 
 func (p *probeState) claim(ctx context.Context, pool *pgxpool.Pool, key, capability, host string) (string, bool) {
@@ -195,44 +211,82 @@ func (p *probeState) scheduleRetention(ctx context.Context, pool *pgxpool.Pool, 
 	`, key, relayURL, eventID, published.Add(time.Hour), published.UTC())
 }
 
+func (p *probeState) cleanupFollowups(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return nil
+	}
+	statements := []string{
+		`DELETE FROM relay_probe_followups
+		 WHERE id IN (
+		     SELECT id FROM relay_probe_followups
+		     WHERE finished_at IS NOT NULL AND finished_at < clock_timestamp() - interval '30 days'
+		     ORDER BY finished_at
+		     LIMIT 200
+		 )`,
+		`DELETE FROM relay_probe_identities
+		 WHERE pubkey IN (
+		     SELECT pubkey FROM relay_probe_identities
+		     WHERE expires_at IS NOT NULL AND expires_at < clock_timestamp()
+		     LIMIT 200
+		 )`,
+		`UPDATE relay_probe_followups
+		 SET status = 'failed', result = 'retry_exhausted', finished_at = clock_timestamp()
+		 WHERE id IN (
+		     SELECT f.id FROM relay_probe_followups f
+		     WHERE f.finished_at IS NULL
+		       AND f.attempts >= 8
+		       AND NOT EXISTS (
+		           SELECT 1 FROM relay_probe_leases l
+		           WHERE l.lease_token = f.lease_token
+		             AND f.lease_token <> ''
+		             AND l.expires_at > clock_timestamp()
+		       )
+		     LIMIT 200
+		 )`,
+		`UPDATE relay_probe_followups
+		 SET status = 'failed', result = 'observation_expired', finished_at = clock_timestamp()
+		 WHERE id IN (
+		     SELECT f.id FROM relay_probe_followups f
+		     WHERE f.finished_at IS NULL
+		       AND f.published_at IS NOT NULL
+		       AND f.published_at < clock_timestamp() - interval '7 days'
+		       AND NOT EXISTS (
+		           SELECT 1 FROM relay_probe_leases l
+		           WHERE l.lease_token = f.lease_token
+		             AND f.lease_token <> ''
+		             AND l.expires_at > clock_timestamp()
+		       )
+		     LIMIT 200
+		 )`,
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement); err != nil && !SchemaMissing(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	if p == nil || pool == nil {
 		return false, nil
 	}
-	_, _ = pool.Exec(ctx, `
-		DELETE FROM relay_probe_followups
-		WHERE id IN (
-			SELECT id FROM relay_probe_followups
-			WHERE finished_at IS NOT NULL AND finished_at < now() - interval '30 days'
-			LIMIT 200
-		)
-	`)
-	_, _ = pool.Exec(ctx, `
-		UPDATE relay_probe_followups
-		SET status = 'failed', result = 'retry_exhausted', finished_at = clock_timestamp()
-		WHERE finished_at IS NULL AND attempts >= 8
-	`)
-	_, _ = pool.Exec(ctx, `
-		UPDATE relay_probe_followups
-		SET status = 'failed', result = 'observation_expired', finished_at = clock_timestamp()
-		WHERE finished_at IS NULL
-		  AND published_at IS NOT NULL
-		  AND published_at < clock_timestamp() - interval '7 days'
-	`)
+	if err := p.cleanupFollowups(ctx, pool); err != nil {
+		return false, err
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var id int64
-	var relayURL, eventID, key, previousToken string
+	var relayURL, eventID, key, previousToken, followCapability string
 	var publishedAt, checkAfter *time.Time
 	var attempts int
 	err = tx.QueryRow(ctx, `
-		UPDATE relay_probe_followups
-		SET status = 'claimed', attempts = attempts + 1, claimed_at = clock_timestamp(), lease_token = ''
-		WHERE id = (
-			SELECT id FROM relay_probe_followups
+		WITH picked AS (
+			SELECT id, lease_token AS previous_token
+			FROM relay_probe_followups
 			WHERE finished_at IS NULL
 			  AND attempts < 8
 			  AND (published_at IS NULL OR published_at > clock_timestamp() - interval '7 days')
@@ -253,8 +307,12 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, endpoint_url, event_id, url_key, lease_token, published_at, check_after, attempts
-	`).Scan(&id, &relayURL, &eventID, &key, &previousToken, &publishedAt, &checkAfter, &attempts)
+		UPDATE relay_probe_followups f
+		SET status = 'claimed', claimed_at = clock_timestamp(), lease_token = ''
+		FROM picked
+		WHERE f.id = picked.id
+		RETURNING f.id, f.endpoint_url, f.event_id, f.url_key, picked.previous_token, f.published_at, f.check_after, f.attempts, f.capability
+	`).Scan(&id, &relayURL, &eventID, &key, &previousToken, &publishedAt, &checkAfter, &attempts, &followCapability)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) || SchemaMissing(err) {
 			return false, nil
@@ -278,8 +336,8 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_attempts
 			SET finished_at = clock_timestamp(), status = 'expired'
-			WHERE lease_token = $1 AND finished_at IS NULL
-		`, previousToken); err != nil {
+			WHERE lease_token = $1 AND url_key = $2 AND finished_at IS NULL
+		`, previousToken, key); err != nil {
 			return false, err
 		}
 	}
@@ -296,8 +354,9 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 	if token == "" {
 		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_followups
-			SET status = 'pending', lease_token = '', check_after = clock_timestamp() + interval '5 minutes'
-			WHERE id = $1 AND status = 'claimed'
+			SET status = 'pending', lease_token = '', deferrals = deferrals + 1,
+			    check_after = clock_timestamp() + interval '30 seconds'
+			WHERE id = $1 AND status = 'claimed' AND finished_at IS NULL
 		`, id); err != nil {
 			return false, err
 		}
@@ -309,15 +368,17 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE relay_probe_followups
-		SET status = 'running', lease_token = $2
-		WHERE id = $1 AND status = 'claimed'
-	`, id, token)
+		SET status = 'running', lease_token = $2, attempts = attempts + 1
+		WHERE id = $1 AND status = 'claimed' AND finished_at IS NULL
+		  AND url_key = $3 AND endpoint_url = $4 AND capability = $5
+	`, id, token, key, relayURL, followCapability)
 	if err != nil {
 		return false, err
 	}
 	if tag.RowsAffected() != 1 {
 		return false, fmt.Errorf("follow-up %d lost its claim", id)
 	}
+	attempts++
 	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
@@ -345,51 +406,63 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 	obsStatus := "inconclusive"
 	confidence := 0.35
 	followStatus := "completed"
+	followResult := result
 	if status != "complete" && !retrieved {
 		result = status
+		if result == "" {
+			result = "incomplete"
+		}
 		obsStatus = "temporary"
 		followStatus = "retryable"
+		followResult = result
 	}
 	if retrieved {
 		result = fmt.Sprintf("retrieved_after_%ds", elapsed)
 		obsStatus = StatusVerified
 		confidence = 0.6
 		followStatus = "completed"
+		followResult = result
 	}
-	err = commitProbeResult(ctx, pool, key, token, result, id, followStatus, result, elapsed, []observationWrite{{
-		Capability: CapRetention, Status: obsStatus, Detail: result, Confidence: confidence,
-	}})
+	ageExceeded := !published.IsZero() && published.Before(time.Now().Add(-7*24*time.Hour))
+	if followStatus == "retryable" && (attempts >= 8 || ageExceeded) {
+		followStatus = "failed"
+		if ageExceeded {
+			followResult = "observation_expired"
+		} else {
+			followResult = "retry_exhausted"
+		}
+	}
+	err = commitProbeResult(ctx, pool, key, token, probeCompletion{
+		AttemptStatus: result, FollowupID: id, FollowStatus: followStatus, FollowResult: followResult,
+		Elapsed: elapsed, Endpoint: relayURL, FollowCapability: followCapability,
+		Writes: []observationWrite{{
+			Capability: CapRetention, Status: obsStatus, Detail: result, Confidence: confidence,
+		}},
+	})
+	if errors.Is(err, errProbeAlreadyCompleted) {
+		return true, nil
+	}
 	if err != nil {
+		releaseOwnedAttempt(ctx, pool, key, token, "commit_failed")
 		nextStatus := "retryable"
+		followResult = "commit_failed"
 		if attempts >= 8 {
 			nextStatus = "failed"
+			followResult = "retry_exhausted"
 		}
 		_, _ = pool.Exec(ctx, `
 			UPDATE relay_probe_followups
 			SET status = $3,
+			    result = $4,
 			    lease_token = '',
 			    check_after = clock_timestamp() + interval '5 minutes',
 			    finished_at = CASE WHEN $3 = 'failed' THEN clock_timestamp() ELSE NULL END
-			WHERE id = $1 AND lease_token = $2 AND finished_at IS NULL
-		`, id, token, nextStatus)
+			WHERE id = $1 AND lease_token = $2 AND url_key = $5 AND endpoint_url = $6
+			  AND capability = $7 AND status IN ('running', 'claimed') AND finished_at IS NULL
+		`, id, token, nextStatus, followResult, key, relayURL, followCapability)
 		return true, err
 	}
 	return true, nil
-}
-
-func (p *probeState) finish(ctx context.Context, pool *pgxpool.Pool, token string) {
-	if token == "" {
-		return
-	}
-	_, _ = pool.Exec(ctx, `
-		UPDATE relay_probe_attempts
-		SET finished_at = now(),
-		    status = CASE WHEN status = 'started' THEN 'finished' ELSE status END
-		WHERE lease_token = $1 AND finished_at IS NULL
-	`, token)
-	_, _ = pool.Exec(ctx, `
-		DELETE FROM relay_probe_leases WHERE lease_token = $1
-	`, token)
 }
 
 func leaseAllows(leased, requested string) bool {
@@ -402,7 +475,15 @@ func leaseAllows(leased, requested string) bool {
 	case CapSearch:
 		return requested == CapAuthSearch
 	case CapGiftWrapPrivate:
-		return requested == CapGiftWrap || requested == CapGiftWrapAccept || requested == CapGiftWrapPublic || requested == CapAuthGiftWrap || requested == CapRetention
+		switch requested {
+		case CapGiftWrap, CapGiftWrapAccept, CapGiftWrapPublic, CapAuthGiftWrap, CapAuthRecipient, CapRetention,
+			CapGiftWrapRecipient, CapGiftWrapRecipientExact, CapGiftWrapRecipientTag,
+			CapGiftWrapObserverExact, CapGiftWrapObserverTag, CapGiftWrapAnonExact, CapGiftWrapAnonTag,
+			CapGiftWrapUnauthExposure, CapGiftWrapAuthExposure:
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
@@ -416,71 +497,103 @@ func probeHost(raw string) string {
 	return parsed.Hostname()
 }
 
-func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) {
+func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) error {
+	completion := p.collectWrite(ctx, relayURL)
+	return p.publishProbe(ctx, pool, "write", key, token, completion)
+}
+
+func (p *probeState) collectWrite(ctx context.Context, relayURL string) probeCompletion {
+	if ctx.Err() != nil {
+		return probeCompletion{AttemptStatus: "canceled", Metric: "canceled"}
+	}
 	event, err := signProbeEvent(p.key, p.pubkey)
 	if err != nil {
-		metrics.IncRelayIntelProbe("write", "error")
-		return
+		return probeCompletion{AttemptStatus: "signing_failed", Metric: "error"}
 	}
 	conn, err := dialRelay(ctx, relayURL, p.allowPrivate, 5*time.Second)
 	if err != nil {
-		metrics.IncRelayIntelProbe("write", classifyDial(err))
-		return
+		status := classifyDial(err)
+		return probeCompletion{AttemptStatus: status, Metric: status}
 	}
 	defer conn.Close()
 	payload, _ := json.Marshal([]any{"EVENT", event})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		metrics.IncRelayIntelProbe("write", "error")
-		return
+		return probeCompletion{AttemptStatus: "write_failed", Metric: "error"}
 	}
 	id, _ := event["id"].(string)
 	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
 	})
-	if pool != nil && authStatus == "ok" {
-		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusVerified, 0.7, "probe", "auth_succeeded", token)
-	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
-		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusRestricted, 0.6, "probe", authStatus, token)
+	var writes []observationWrite
+	if authStatus == "ok" {
+		writes = append(writes, observationWrite{Capability: CapAuthWrite, Status: StatusVerified, Detail: "auth_succeeded", Confidence: 0.7})
+	} else if authStatus == "unauthorized" || ack == "auth_required" || authStatus == "failed" || authStatus == "required" {
+		detail := authStatus
+		if detail == "" {
+			detail = ack
+		}
+		writes = append(writes, observationWrite{Capability: CapAuthWrite, Status: StatusRestricted, Detail: detail, Confidence: 0.6})
 	}
 	if ack != "accepted" {
-		if pool != nil {
-			status, detail := publicationEvidence(ack)
-			_ = storeObservation(ctx, pool, key, CapWriteAccept, status, 0.55, "probe", detail, token)
+		status, detail := publicationEvidence(ack)
+		if ack == "" {
+			ack = "write_failed"
 		}
-		metrics.IncRelayIntelProbe("write", ack)
-		return
+		writes = append(writes, observationWrite{Capability: CapWriteAccept, Status: status, Detail: detail, Confidence: 0.55})
+		return probeCompletion{AttemptStatus: ack, Metric: ack, Writes: writes}
 	}
-	if pool != nil {
-		_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusVerified, 0.8, "probe", "ok_true", token)
-		created, _ := event["created_at"].(int64)
-		p.scheduleRetention(ctx, pool, key, relayURL, id, time.Unix(created, 0))
+	writes = append(writes, observationWrite{Capability: CapWriteAccept, Status: StatusVerified, Detail: "ok_true", Confidence: 0.8})
+	created, _ := event["created_at"].(int64)
+	retention := &scheduledRetention{RelayURL: relayURL, EventID: id, Published: time.Unix(created, 0)}
+	if ctx.Err() != nil {
+		return probeCompletion{AttemptStatus: "canceled", Metric: "canceled", Writes: writes, Retention: retention}
 	}
 	found, err := fetchEvents(ctx, relayURL, p.allowPrivate, map[string]any{"ids": []string{id}, "limit": 1})
 	if err == nil {
 		for _, item := range found {
 			if item != nil && item.ID == id {
-				if pool != nil {
-					_ = storeObservation(ctx, pool, key, CapWriteRetrieve, StatusVerified, 0.85, "probe", "retrieved", token)
-				}
-				metrics.IncRelayIntelProbe("write", "ok")
-				return
+				writes = append(writes, observationWrite{Capability: CapWriteRetrieve, Status: StatusVerified, Detail: "retrieved", Confidence: 0.85})
+				return probeCompletion{AttemptStatus: "retrieved", Metric: "ok", Writes: writes, Retention: retention}
 			}
 		}
+		return probeCompletion{AttemptStatus: "accepted_not_retrieved", Metric: "incomplete", Writes: writes, Retention: retention}
 	}
-	metrics.IncRelayIntelProbe("write", "incomplete")
+	return probeCompletion{AttemptStatus: "incomplete", Metric: "incomplete", Writes: writes, Retention: retention}
 }
 
-func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) {
+func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) error {
+	completion := p.collectSearch(ctx, relayURL)
+	return p.publishProbe(ctx, pool, "search", key, token, completion)
+}
+
+func (p *probeState) publishProbe(ctx context.Context, pool *pgxpool.Pool, metric, key, token string, completion probeCompletion) error {
+	err := commitProbeResult(ctx, pool, key, token, completion)
+	if errors.Is(err, errProbeAlreadyCompleted) {
+		metrics.IncRelayIntelProbe(metric, completion.Metric)
+		return nil
+	}
+	if err != nil {
+		releaseOwnedAttempt(ctx, pool, key, token, "commit_failed")
+		metrics.IncRelayIntelProbe(metric, "error")
+		return err
+	}
+	metrics.IncRelayIntelProbe(metric, completion.Metric)
+	return nil
+}
+
+func (p *probeState) collectSearch(ctx context.Context, relayURL string) probeCompletion {
+	if ctx.Err() != nil {
+		return probeCompletion{AttemptStatus: "canceled", Metric: "canceled"}
+	}
 	event, err := signProbeEvent(p.key, p.pubkey)
 	if err != nil {
-		metrics.IncRelayIntelProbe("search", "error")
-		return
+		return probeCompletion{AttemptStatus: "signing_failed", Metric: "error"}
 	}
 	conn, err := dialRelay(ctx, relayURL, p.allowPrivate, 5*time.Second)
 	if err != nil {
-		metrics.IncRelayIntelProbe("search", classifyDial(err))
-		return
+		status := classifyDial(err)
+		return probeCompletion{AttemptStatus: status, Metric: status}
 	}
 	defer conn.Close()
 	id, _ := event["id"].(string)
@@ -488,61 +601,56 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 	payload, _ := json.Marshal([]any{"EVENT", event})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		metrics.IncRelayIntelProbe("search", "error")
-		return
+		return probeCompletion{AttemptStatus: "write_failed", Metric: "error"}
 	}
-	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
+	auth := func(challenge string) (map[string]any, error) {
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
-	})
-	if pool != nil && authStatus == "ok" {
-		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusVerified, 0.7, "probe", "auth_succeeded", token)
-	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
-		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusRestricted, 0.6, "probe", authStatus, token)
+	}
+	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(5*time.Second), auth)
+	var writes []observationWrite
+	if authStatus == "ok" {
+		writes = append(writes, observationWrite{Capability: CapAuthSearch, Status: StatusVerified, Detail: "auth_succeeded", Confidence: 0.7})
+	} else if authStatus == "unauthorized" || ack == "auth_required" || authStatus == "failed" || authStatus == "required" {
+		detail := authStatus
+		if detail == "" {
+			detail = ack
+		}
+		writes = append(writes, observationWrite{Capability: CapAuthSearch, Status: StatusRestricted, Detail: detail, Confidence: 0.6})
 	}
 	if ack != "accepted" {
-		if pool != nil {
-			status, detail := publicationEvidence(ack)
-			_ = storeObservation(ctx, pool, key, CapSearch, status, 0.45, "probe", detail, token)
+		status, detail := publicationEvidence(ack)
+		if ack == "" {
+			ack = "write_failed"
 		}
-		metrics.IncRelayIntelProbe("search", "inconclusive")
-		return
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: status, Detail: detail, Confidence: 0.45})
+		return probeCompletion{AttemptStatus: ack, Metric: "inconclusive", Writes: writes}
 	}
-	presentStatus, presentIDs, presentExposed, _ := readSubscription(ctx, conn, "nm-present", map[string]any{"ids": []string{id}, "limit": 1}, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
-		return signAuth(p.key, p.pubkey, relayURL, challenge)
-	})
+	presentStatus, presentIDs, presentExposed, _ := readSubscription(ctx, conn, "nm-present", map[string]any{"ids": []string{id}, "limit": 1}, time.Now().Add(5*time.Second), auth)
 	if !containsID(presentIDs, id) && !containsID(presentExposed, id) {
-		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, "inconclusive", 0.35, "probe", "not_present:"+presentStatus, token)
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: "inconclusive", Detail: "not_present:" + presentStatus, Confidence: 0.35})
+		attempt := presentStatus
+		if attempt == "" || attempt == "complete" {
+			attempt = "not_present"
 		}
-		metrics.IncRelayIntelProbe("search", "inconclusive")
-		return
+		return probeCompletion{AttemptStatus: attempt, Metric: "inconclusive", Writes: writes}
 	}
-	positive, positiveStatus := readSearchIDs(conn, "nm-search-yes", content, p.pubkey)
-	negative, negativeStatus := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative-"+id, p.pubkey)
+	positive, positiveStatus := readSearchIDs(ctx, conn, "nm-search-yes", content, p.pubkey, auth)
+	negative, negativeStatus := readSearchIDs(ctx, conn, "nm-search-no", "nostrmash-relay-intel-negative-"+id, p.pubkey, auth)
 	if positiveStatus == "unsupported" || negativeStatus == "unsupported" {
-		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusUnsupported, 0.7, "probe", "closed", token)
-		}
-		metrics.IncRelayIntelProbe("search", "unsupported")
-		return
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: StatusUnsupported, Detail: "closed", Confidence: 0.7})
+		return probeCompletion{AttemptStatus: "unsupported", Metric: "unsupported", Writes: writes}
 	}
 	outcome := classifyCompletedSearch(positiveStatus, negativeStatus, containsID(positive, id), containsID(negative, id))
 	switch outcome {
 	case "verified":
-		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusVerified, 0.8, "probe", "search_match", token)
-		}
-		metrics.IncRelayIntelProbe("search", "ok")
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: StatusVerified, Detail: "search_match", Confidence: 0.8})
+		return probeCompletion{AttemptStatus: "verified", Metric: "ok", Writes: writes}
 	case "ignored":
-		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusRestricted, 0.6, "probe", "search_ignored", token)
-		}
-		metrics.IncRelayIntelProbe("search", "inconclusive")
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: StatusRestricted, Detail: "search_ignored", Confidence: 0.6})
+		return probeCompletion{AttemptStatus: "search_ignored", Metric: "inconclusive", Writes: writes}
 	default:
-		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, "inconclusive", 0.35, "probe", outcome, token)
-		}
-		metrics.IncRelayIntelProbe("search", "inconclusive")
+		writes = append(writes, observationWrite{Capability: CapSearch, Status: "inconclusive", Detail: outcome, Confidence: 0.35})
+		return probeCompletion{AttemptStatus: outcome, Metric: "inconclusive", Writes: writes}
 	}
 }
 
@@ -817,7 +925,9 @@ func readSubscription(ctx context.Context, conn *websocket.Conn, sub string, fil
 				return "unauthorized", ids, exposed, false
 			}
 			authState = "ok"
-			exposed = append(exposed, ids...)
+			for _, id := range ids {
+				exposed = appendID(exposed, id)
+			}
 			ids = nil
 			if retries < 2 {
 				retries++
@@ -839,6 +949,9 @@ func readSubscription(ctx context.Context, conn *websocket.Conn, sub string, fil
 			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 64 * 1024})
 			if !parsed.Valid() || parsed.Event == nil || !eventMatchesFilter(parsed.Event, filter) {
 				continue
+			}
+			if authState != "ok" {
+				exposed = appendID(exposed, parsed.Event.ID)
 			}
 			ids = append(ids, parsed.Event.ID)
 			if len(ids) > 8 {
@@ -921,81 +1034,24 @@ func classifyCompletedSearch(positiveStatus, negativeStatus string, positiveHit,
 	return classifySearch(positiveHit, negativeHit)
 }
 
-func readSearchIDs(conn *websocket.Conn, sub, query, author string) ([]string, string) {
+func readSearchIDs(ctx context.Context, conn *websocket.Conn, sub, query, author string, auth func(string) (map[string]any, error)) ([]string, string) {
 	filter := map[string]any{"kinds": []int{1}, "search": query, "limit": 5}
 	if author != "" {
 		filter["authors"] = []string{author}
 	}
-	req, _ := json.Marshal([]any{"REQ", sub, filter})
-	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
-		return nil, "incomplete"
+	status, ids, exposed, _ := readSubscription(ctx, conn, sub, filter, time.Now().Add(5*time.Second), auth)
+	seen := append([]string{}, ids...)
+	for _, id := range exposed {
+		seen = appendID(seen, id)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	var ids []string
-	messages := 0
-	total := 0
-	for messages < 32 && total < 256*1024 && time.Now().Before(deadline) {
-		_ = conn.SetReadDeadline(deadline)
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			return ids, "incomplete"
-		}
-		if len(message) > 64*1024 || total+len(message) > 256*1024 {
-			return ids, "incomplete"
-		}
-		messages++
-		total += len(message)
-		var frame []json.RawMessage
-		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
-			continue
-		}
-		var typ string
-		if json.Unmarshal(frame[0], &typ) != nil {
-			continue
-		}
-		switch typ {
-		case "EVENT":
-			if len(frame) < 3 {
-				continue
-			}
-			var got string
-			if json.Unmarshal(frame[1], &got) != nil || got != sub {
-				continue
-			}
-			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 32 * 1024})
-			if !parsed.Valid() || parsed.Event == nil || !eventMatchesFilter(parsed.Event, filter) {
-				continue
-			}
-			if parsed.Event.ID == "" || (author != "" && !strings.EqualFold(parsed.Event.Pubkey, author)) {
-				continue
-			}
-			ids = append(ids, parsed.Event.ID)
-		case "EOSE":
-			if len(frame) < 2 {
-				continue
-			}
-			var got string
-			if json.Unmarshal(frame[1], &got) != nil || got != sub {
-				continue
-			}
-			return ids, "complete"
-		case "CLOSED":
-			if len(frame) < 2 {
-				continue
-			}
-			var got string
-			if json.Unmarshal(frame[1], &got) != nil || got != sub {
-				continue
-			}
-			text := strings.ToLower(string(message))
-			if strings.Contains(text, "unsupported") || strings.Contains(text, "not supported") {
-				return ids, "unsupported"
-			}
-			return ids, "incomplete"
-		}
+	return seen, status
+}
+
+func appendID(ids []string, id string) []string {
+	if id == "" || containsID(ids, id) || len(ids) >= 16 {
+		return ids
 	}
-	return ids, "incomplete"
+	return append(ids, id)
 }
 
 func containsID(ids []string, want string) bool {
@@ -1109,11 +1165,36 @@ func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, 
 }
 
 type observationWrite struct {
-	Capability string
-	Status     string
-	Detail     string
-	Confidence float64
+	Capability      string
+	Status          string
+	Detail          string
+	Confidence      float64
+	EvidenceVersion int
+	Retrieved       *bool
+	Unauthenticated *bool
+	Authenticated   *bool
 }
+
+type scheduledRetention struct {
+	RelayURL  string
+	EventID   string
+	Published time.Time
+}
+
+type probeCompletion struct {
+	AttemptStatus    string
+	FollowupID       int64
+	FollowStatus     string
+	FollowResult     string
+	Elapsed          int
+	Endpoint         string
+	FollowCapability string
+	Writes           []observationWrite
+	Retention        *scheduledRetention
+	Metric           string
+}
+
+var errProbeAlreadyCompleted = errors.New("probe result already recorded")
 
 func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, item observationWrite) (bool, error) {
 	inserted := false
@@ -1149,84 +1230,159 @@ func applySample(ctx context.Context, tx pgx.Tx, key string, attemptID int64, it
 		WHERE id IN (
 			SELECT id FROM relay_capability_samples
 			WHERE url_key = $1 AND capability = $2
-			  AND detail NOT LIKE 'observer_retrieved%'
-			  AND detail NOT LIKE 'publicly_accessible%'
-			  AND detail NOT LIKE 'retrieved_before_auth%'
 			ORDER BY observed_at DESC, id DESC
 			OFFSET 20
 		)
 	`, key, item.Capability)
-	recentFailures, recentWindow := 0, 0
+	recentFailures, recentWindow, recentSuccesses, recentInconclusive := 0, 0, 0, 0
 	_ = tx.QueryRow(ctx, `
 		SELECT count(*),
-		       count(*) FILTER (WHERE status IN ('unsupported', 'restricted', 'temporary'))
+		       count(*) FILTER (WHERE status IN ('unsupported', 'restricted', 'temporary')),
+		       count(*) FILTER (WHERE status = 'verified'),
+		       count(*) FILTER (WHERE status IN ('inconclusive', 'temporary'))
 		FROM (
 			SELECT status FROM relay_capability_samples
 			WHERE url_key = $1 AND capability = $2
 			ORDER BY observed_at DESC, id DESC
 			LIMIT 20
 		) recent
-	`, key, item.Capability).Scan(&recentWindow, &recentFailures)
+	`, key, item.Capability).Scan(&recentWindow, &recentFailures, &recentSuccesses, &recentInconclusive)
 	provisional := item.Status == "inconclusive" || item.Status == "temporary"
+	conclusive := item.Status == StatusVerified || item.Status == StatusUnsupported || item.Status == StatusRestricted
 	_, err := tx.Exec(ctx, `
 		INSERT INTO relay_capability_observations (
 			url_key, capability, status, confidence, source, detail, sample_count, observed_at
 		) VALUES (
-			$1, $2, $3, $4, 'probe', jsonb_build_object('text', $5::text, 'recent_failures', $6::int, 'recent_window', $7::int), 1, clock_timestamp()
+			$1, $2, $3, $4, 'probe', jsonb_strip_nulls(jsonb_build_object(
+				'text', $5::text,
+				'evidence_version', NULLIF($9::int, 0),
+				'recent_failures', $6::int,
+				'recent_window', $7::int,
+				'recent_successes', $10::int,
+				'recent_inconclusive', $11::int,
+				'retrieved', $13::boolean,
+				'unauthenticated', $14::boolean,
+				'authenticated', $15::boolean,
+				'last_attempt_at', clock_timestamp(),
+				'last_conclusive_at', CASE WHEN $12::bool THEN clock_timestamp() ELSE NULL END,
+				'last_success_at', CASE WHEN $3 = 'verified' THEN clock_timestamp() ELSE NULL END,
+				'last_negative_at', CASE WHEN $3 IN ('unsupported', 'restricted') THEN clock_timestamp() ELSE NULL END,
+				'conclusive_status', CASE WHEN $12::bool THEN $3 ELSE NULL END,
+				'conclusive_confidence', CASE WHEN $12::bool THEN $4::float8 ELSE NULL END
+			)), 1, clock_timestamp()
 		)
 		ON CONFLICT (url_key, capability) DO UPDATE
 		SET status = CASE
-		        WHEN $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        WHEN (
+		            $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        ) OR (
+		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
+		            AND relay_capability_observations.status = 'verified'
+		            AND $3 = 'verified'
+		        )
 		        THEN relay_capability_observations.status
 		        ELSE EXCLUDED.status
 		    END,
 		    confidence = CASE
-		        WHEN $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        WHEN (
+		            $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        ) OR (
+		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
+		            AND relay_capability_observations.status = 'verified'
+		            AND $3 = 'verified'
+		        )
 		        THEN relay_capability_observations.confidence
 		        ELSE EXCLUDED.confidence
 		    END,
 		    source = CASE
-		        WHEN $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        WHEN (
+		            $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        ) OR (
+		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
+		            AND relay_capability_observations.status = 'verified'
+		            AND $3 = 'verified'
+		        )
 		        THEN relay_capability_observations.source
 		        ELSE EXCLUDED.source
 		    END,
 		    detail = CASE
-		        WHEN $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
-		        THEN jsonb_set(
-		            jsonb_set(relay_capability_observations.detail, '{recent_failures}', to_jsonb($6::int)),
-		            '{recent_window}', to_jsonb($7::int))
+		        WHEN (
+		            $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        ) OR (
+		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
+		            AND relay_capability_observations.status = 'verified'
+		            AND $3 = 'verified'
+		        )
+		        THEN relay_capability_observations.detail
+		            || jsonb_build_object(
+		                'recent_failures', $6::int,
+		                'recent_window', $7::int,
+		                'recent_successes', $10::int,
+		                'recent_inconclusive', $11::int,
+		                'last_attempt_at', clock_timestamp()
+		            )
 		        ELSE EXCLUDED.detail
 		    END,
 		    sample_count = relay_capability_observations.sample_count + 1,
 		    observed_at = CASE
-		        WHEN $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        WHEN (
+		            $8::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        ) OR (
+		            $9::int < COALESCE((relay_capability_observations.detail->>'evidence_version')::int, 0)
+		            AND relay_capability_observations.status = 'verified'
+		            AND $3 = 'verified'
+		        )
 		        THEN relay_capability_observations.observed_at
 		        ELSE clock_timestamp()
 		    END
-	`, key, item.Capability, item.Status, item.Confidence, item.Detail, recentFailures, recentWindow, provisional)
+	`, key, item.Capability, item.Status, item.Confidence, item.Detail, recentFailures, recentWindow, provisional, item.EvidenceVersion, recentSuccesses, recentInconclusive, conclusive, item.Retrieved, item.Unauthenticated, item.Authenticated)
 	return err == nil, err
 }
 
-func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token, attemptStatus string, followupID int64, followStatus, followResult string, elapsed int, writes []observationWrite) error {
+func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token string, completion probeCompletion) error {
+	if completion.AttemptStatus == "" {
+		completion.AttemptStatus = "incomplete"
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var leasedURL, leasedCap string
-	var current bool
+	var leasedURL, leasedCap, attemptURL, attemptCap, storedStatus string
+	var current, attemptOpen bool
 	var attemptID int64
 	err = tx.QueryRow(ctx, `
-		SELECT l.url_key, l.capability, l.expires_at > clock_timestamp(), a.id
+		SELECT l.url_key, l.capability, l.expires_at > clock_timestamp(),
+		       a.id, a.url_key, a.capability, a.status, a.finished_at IS NULL
 		FROM relay_probe_leases l
 		JOIN relay_probe_attempts a ON a.lease_token = l.lease_token
 		WHERE l.lease_token = $1
 		FOR UPDATE OF l
-	`, token).Scan(&leasedURL, &leasedCap, &current, &attemptID)
-	if err != nil || !current || leasedURL != key {
+	`, token).Scan(&leasedURL, &leasedCap, &current, &attemptID, &attemptURL, &attemptCap, &storedStatus, &attemptOpen)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return recognizeFinishedAttempt(ctx, tx, key, token, completion.AttemptStatus)
+		}
+		return err
+	}
+	var stillCurrent bool
+	if err = tx.QueryRow(ctx, `
+		SELECT expires_at > clock_timestamp()
+		FROM relay_probe_leases
+		WHERE lease_token = $1
+	`, token).Scan(&stillCurrent); err != nil {
+		return err
+	}
+	if !current || !stillCurrent || leasedURL != key || attemptURL != key || attemptCap != leasedCap {
 		return fmt.Errorf("probe lease %s cannot publish evidence", token)
 	}
-	for _, item := range writes {
+	if !attemptOpen {
+		if storedStatus == completion.AttemptStatus {
+			return errProbeAlreadyCompleted
+		}
+		return fmt.Errorf("conflicting probe result for %s: stored %s", token, storedStatus)
+	}
+	for _, item := range completion.Writes {
 		if !leaseAllows(leasedCap, item.Capability) {
 			return fmt.Errorf("probe lease %s cannot publish %s", token, item.Capability)
 		}
@@ -1234,40 +1390,105 @@ func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token, atte
 			return err
 		}
 	}
-	if _, err = tx.Exec(ctx, `
+	if completion.Retention != nil && completion.Retention.EventID != "" {
+		published := completion.Retention.Published
+		if published.IsZero() {
+			published = time.Now().UTC()
+		}
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO relay_probe_followups (
+				url_key, endpoint_url, event_id, capability, check_after, published_at, status
+			) VALUES ($1, $2, $3, 'retention', $4, $5, 'pending')
+			ON CONFLICT (url_key, event_id, capability) DO NOTHING
+		`, key, completion.Retention.RelayURL, completion.Retention.EventID, published.Add(time.Hour), published.UTC()); err != nil {
+			return err
+		}
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE relay_probe_attempts
 		SET finished_at = clock_timestamp(), status = $2
-		WHERE id = $1 AND finished_at IS NULL
-	`, attemptID, attemptStatus); err != nil {
+		WHERE id = $1 AND lease_token = $3 AND url_key = $4 AND capability = $5 AND finished_at IS NULL
+	`, attemptID, completion.AttemptStatus, token, key, leasedCap)
+	if err != nil {
 		return err
 	}
-	if followupID > 0 {
-		var tag pgconn.CommandTag
-		if followStatus == "completed" || followStatus == "skipped" || followStatus == "failed" {
-			tag, err = tx.Exec(ctx, `
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("probe attempt %d was not updated", attemptID)
+	}
+	if completion.FollowupID > 0 {
+		endpoint := completion.Endpoint
+		capability := completion.FollowCapability
+		if capability == "" {
+			capability = CapRetention
+		}
+		var followTag pgconn.CommandTag
+		if completion.FollowStatus == "completed" || completion.FollowStatus == "skipped" || completion.FollowStatus == "failed" {
+			followTag, err = tx.Exec(ctx, `
 				UPDATE relay_probe_followups
 				SET status = $2, result = $3, elapsed_seconds = $4,
 				    verified_at = clock_timestamp(), finished_at = clock_timestamp()
-				WHERE id = $1 AND lease_token = $5
-			`, followupID, followStatus, followResult, elapsed, token)
+				WHERE id = $1 AND lease_token = $5 AND url_key = $6 AND endpoint_url = $7
+				  AND capability = $8 AND status IN ('running', 'claimed') AND finished_at IS NULL
+			`, completion.FollowupID, completion.FollowStatus, completion.FollowResult, completion.Elapsed, token, key, endpoint, capability)
 		} else {
-			tag, err = tx.Exec(ctx, `
+			followTag, err = tx.Exec(ctx, `
 				UPDATE relay_probe_followups
 				SET status = $2, result = $3, elapsed_seconds = $4,
 				    verified_at = clock_timestamp(), lease_token = '',
 				    check_after = clock_timestamp() + interval '5 minutes'
-				WHERE id = $1 AND lease_token = $5 AND finished_at IS NULL
-			`, followupID, followStatus, followResult, elapsed, token)
+				WHERE id = $1 AND lease_token = $5 AND url_key = $6 AND endpoint_url = $7
+				  AND capability = $8 AND status IN ('running', 'claimed') AND finished_at IS NULL
+			`, completion.FollowupID, completion.FollowStatus, completion.FollowResult, completion.Elapsed, token, key, endpoint, capability)
 		}
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("follow-up %d is not owned by lease %s", followupID, token)
+		if followTag.RowsAffected() != 1 {
+			return fmt.Errorf("follow-up %d is not owned by lease %s", completion.FollowupID, token)
 		}
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM relay_probe_leases WHERE lease_token = $1`, token); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM relay_probe_leases WHERE lease_token = $1 AND url_key = $2`, token, key); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func releaseOwnedAttempt(ctx context.Context, pool *pgxpool.Pool, key, token, status string) {
+	if pool == nil || token == "" || key == "" {
+		return
+	}
+	if status == "" {
+		status = "commit_failed"
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE relay_probe_attempts
+		SET finished_at = clock_timestamp(), status = $2
+		WHERE lease_token = $1 AND url_key = $3 AND finished_at IS NULL
+	`, token, status, key)
+	if err != nil || tag.RowsAffected() != 1 {
+		return
+	}
+	_, _ = pool.Exec(ctx, `DELETE FROM relay_probe_leases WHERE lease_token = $1 AND url_key = $2`, token, key)
+}
+
+func recognizeFinishedAttempt(ctx context.Context, tx pgx.Tx, key, token, attemptStatus string) error {
+	var storedKey, storedStatus string
+	var finished bool
+	err := tx.QueryRow(ctx, `
+		SELECT url_key, status, finished_at IS NOT NULL
+		FROM relay_probe_attempts
+		WHERE lease_token = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`, token).Scan(&storedKey, &storedStatus, &finished)
+	if err != nil {
+		return fmt.Errorf("probe lease %s cannot publish evidence", token)
+	}
+	if storedKey != key || !finished {
+		return fmt.Errorf("probe lease %s cannot publish evidence", token)
+	}
+	if storedStatus == attemptStatus {
+		return errProbeAlreadyCompleted
+	}
+	return fmt.Errorf("conflicting probe result for %s: stored %s", token, storedStatus)
 }

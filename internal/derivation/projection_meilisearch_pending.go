@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/nostrmash/nostrmash/internal/nostr"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 // reinsertClaimedMeilisearchSyncsTimeout bounds the best-effort
@@ -50,15 +51,26 @@ func (h *Handlers) MarkMeilisearchDirty(ctx context.Context, eventID string) err
 	}
 
 	var kind int
+	var pubkey string
 	if err := h.pool.QueryRow(ctx, `
-		SELECT kind
+		SELECT kind, pubkey
 		FROM events
 		WHERE id = $1
-	`, eventID).Scan(&kind); err != nil {
+	`, eventID).Scan(&kind, &pubkey); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
 		return fmt.Errorf("load event for meilisearch dirty marking: %w", err)
+	}
+	if kind == 1059 {
+		return nil
+	}
+	synthetic, err := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+	if err != nil {
+		return fmt.Errorf("synthetic identity: %w", err)
+	}
+	if synthetic {
+		return nil
 	}
 	if kind != 0 && !nostr.IsIndexedNoteKind(kind) {
 		return nil
@@ -158,6 +170,46 @@ func NoteSyncDue(pending int, oldest time.Duration, batchSize int, maxWait time.
 	return maxWait > 0 && oldest >= maxWait
 }
 
+func (h *Handlers) partitionSyntheticEvents(ctx context.Context, eventIDs []string) (indexable, deferred []string, err error) {
+	rows, err := h.pool.Query(ctx, `SELECT id, pubkey, kind FROM events WHERE id = ANY($1::text[])`, eventIDs)
+	if err != nil {
+		return nil, eventIDs, fmt.Errorf("load events for synthetic exclusion: %w", err)
+	}
+	type loadedEvent struct {
+		id, pubkey string
+		kind       int
+	}
+	var loaded []loadedEvent
+	for rows.Next() {
+		var item loadedEvent
+		if err := rows.Scan(&item.id, &item.pubkey, &item.kind); err != nil {
+			rows.Close()
+			return nil, eventIDs, err
+		}
+		loaded = append(loaded, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, eventIDs, err
+	}
+	rows.Close()
+	for _, item := range loaded {
+		if item.kind == 1059 {
+			continue
+		}
+		synthetic, lookupErr := relayintel.LookupSynthetic(ctx, h.pool, item.pubkey)
+		if lookupErr != nil {
+			deferred = append(deferred, item.id)
+			continue
+		}
+		if synthetic {
+			continue
+		}
+		indexable = append(indexable, item.id)
+	}
+	return indexable, deferred, nil
+}
+
 func (h *Handlers) drainPendingMeilisearchSyncBatch(ctx context.Context, limit int, target meiliClaimTarget) (int, int, error) {
 	if h == nil || h.pool == nil {
 		return 0, 0, fmt.Errorf("handlers are not initialized")
@@ -177,6 +229,25 @@ func (h *Handlers) drainPendingMeilisearchSyncBatch(ctx context.Context, limit i
 	if len(eventIDs) == 0 {
 		return 0, claimed.picked, nil
 	}
+	indexable, deferred, err := h.partitionSyntheticEvents(ctx, eventIDs)
+	if err != nil {
+		if reErr := h.reinsertClaimedMeilisearchSyncs(eventIDs); reErr != nil {
+			return 0, claimed.picked, fmt.Errorf("requeue events after synthetic exclusion failed: %w", reErr)
+		}
+		return 0, claimed.picked, err
+	}
+	if len(deferred) > 0 {
+		if reErr := h.reinsertClaimedMeilisearchSyncs(deferred); reErr != nil {
+			return 0, claimed.picked, fmt.Errorf("requeue events whose probe identity could not be checked: %w", reErr)
+		}
+	}
+	if len(indexable) == 0 {
+		if len(deferred) > 0 {
+			return 0, claimed.picked, fmt.Errorf("synthetic identity lookup deferred %d search documents", len(deferred))
+		}
+		return 0, claimed.picked, nil
+	}
+	eventIDs = indexable
 
 	// The claim is one kind, so SyncEventsBatch opens the notes index or
 	// the profiles index, plus search documents for that kind, and does

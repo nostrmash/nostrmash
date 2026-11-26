@@ -1531,11 +1531,19 @@ type RelayProbeFollowup struct {
 	VerifiedAt     pgtype.Timestamptz
 	ElapsedSeconds pgtype.Int4
 	Attempts       int32
+	ClaimedAt      pgtype.Timestamptz
+	Deferrals      int32
 }
 
 type RelayProbeIdentity struct {
 	Pubkey    string
 	CreatedAt pgtype.Timestamptz
+	ExpiresAt pgtype.Timestamptz
+}
+
+type RelayProbeIdentityEpoch struct {
+	ID    bool
+	Epoch int64
 }
 
 type RelayProbeLease struct {

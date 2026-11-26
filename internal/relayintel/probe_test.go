@@ -76,7 +76,7 @@ func TestReadWriteAckStopsOnAMismatchedOK(t *testing.T) {
 
 func TestRepeatedFailuresReduceALaterSuccess(t *testing.T) {
 	status, confidence := adjustForRecentFailures(StatusVerified, 0.9, 3, 4)
-	if status == StatusVerified || confidence > 0.45 {
+	if status != StatusVerified || confidence > 0.45 {
 		t.Fatalf("status=%s confidence=%f", status, confidence)
 	}
 	kept, lowered := adjustForRecentFailures(StatusVerified, 0.9, 1, 4)

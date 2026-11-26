@@ -82,18 +82,27 @@ func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
 	if !reasonCode(reasons, "giftwrap_public") {
 		t.Fatalf("reasons = %#v", reasons)
 	}
-	exposed[CapGiftWrapPrivate] = Capability{Status: StatusVerified, Confidence: 0.9, ObservedAt: &newer}
+	if privacyAssessment(exposed) == "recipient_only_verified" {
+		t.Fatal("private evidence without a six-path version cleared exposure")
+	}
+	exposed[CapGiftWrapPrivate] = Capability{Status: StatusVerified, Confidence: 0.9, ObservedAt: &newer, EvidenceVersion: ComprehensivePrivacyVersion}
 	if privacyAssessment(exposed) != "recipient_only_verified" {
 		t.Fatal(privacyAssessment(exposed))
 	}
+	exposed[CapGiftWrapRecipient] = Capability{Status: StatusVerified, Source: "probe", ObservedAt: &newer, Retrieved: boolPtr(true)}
 	report := privacyReport(exposed, now)
-	if !report.RecipientRetrievalVerified || report.ExposureUnresolved || !report.ExposureConfirmed {
+	if report.RecipientRetrievalVerified == nil || !*report.RecipientRetrievalVerified || report.ExposureUnresolved || !report.ExposureConfirmed {
 		t.Fatalf("privacy report = %+v", report)
 	}
 	if privacyAssessmentAt(map[string]Capability{
-		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale},
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale, EvidenceVersion: ComprehensivePrivacyVersion},
 	}, now) != "stale" {
 		t.Fatal("stale private evidence still counted as current")
+	}
+	if privacyAssessmentAt(map[string]Capability{
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale},
+	}, now) != "privacy_unknown" {
+		t.Fatal("legacy private evidence was upgraded to the comprehensive contract")
 	}
 	if privacyAssessmentAt(map[string]Capability{
 		CapGiftWrapPublic: {Status: StatusStale, ObservedAt: &stale},
@@ -102,14 +111,20 @@ func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
 	}
 	if unresolved := privacyReport(map[string]Capability{
 		CapGiftWrapPublic: {Status: StatusStale, ObservedAt: &stale},
-	}, now); unresolved.RecipientRetrievalVerified || !unresolved.ExposureUnresolved {
+	}, now); unresolved.RecipientRetrievalVerified != nil || !unresolved.ExposureUnresolved {
 		t.Fatalf("unresolved exposure = %+v", unresolved)
 	}
 	if privacyAssessmentAt(map[string]Capability{
 		CapGiftWrapPublic:  {Status: StatusVerified, ObservedAt: &older},
-		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &now},
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &now, EvidenceVersion: ComprehensivePrivacyVersion},
 	}, now) != "recipient_only_verified" {
 		t.Fatal("a newer complete private result did not replace exposure")
+	}
+	if privacyAssessmentAt(map[string]Capability{
+		CapGiftWrapPublic:  {Status: StatusVerified, ObservedAt: &older},
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &now},
+	}, now) == "recipient_only_verified" {
+		t.Fatal("weak private evidence replaced confirmed exposure")
 	}
 	if classifyGiftWrap(giftWrapEvidence{Accept: "accepted", Observer: "incomplete", ObserverHit: true}) != "public" {
 		t.Fatal("an observed unauthorized hit was discarded because EOSE did not arrive")
