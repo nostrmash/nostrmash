@@ -275,15 +275,15 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 		published = *publishedAt
 	}
 	conn, dialErr := dialRelay(ctx, relayURL, p.allowPrivate, 5*time.Second)
-	status := "incomplete"
+	var status string
 	var ids []string
-	if dialErr == nil {
+	if dialErr != nil {
+		status = classifyDial(dialErr)
+	} else {
 		status, ids, _, _ = readSubscription(ctx, conn, "nm-retain", map[string]any{"ids": []string{eventID}, "limit": 1}, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
 			return signAuth(p.key, p.pubkey, relayURL, challenge)
 		})
 		conn.Close()
-	} else {
-		status = classifyDial(dialErr)
 	}
 	elapsed := int(time.Since(published).Seconds())
 	if elapsed < 0 {
