@@ -43,6 +43,36 @@ func TestProbeClaimsSurviveRestartAndHonorBudgets(t *testing.T) {
 	}
 }
 
+func TestStaleLeaseCannotPublishEvidence(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "relay probe evidence"), "probeevidence")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	token := claimToken(t, ctx, pool, "wss://evidence.example", "write_accept", "evidence.example", "worker-a", 20, 60)
+	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", "stale-token"); err == nil {
+		t.Fatal("a stale token published evidence")
+	}
+	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", token); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, "inconclusive", 0.2, "probe", "timeout", token); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var failures, window int
+	if err := pool.QueryRow(ctx, `
+		SELECT status, COALESCE((detail->>'recent_failures')::int, 0), COALESCE((detail->>'recent_window')::int, 0)
+		FROM relay_capability_observations
+		WHERE url_key = $1 AND capability = $2
+	`, "wss://evidence.example", CapWriteAccept).Scan(&status, &failures, &window); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusVerified || window < 2 {
+		t.Fatalf("status=%s failures=%d window=%d", status, failures, window)
+	}
+}
+
 func claimToken(t *testing.T, ctx context.Context, pool *pgxpool.Pool, url, capability, host, worker string, global, minSeconds int) string {
 	t.Helper()
 	var token string

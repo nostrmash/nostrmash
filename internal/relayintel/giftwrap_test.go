@@ -63,6 +63,83 @@ func TestAuthChallengeMustMatchTheSubmittedEvent(t *testing.T) {
 	}
 }
 
+func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
+	now := time.Now()
+	older := now.Add(-time.Hour)
+	newer := now.Add(time.Minute)
+	stale := now.Add(-8 * 24 * time.Hour)
+	exposed := map[string]Capability{
+		CapGiftWrapPrivate: {Status: StatusVerified, Confidence: 0.8, ObservedAt: &older},
+		CapGiftWrap:        {Status: StatusVerified, ObservedAt: &older},
+		CapGiftWrapPublic:  {Status: StatusVerified, Confidence: 0.8, ObservedAt: &now},
+	}
+	if privacyAssessment(exposed) != "publicly_accessible" {
+		t.Fatal(privacyAssessment(exposed))
+	}
+	_, _, reasons := privacyComponent(RoleDMInbox, exposed)
+	if !reasonCode(reasons, "giftwrap_public") {
+		t.Fatalf("reasons = %#v", reasons)
+	}
+	exposed[CapGiftWrapPrivate] = Capability{Status: StatusVerified, Confidence: 0.9, ObservedAt: &newer}
+	if privacyAssessment(exposed) != "recipient_only_verified" {
+		t.Fatal(privacyAssessment(exposed))
+	}
+	if privacyAssessment(map[string]Capability{
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale},
+	}) != "stale" {
+		t.Fatal("stale private evidence still counted as current")
+	}
+	if classifyGiftWrap(giftWrapEvidence{Accept: "accepted", Observer: "incomplete", ObserverHit: true}) != "public" {
+		t.Fatal("an observed unauthorized hit was discarded because EOSE did not arrive")
+	}
+}
+
+func TestAuthAcknowledgementIsNotPublication(t *testing.T) {
+	key := newKey(t)
+	pubkey := pubOf(key)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON([]any{"AUTH", "challenge-2"})
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var frame []json.RawMessage
+		if json.Unmarshal(payload, &frame) != nil || len(frame) < 2 {
+			return
+		}
+		var signed map[string]any
+		if json.Unmarshal(frame[1], &signed) != nil {
+			return
+		}
+		authID, _ := signed["id"].(string)
+		_ = conn.WriteJSON([]any{"OK", authID, true, ""})
+		_ = conn.WriteJSON([]any{"OK", "wanted", true, ""})
+	}))
+	defer server.Close()
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`["EVENT",{}]`))
+	ack, authStatus := readWriteAckWithAuth(conn, "wanted", time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+		return signAuth(key, pubkey, wsURL(server), challenge)
+	})
+	if ack != "accepted" || authStatus != "ok" {
+		t.Fatalf("ack=%s auth=%s", ack, authStatus)
+	}
+}
+
 func TestGiftWrapDecryptsOnlyForTheRecipient(t *testing.T) {
 	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
 	senderPub := pubOf(sender)
@@ -104,14 +181,14 @@ func TestGiftWrapProbeRequiresRecipientOnlyEvidence(t *testing.T) {
 		observerKey: observer, observerPub: pubOf(observer),
 		allowlist: []string{probeHost(wsURL(server))},
 	}
-	evidence := state.exchangeGiftWrap(t.Context(), wsURL(server))
+	evidence := state.exchangeGiftWrap(t.Context(), nil, wsURL(server))
 	if evidence.Outcome != "private" || evidence.Accept != "accepted" {
 		t.Fatalf("evidence = %+v", evidence)
 	}
 	publicServer := giftWrapServer(t, recipientPub, &published, true)
 	defer publicServer.Close()
 	state.allowlist = []string{probeHost(wsURL(publicServer))}
-	public := state.exchangeGiftWrap(t.Context(), wsURL(publicServer))
+	public := state.exchangeGiftWrap(t.Context(), nil, wsURL(publicServer))
 	if public.Outcome != "public" {
 		t.Fatalf("public evidence = %+v", public)
 	}

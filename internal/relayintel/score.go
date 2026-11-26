@@ -1,6 +1,9 @@
 package relayintel
 
-import "math"
+import (
+	"math"
+	"time"
+)
 
 // Weights are the scoring shares for one role. Diversity is intentionally
 // absent: it is applied once, to the selected set.
@@ -403,20 +406,74 @@ func reachComponent(in ScoreInput) (float64, float64) {
 	return clamp01(adoption), conf
 }
 
+func privacyAssessment(caps map[string]Capability) string {
+	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
+	public := caps[CapGiftWrapPublic]
+	privateAt := observedAt(private)
+	publicAt := observedAt(public)
+	publicVerified := public.Status == StatusVerified
+	privateVerified := private.Status == StatusVerified
+	switch {
+	case publicVerified && privateVerified:
+		if privateAt.After(publicAt) && !staleObservation(privateAt) {
+			return "recipient_only_verified"
+		}
+		return "publicly_accessible"
+	case publicVerified:
+		return "publicly_accessible"
+	case privateVerified && staleObservation(privateAt):
+		return "stale"
+	case privateVerified:
+		return "recipient_only_verified"
+	default:
+		return "privacy_unknown"
+	}
+}
+
+func newerCapability(left, right Capability) Capability {
+	if right.Status != StatusVerified && right.Status != StatusStale {
+		return left
+	}
+	if left.Status != StatusVerified && left.Status != StatusStale {
+		return right
+	}
+	if observedAt(right).After(observedAt(left)) {
+		return right
+	}
+	return left
+}
+
+func observedAt(cap Capability) time.Time {
+	if cap.ObservedAt == nil {
+		return time.Time{}
+	}
+	return *cap.ObservedAt
+}
+
+func staleObservation(at time.Time) bool {
+	return !at.IsZero() && time.Since(at) > ProbeStaleFor
+}
+
 func privacyComponent(role string, caps map[string]Capability) (float64, float64, []Reason) {
 	if role != RoleDMInbox && role != RoleKeyPackage {
 		return 0.5, 0.3, nil
 	}
-	private := caps[CapGiftWrapPrivate]
-	public := caps[CapGiftWrapPublic]
 	accept := caps[CapGiftWrapAccept]
 	wrap := caps[CapGiftWrap]
 	auth := caps[CapAuth]
+	switch privacyAssessment(caps) {
+	case "recipient_only_verified":
+		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "The newest complete gift-wrap check was recipient-only. This is not a delivery or anonymity guarantee."}}
+	case "publicly_accessible":
+		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "A newer or equally recent observation showed unauthorized gift-wrap retrieval. Older recipient-only evidence does not override it."}}
+	case "stale":
+		return 0.35, 0.3, []Reason{{Code: "giftwrap_stale", Text: "The recipient-only observation is older than seven days and has not been confirmed again."}}
+	case "privacy_unknown":
+		if accept.Status == StatusVerified {
+			return 0.4, 0.45, []Reason{{Code: "giftwrap_accepted_only", Text: "The relay accepted a gift wrap. Recipient-only access was not established."}}
+		}
+	}
 	switch {
-	case private.Status == StatusVerified || wrap.Status == StatusVerified:
-		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "A synthetic gift wrap was retrieved by the recipient and was absent from a completed observer query. This is not a delivery or anonymity guarantee."}}
-	case public.Status == StatusVerified:
-		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "An observer that is not the recipient retrieved the gift wrap. Acceptance does not make this relay private."}}
 	case accept.Status == StatusVerified:
 		return 0.4, 0.45, []Reason{{Code: "giftwrap_accepted_only", Text: "The relay accepted a gift wrap. Recipient-only access was not established."}}
 	case wrap.Status == StatusUnsupported || accept.Status == StatusUnsupported:
@@ -454,10 +511,10 @@ func functionalityComponent(role string, caps map[string]Capability) (float64, f
 		if wrap.Status == StatusUnsupported {
 			return 0, 0.8, []Reason{{Code: "dm_unsupported", Text: "The relay does not accept the gift-wrap kinds used for DMs."}}, "dm_unsupported"
 		}
-		if caps[CapGiftWrapPrivate].Status == StatusVerified || wrap.Status == StatusVerified {
+		switch privacyAssessment(caps) {
+		case "recipient_only_verified":
 			return 0.9, 0.8, nil, ""
-		}
-		if caps[CapGiftWrapPublic].Status == StatusVerified {
+		case "publicly_accessible":
 			return 0.2, 0.75, []Reason{{Code: "dm_public_giftwrap", Text: "Gift wraps on this relay were readable by an observer. That is not suitable for private messages."}}, ""
 		}
 		read := caps[CapRead]

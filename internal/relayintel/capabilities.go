@@ -56,6 +56,7 @@ type Observation struct {
 	ObservedAt     time.Time
 	SampleCount    int
 	RecentFailures int
+	RecentWindow   int
 	Detail         string
 }
 
@@ -335,7 +336,11 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 			current.Source = obs.Source
 			current.SampleCount = obs.SampleCount
 			current.RecentFailures = obs.RecentFailures
-			current.Status, current.Confidence = adjustForRecentFailures(current.Status, current.Confidence, obs.RecentFailures, obs.SampleCount)
+			window := obs.SampleCount
+			if obs.RecentWindow > 0 {
+				window = obs.RecentWindow
+			}
+			current.Status, current.Confidence = adjustForRecentFailures(current.Status, current.Confidence, obs.RecentFailures, window)
 			if obs.Detail != "" {
 				current.Detail = obs.Detail
 			}

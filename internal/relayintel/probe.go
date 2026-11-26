@@ -31,6 +31,7 @@ type probeState struct {
 	globalLimit  int
 	minInterval  time.Duration
 	giftwrap     bool
+	turn         int
 	allowlist    []string
 	recipientKey *btcec.PrivateKey
 	recipientPub string
@@ -81,7 +82,8 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 	if p == nil || pool == nil {
 		return nil
 	}
-	if p.giftwrap {
+	p.turn++
+	if p.giftwrap && p.turn%2 == 0 {
 		probed, err := p.probeOneGiftWrap(ctx, pool)
 		if err != nil || probed {
 			return err
@@ -101,9 +103,10 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		      AND l.capability = CASE WHEN s.role = 'search' THEN 'search' ELSE 'write_accept' END
 		      AND l.expires_at > now()
 		  )
+		  AND lower(split_part(split_part(regexp_replace(s.endpoint_url, '^wss?://', ''), '/', 1), ':', 1)) = ANY($1::text[])
 		ORDER BY o.observed_at ASC NULLS FIRST, s.trust_weighted DESC, s.url_key ASC
 		LIMIT 50
-	`)
+	`, p.allowlist)
 	if err != nil {
 		return wrapDB(err)
 	}
@@ -133,12 +136,16 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 			continue
 		}
 		if item.role == RoleSearch {
-			p.search(ctx, pool, item.url, item.key)
+			p.search(ctx, pool, item.url, item.key, token)
 		} else {
-			p.write(ctx, pool, item.url, item.key)
+			p.write(ctx, pool, item.url, item.key, token)
 		}
 		p.finish(ctx, pool, token)
 		return nil
+	}
+	if p.giftwrap && p.turn%2 == 1 {
+		_, err = p.probeOneGiftWrap(ctx, pool)
+		return err
 	}
 	return nil
 }
@@ -181,7 +188,7 @@ func probeHost(raw string) string {
 	return parsed.Hostname()
 }
 
-func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, key string) {
+func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) {
 	event, err := signProbeEvent(p.key, p.pubkey)
 	if err != nil {
 		metrics.IncRelayIntelProbe("write", "error")
@@ -204,26 +211,26 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
 	})
 	if pool != nil && authStatus == "ok" {
-		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusVerified, 0.7, "probe", "auth_succeeded")
+		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusVerified, 0.7, "probe", "auth_succeeded", token)
 	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
-		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusRestricted, 0.6, "probe", authStatus)
+		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusRestricted, 0.6, "probe", authStatus, token)
 	}
 	if ack != "accepted" {
 		if pool != nil && ack == "rejected" {
-			_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusRestricted, 0.55, "probe", "ok_false")
+			_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusRestricted, 0.55, "probe", "ok_false", token)
 		}
 		metrics.IncRelayIntelProbe("write", ack)
 		return
 	}
 	if pool != nil {
-		_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusVerified, 0.8, "probe", "ok_true")
+		_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusVerified, 0.8, "probe", "ok_true", token)
 	}
 	found, err := fetchEvents(ctx, relayURL, p.allowPrivate, map[string]any{"ids": []string{id}, "limit": 1})
 	if err == nil {
 		for _, item := range found {
 			if item != nil && item.ID == id {
 				if pool != nil {
-					_ = storeObservation(ctx, pool, key, CapWriteRetrieve, StatusVerified, 0.85, "probe", "retrieved")
+					_ = storeObservation(ctx, pool, key, CapWriteRetrieve, StatusVerified, 0.85, "probe", "retrieved", token)
 				}
 				metrics.IncRelayIntelProbe("write", "ok")
 				return
@@ -233,7 +240,7 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 	metrics.IncRelayIntelProbe("write", "incomplete")
 }
 
-func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, key string) {
+func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, key, token string) {
 	event, err := signProbeEvent(p.key, p.pubkey)
 	if err != nil {
 		metrics.IncRelayIntelProbe("search", "error")
@@ -256,9 +263,9 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
 	})
 	if pool != nil && authStatus == "ok" {
-		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusVerified, 0.7, "probe", "auth_succeeded")
+		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusVerified, 0.7, "probe", "auth_succeeded", token)
 	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
-		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusRestricted, 0.6, "probe", authStatus)
+		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusRestricted, 0.6, "probe", authStatus, token)
 	}
 	if ack != "accepted" {
 		metrics.IncRelayIntelProbe("search", "inconclusive")
@@ -268,7 +275,7 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 	negative, negativeStatus := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative")
 	if positiveStatus == "unsupported" || negativeStatus == "unsupported" {
 		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusUnsupported, 0.7, "probe", "closed")
+			_ = storeObservation(ctx, pool, key, CapSearch, StatusUnsupported, 0.7, "probe", "closed", token)
 		}
 		metrics.IncRelayIntelProbe("search", "unsupported")
 		return
@@ -277,12 +284,12 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 	switch outcome {
 	case "verified":
 		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusVerified, 0.8, "probe", "search_match")
+			_ = storeObservation(ctx, pool, key, CapSearch, StatusVerified, 0.8, "probe", "search_match", token)
 		}
 		metrics.IncRelayIntelProbe("search", "ok")
 	case "ignored":
 		if pool != nil {
-			_ = storeObservation(ctx, pool, key, CapSearch, StatusRestricted, 0.6, "probe", "search_ignored")
+			_ = storeObservation(ctx, pool, key, CapSearch, StatusRestricted, 0.6, "probe", "search_ignored", token)
 		}
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 	default:
@@ -323,29 +330,40 @@ func readWriteAck(conn *websocket.Conn, eventID string, deadline time.Time) stri
 
 func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, string) {
 	authState := ""
+	authEventID := ""
+	attempts := 0
+	messages := 0
+	total := 0
 	for {
+		if messages >= 32 || total >= 256*1024 {
+			return "incomplete", authState
+		}
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			return "timeout", authState
 		}
+		messages++
+		total += len(message)
 		var frame []any
 		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
 			continue
 		}
 		typ, _ := frame[0].(string)
 		if typ == "AUTH" {
-			if auth == nil || len(frame) < 2 {
+			if attempts >= 2 || auth == nil || len(frame) < 2 {
 				return "auth_required", "required"
 			}
 			challenge, _ := frame[1].(string)
 			if challenge == "" {
 				return "auth_required", "required"
 			}
+			attempts++
 			signed, err := auth(challenge)
 			if err != nil {
 				return "auth_required", "failed"
 			}
+			authEventID, _ = signed["id"].(string)
 			payload, _ := json.Marshal([]any{"AUTH", signed})
 			_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
@@ -353,6 +371,17 @@ func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Ti
 			}
 			authState = "sent"
 			continue
+		}
+		if typ == "OK" && len(frame) >= 3 {
+			id, _ := frame[1].(string)
+			if authEventID != "" && id == authEventID {
+				ok, isBool := frame[2].(bool)
+				if !isBool || !ok {
+					return "unauthorized", "unauthorized"
+				}
+				authState = "ok"
+				continue
+			}
 		}
 		switch classifyWriteFrame(frame, eventID) {
 		case "accepted":
@@ -555,48 +584,76 @@ func signProbeEvent(priv *btcec.PrivateKey, pubkey string) (map[string]any, erro
 	}, nil
 }
 
-func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, status string, confidence float64, source, detail string) error {
-	recentFailures := 0
-	if _, err := pool.Exec(ctx, `
+func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, status string, confidence float64, source, detail, token string) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if token != "" {
+		var owned int
+		err = tx.QueryRow(ctx, `
+			SELECT count(*) FROM relay_probe_leases
+			WHERE lease_token = $1 AND expires_at > now()
+		`, token).Scan(&owned)
+		if err != nil {
+			return err
+		}
+		if owned != 1 {
+			return fmt.Errorf("probe lease %s cannot publish evidence", token)
+		}
+	}
+	if _, err = tx.Exec(ctx, `
 		INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, key, capability, status, confidence, source, detail); err != nil && !SchemaMissing(err) {
+	`, key, capability, status, confidence, source, detail); err != nil {
+		if SchemaMissing(err) {
+			return nil
+		}
 		return err
-	} else if err == nil {
-		_, _ = pool.Exec(ctx, `
-			DELETE FROM relay_capability_samples
-			WHERE id IN (
-				SELECT id FROM relay_capability_samples
-				WHERE url_key = $1 AND capability = $2
-				ORDER BY observed_at DESC, id DESC
-				OFFSET 20
-			)
-		`, key, capability)
-		_ = pool.QueryRow(ctx, `
-			SELECT count(*) FILTER (WHERE status IN ('unsupported', 'restricted', 'inconclusive', 'temporary'))
-			FROM (
-				SELECT status FROM relay_capability_samples
-				WHERE url_key = $1 AND capability = $2
-				ORDER BY observed_at DESC, id DESC
-				LIMIT 20
-			) recent
-		`, key, capability).Scan(&recentFailures)
 	}
-	_, err := pool.Exec(ctx, `
+	_, _ = tx.Exec(ctx, `
+		DELETE FROM relay_capability_samples
+		WHERE id IN (
+			SELECT id FROM relay_capability_samples
+			WHERE url_key = $1 AND capability = $2
+			ORDER BY observed_at DESC, id DESC
+			OFFSET 20
+		)
+	`, key, capability)
+	recentFailures, recentWindow := 0, 0
+	_ = tx.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE status IN ('unsupported', 'restricted', 'temporary'))
+		FROM (
+			SELECT status FROM relay_capability_samples
+			WHERE url_key = $1 AND capability = $2
+			ORDER BY observed_at DESC, id DESC
+			LIMIT 20
+		) recent
+	`, key, capability).Scan(&recentWindow, &recentFailures)
+	provisional := status == "inconclusive" || status == "temporary"
+	if _, err = tx.Exec(ctx, `
 		INSERT INTO relay_capability_observations (
 			url_key, capability, status, confidence, source, detail, sample_count, observed_at
 		) VALUES (
-			$1, $2, $3, $4, $5, jsonb_build_object('text', $6::text, 'recent_failures', $7::int), 1, now()
+			$1, $2, $3, $4, $5, jsonb_build_object('text', $6::text, 'recent_failures', $7::int, 'recent_window', $8::int), 1, now()
 		)
 		ON CONFLICT (url_key, capability) DO UPDATE
-		SET status = EXCLUDED.status,
+		SET status = CASE
+		        WHEN $9::bool AND relay_capability_observations.status IN ('verified', 'unsupported', 'restricted')
+		        THEN relay_capability_observations.status
+		        ELSE EXCLUDED.status
+		    END,
 		    confidence = EXCLUDED.confidence,
 		    source = EXCLUDED.source,
 		    detail = EXCLUDED.detail,
 		    sample_count = relay_capability_observations.sample_count + 1,
-		    observed_at = now()
-	`, key, capability, status, confidence, source, detail, recentFailures)
-	if err != nil {
+		    observed_at = CASE WHEN $9::bool THEN relay_capability_observations.observed_at ELSE now() END
+	`, key, capability, status, confidence, source, detail, recentFailures, recentWindow, provisional); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
 	metrics.IncRelayIntelCapability(capability, status)

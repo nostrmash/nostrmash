@@ -227,7 +227,8 @@ func loadObservations(ctx context.Context, pool *pgxpool.Pool, keys []string) (m
 	rows, err := pool.Query(ctx, `
 		SELECT url_key, capability, status, confidence, source,
 		       COALESCE(detail->>'text', ''), sample_count,
-		       COALESCE((detail->>'recent_failures')::int, 0), observed_at
+		       COALESCE((detail->>'recent_failures')::int, 0),
+		       COALESCE((detail->>'recent_window')::int, 0), observed_at
 		FROM relay_capability_observations
 		WHERE url_key = ANY($1::text[])
 	`, keys)
@@ -239,7 +240,7 @@ func loadObservations(ctx context.Context, pool *pgxpool.Pool, keys []string) (m
 		var item Observation
 		if err := rows.Scan(
 			&item.URLKey, &item.Capability, &item.Status, &item.Confidence, &item.Source,
-			&item.Detail, &item.SampleCount, &item.RecentFailures, &item.ObservedAt,
+			&item.Detail, &item.SampleCount, &item.RecentFailures, &item.RecentWindow, &item.ObservedAt,
 		); err != nil {
 			return nil, err
 		}

@@ -1259,6 +1259,12 @@ func capabilityConfidence(role string, caps map[string]Capability) float64 {
 	case RoleSearch:
 		return caps[CapSearch].Confidence
 	case RoleDMInbox:
+		if privacyAssessment(caps) == "publicly_accessible" {
+			return 0
+		}
+		if privacyAssessment(caps) == "recipient_only_verified" && caps[CapGiftWrapPrivate].Confidence > 0 {
+			return caps[CapGiftWrapPrivate].Confidence
+		}
 		return caps[CapGiftWrap].Confidence
 	case RoleKeyPackage:
 		return caps[CapKeyPackage].Confidence

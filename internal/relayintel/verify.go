@@ -444,6 +444,9 @@ func dialRelay(ctx context.Context, relayURL string, allowPrivate bool, timeout 
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
+	if conn != nil {
+		conn.SetReadLimit(64 * 1024)
+	}
 	return conn, err
 }
 

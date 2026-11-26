@@ -46,9 +46,10 @@ func (p *probeState) probeOneGiftWrap(ctx context.Context, pool *pgxpool.Pool) (
 		      AND l.capability = 'giftwrap_private'
 		      AND l.expires_at > now()
 		  )
+		  AND lower(split_part(split_part(regexp_replace(s.endpoint_url, '^wss?://', ''), '/', 1), ':', 1)) = ANY($1::text[])
 		ORDER BY o.observed_at ASC NULLS FIRST, s.trust_weighted DESC, s.url_key ASC
 		LIMIT 20
-	`)
+	`, p.allowlist)
 	if err != nil {
 		return false, wrapDB(err)
 	}
@@ -65,21 +66,24 @@ func (p *probeState) probeOneGiftWrap(ctx context.Context, pool *pgxpool.Pool) (
 		if !ok {
 			continue
 		}
-		evidence := p.exchangeGiftWrap(ctx, relayURL)
-		p.storeGiftWrap(ctx, pool, key, evidence)
+		evidence := p.exchangeGiftWrap(ctx, pool, relayURL)
+		p.storeGiftWrap(ctx, pool, key, token, evidence)
 		p.finish(ctx, pool, token)
 		return true, nil
 	}
 	return false, rows.Err()
 }
 
-func (p *probeState) exchangeGiftWrap(ctx context.Context, relayURL string) giftWrapEvidence {
+func (p *probeState) exchangeGiftWrap(ctx context.Context, pool *pgxpool.Pool, relayURL string) giftWrapEvidence {
 	event, err := buildGiftWrap(p.key, p.pubkey, p.recipientPub)
 	if err != nil {
 		metrics.IncRelayIntelProbe("giftwrap", "error")
 		return giftWrapEvidence{Outcome: "error"}
 	}
 	id, _ := event["id"].(string)
+	if pub, _ := event["pubkey"].(string); pub != "" && pool != nil {
+		_, _ = pool.Exec(ctx, `INSERT INTO relay_probe_identities (pubkey) VALUES ($1) ON CONFLICT (pubkey) DO NOTHING`, pub)
+	}
 	conn, err := dialRelay(ctx, relayURL, p.allowPrivate, 5*time.Second)
 	if err != nil {
 		metrics.IncRelayIntelProbe("giftwrap", classifyDial(err))
@@ -103,8 +107,24 @@ func (p *probeState) exchangeGiftWrap(ctx context.Context, relayURL string) gift
 		}
 		return evidence
 	}
-	evidence.Recipient, evidence.RecipientHit = p.readGiftWrap(ctx, relayURL, id, p.recipientKey, p.recipientPub, true)
-	evidence.Observer, evidence.ObserverHit = p.readGiftWrap(ctx, relayURL, id, p.observerKey, p.observerPub, false)
+	recipientID, recipientIDHit := p.readGiftWrap(ctx, relayURL, id, p.recipientKey, p.recipientPub, false)
+	recipientTag, recipientTagHit := p.readGiftWrap(ctx, relayURL, id, p.recipientKey, p.recipientPub, true)
+	observerID, observerIDHit := p.readGiftWrap(ctx, relayURL, id, p.observerKey, p.observerPub, false)
+	observerTag, observerTagHit := p.readGiftWrap(ctx, relayURL, id, p.observerKey, p.observerPub, true)
+	evidence.RecipientHit = recipientIDHit || recipientTagHit
+	evidence.ObserverHit = observerIDHit || observerTagHit
+	if evidence.RecipientHit && (recipientID == "complete" || recipientTag == "complete") {
+		evidence.Recipient = "complete"
+	} else {
+		evidence.Recipient = "incomplete"
+	}
+	if evidence.ObserverHit {
+		evidence.Observer = "complete"
+	} else if observerID == "complete" && observerTag == "complete" {
+		evidence.Observer = "complete"
+	} else {
+		evidence.Observer = "incomplete"
+	}
 	evidence.Outcome = classifyGiftWrap(evidence)
 	return evidence
 }
@@ -125,29 +145,29 @@ func (p *probeState) readGiftWrap(ctx context.Context, relayURL, eventID string,
 	return status, containsID(ids, eventID)
 }
 
-func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key string, evidence giftWrapEvidence) {
+func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key, token string, evidence giftWrapEvidence) {
 	if pool == nil {
 		return
 	}
 	if evidence.Accept == "accepted" {
-		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, StatusVerified, 0.7, "probe", "ok_true")
+		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, StatusVerified, 0.7, "probe", "ok_true", token)
 	} else if evidence.Accept == "rejected" {
-		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, StatusUnsupported, 0.7, "probe", "ok_false")
+		_ = storeObservation(ctx, pool, key, CapGiftWrapAccept, StatusUnsupported, 0.7, "probe", "ok_false", token)
 	}
 	switch evidence.Auth {
 	case "ok":
-		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusVerified, 0.7, "probe", "auth_succeeded")
+		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusVerified, 0.7, "probe", "auth_succeeded", token)
 	case "unauthorized":
-		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusRestricted, 0.6, "probe", "auth_rejected")
+		_ = storeObservation(ctx, pool, key, CapAuthGiftWrap, StatusRestricted, 0.6, "probe", "auth_rejected", token)
 	}
 	switch evidence.Outcome {
 	case "private":
-		_ = storeObservation(ctx, pool, key, CapGiftWrapPrivate, StatusVerified, 0.8, "probe", "recipient_only")
-		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusVerified, 0.8, "probe", "recipient_only")
+		_ = storeObservation(ctx, pool, key, CapGiftWrapPrivate, StatusVerified, 0.8, "probe", "recipient_only", token)
+		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusVerified, 0.8, "probe", "recipient_only", token)
 		metrics.IncRelayIntelProbe("giftwrap", "ok")
 	case "public":
-		_ = storeObservation(ctx, pool, key, CapGiftWrapPublic, StatusVerified, 0.8, "probe", "observer_retrieved")
-		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusRestricted, 0.7, "probe", "publicly_accessible")
+		_ = storeObservation(ctx, pool, key, CapGiftWrapPublic, StatusVerified, 0.8, "probe", "observer_retrieved", token)
+		_ = storeObservation(ctx, pool, key, CapGiftWrap, StatusRestricted, 0.7, "probe", "publicly_accessible", token)
 		metrics.IncRelayIntelProbe("giftwrap", "public")
 	default:
 		metrics.IncRelayIntelProbe("giftwrap", "inconclusive")
@@ -158,7 +178,7 @@ func classifyGiftWrap(evidence giftWrapEvidence) string {
 	if evidence.Accept != "accepted" {
 		return evidence.Accept
 	}
-	if evidence.Observer == "complete" && evidence.ObserverHit {
+	if evidence.ObserverHit {
 		return "public"
 	}
 	if evidence.Recipient == "complete" && evidence.RecipientHit && evidence.Observer == "complete" && !evidence.ObserverHit {
