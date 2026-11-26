@@ -158,13 +158,17 @@ Relay URLs, NIP-11 documents, event bodies, and API parameters are untrusted. Di
 
 ## Frontend flow
 
-1. `GET /api/v1/profiles/{pubkey}/relay-config` and `relay-diagnostics`.
-2. `GET /api/v1/profiles/{pubkey}/relay-recommendations` or `POST /api/v1/relays/optimize` with the user's pins, excludes, paid relays, and auth preferences.
-3. Show the unsigned event, the diff, reason codes, coverage, unknown weight, and `attention_required` items. Do not hide partial constraint failures.
-4. If `based_on_event_id` no longer matches the client's latest event, stop and reload.
-5. Ask the signer (NIP-07 or NIP-46) for a signature. NostrMash never sees the secret.
-6. The client publishes the signed event to the relays it chooses.
-7. `POST /api/v1/relays/verify` with the signed event and at least two relays. Treat `partial`, `conflict`, and `insufficient_relay_sample` as incomplete.
+The future `/relays/manager` screen can use this API now. It should not offer one-click signing until `ready_to_sign` is true for that event, and it must still reload the newest source before asking for a signature. Gift-wrap, search, and write probes are a separate workstream. Until those observations exist, DM and search rows should say the capability is unverified.
+
+1. Connect with NIP-07 or NIP-46 in the browser. Send the pubkey only. Do not send a private key.
+2. `GET /api/v1/profiles/{pubkey}/relay-config` shows the indexed lists. `relay-diagnostics` shows health findings. Neither is a network-wide proof that the account has no other list.
+3. `GET /api/v1/profiles/{pubkey}/relay-recommendations` or `POST /api/v1/relays/optimize` with pins, exclusions, paid relays, and auth preferences. Pass the newest signed events the client already has in `source_events`.
+4. Show the current list and the proposed list. `shared_configuration` means the public outbox and KeyPackage discovery are one kind 10002 event. A warning there means a messaging client must publish a new KeyPackage after the outbox changes. Do not treat every kind 10002 as proof the account uses Marmot.
+5. `allow_create` asks for a first list when this index has no source. `allow_recreate` is the only switch that rebuilds a list with a deletion tombstone. Both stay in review. `ready_to_sign` is the only flag that means this response's replacement matched the selection and the constraints. A warning does not clear it, and a creation never sets it.
+6. If `requires_refresh` is true, or `based_on_event_id` does not match the event the client just fetched, stop. Fetch the latest event from relays and call optimize again.
+7. Ask the signer to sign. Publish the signed event from the client. This server does not sign or publish.
+8. `POST /api/v1/relays/verify` checks a sample. `sample_verified` is the success field. `global_success` is not network-wide propagation. A partial publish stays partial until the missing relays agree or the user stops.
+9. Restoration is another signed event from the user. There is no server-side rollback of a published list.
 
 ## Operations
 
