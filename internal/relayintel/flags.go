@@ -2,11 +2,14 @@ package relayintel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -59,7 +62,7 @@ func SyntheticAuthor(ctx context.Context, pool *pgxpool.Pool, pubkey string) boo
 	if SyntheticPubkey(pubkey) {
 		return true
 	}
-	if _, ok := syntheticMisses.Load(pubkey); ok {
+	if missFresh(pubkey) {
 		return false
 	}
 	if pool == nil || len(pubkey) != 64 {
@@ -69,16 +72,42 @@ func SyntheticAuthor(ctx context.Context, pool *pgxpool.Pool, pubkey string) boo
 	err := pool.QueryRow(ctx, `SELECT 1 FROM relay_probe_identities WHERE pubkey = $1`, pubkey).Scan(&one)
 	if err == nil {
 		RememberSynthetic(pubkey)
+		dropSyntheticMiss(pubkey)
 		return true
 	}
-	if SchemaMissing(err) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		storeSyntheticMiss(pubkey)
 		return false
 	}
-	if syntheticMissCount.Load() < 20000 {
-		syntheticMisses.Store(pubkey, struct{}{})
+	return false
+}
+
+func missFresh(pubkey string) bool {
+	value, ok := syntheticMisses.Load(pubkey)
+	if !ok {
+		return false
+	}
+	expires, ok := value.(time.Time)
+	if ok && time.Now().Before(expires) {
+		return true
+	}
+	dropSyntheticMiss(pubkey)
+	return false
+}
+
+func storeSyntheticMiss(pubkey string) {
+	if syntheticMissCount.Load() >= 20000 {
+		return
+	}
+	if _, loaded := syntheticMisses.LoadOrStore(pubkey, time.Now().Add(15*time.Second)); !loaded {
 		syntheticMissCount.Add(1)
 	}
-	return false
+}
+
+func dropSyntheticMiss(pubkey string) {
+	if _, loaded := syntheticMisses.LoadAndDelete(pubkey); loaded {
+		syntheticMissCount.Add(-1)
+	}
 }
 
 // registerSyntheticIdentity records a probe pubkey before a test event is sent.
@@ -89,14 +118,14 @@ func registerSyntheticIdentity(ctx context.Context, pool *pgxpool.Pool, pubkey s
 		return fmt.Errorf("synthetic identity is not a pubkey")
 	}
 	RememberSynthetic(pubkey)
-	syntheticMisses.Delete(pubkey)
+	dropSyntheticMiss(pubkey)
 	if pool == nil {
 		return nil
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO relay_probe_identities (pubkey) VALUES ($1)
 		ON CONFLICT (pubkey) DO NOTHING
-	`, pubkey); err != nil && !SchemaMissing(err) {
+	`, pubkey); err != nil {
 		return err
 	}
 	return nil

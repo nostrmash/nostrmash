@@ -179,8 +179,8 @@ func TestGiftWrapDecryptsOnlyForTheRecipient(t *testing.T) {
 	}
 	if classifyGiftWrap(giftWrapEvidence{
 		Accept: "accepted", Checked: true,
-		RecipientExact: accessResult{Status: "complete", Hit: true, Authenticated: true},
-		RecipientTag:   accessResult{Status: "complete", Hit: true, Authenticated: true},
+		RecipientExact: accessResult{Status: "complete", Hit: true, HitAfterAuth: true, Authenticated: true},
+		RecipientTag:   accessResult{Status: "complete", Hit: true, HitAfterAuth: true, Authenticated: true},
 		ObserverExact:  accessResult{Status: "complete", Authenticated: true},
 		ObserverTag:    accessResult{Status: "complete", Authenticated: true},
 		AnonExact:      accessResult{Status: "complete"},
@@ -190,8 +190,8 @@ func TestGiftWrapDecryptsOnlyForTheRecipient(t *testing.T) {
 	}
 	denied := giftWrapEvidence{
 		Accept: "accepted", Checked: true,
-		RecipientExact: accessResult{Status: "complete", Hit: true, Authenticated: true},
-		RecipientTag:   accessResult{Status: "complete", Hit: true, Authenticated: true},
+		RecipientExact: accessResult{Status: "complete", Hit: true, HitAfterAuth: true, Authenticated: true},
+		RecipientTag:   accessResult{Status: "complete", Hit: true, HitAfterAuth: true, Authenticated: true},
 		ObserverExact:  accessResult{Status: "denied", Authenticated: true},
 		ObserverTag:    accessResult{Status: "denied", Authenticated: true},
 		AnonExact:      accessResult{Status: "auth_required"},
@@ -388,8 +388,49 @@ func TestExposureBeforeAuthSurvivesAuthentication(t *testing.T) {
 	if evidence.Outcome != "public" {
 		t.Fatalf("pre-auth exposure became %s: %+v", evidence.Outcome, evidence)
 	}
-	if !evidence.ObserverExact.SeenBeforeAuth || !evidence.ObserverExact.Hit || !evidence.AnonExact.Hit {
+	if !evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverExact.HitAfterAuth || !evidence.AnonExact.Hit {
 		t.Fatalf("unauthorized retrieval was not retained: %+v", evidence)
+	}
+	if !evidence.RecipientExact.SeenBeforeAuth || evidence.RecipientExact.HitAfterAuth {
+		t.Fatalf("recipient pre-auth retrieval counted as authenticated access: %+v", evidence.RecipientExact)
+	}
+}
+
+func TestRecipientPreAuthExposureIsNotAuthenticatedRetrieval(t *testing.T) {
+	sender, recipient := newKey(t), newKey(t)
+	recipientPub := pubOf(recipient)
+	var published map[string]any
+	server := giftWrapServer(t, recipientPub, &published, "expose_then_empty")
+	defer server.Close()
+	state := &probeState{
+		key: sender, pubkey: pubOf(sender), allowPrivate: true,
+		recipientKey: recipient, recipientPub: recipientPub,
+		allowlist: []string{probeHost(wsURL(server))},
+	}
+	event, err := buildGiftWrap(sender, pubOf(sender), recipientPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := event["id"].(string)
+	published = event
+	result := state.readGiftWrap(t.Context(), wsURL(server), id, recipient, recipientPub, recipientPub, false, true)
+	if !result.SeenBeforeAuth || result.HitAfterAuth || result.Hit {
+		t.Fatalf("authenticated retrieval was manufactured from pre-auth exposure: %+v", result)
+	}
+	if !result.Authenticated || result.Status != "complete" {
+		t.Fatalf("authenticated subscription did not complete: %+v", result)
+	}
+	evidence := giftWrapEvidence{
+		Accept: "accepted", Checked: true,
+		RecipientExact: result,
+		RecipientTag:   accessResult{Status: "complete", Authenticated: true},
+		ObserverExact:  accessResult{Status: "complete", Authenticated: true},
+		ObserverTag:    accessResult{Status: "complete", Authenticated: true},
+		AnonExact:      accessResult{Status: "complete"},
+		AnonTag:        accessResult{Status: "auth_required"},
+	}
+	if classifyGiftWrap(evidence) == "private" {
+		t.Fatal("pre-auth recipient exposure satisfied recipient-only verification")
 	}
 }
 
@@ -583,6 +624,17 @@ func giftWrapServer(t *testing.T, recipient string, published *map[string]any, m
 				_ = json.Unmarshal(frame[1], &sub)
 				var filter map[string]any
 				_ = json.Unmarshal(frame[2], &filter)
+				if mode == "expose_then_empty" && authed == "" {
+					if *published != nil {
+						_ = conn.WriteJSON([]any{"EVENT", sub, *published})
+					}
+					_ = conn.WriteJSON([]any{"AUTH", "gift-challenge"})
+					continue
+				}
+				if mode == "expose_then_empty" {
+					_ = conn.WriteJSON([]any{"EOSE", sub})
+					continue
+				}
 				if mode == "expose_then_deny" && authed == "" {
 					if *published != nil {
 						_ = conn.WriteJSON([]any{"EVENT", sub, *published})

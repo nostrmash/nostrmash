@@ -38,6 +38,18 @@ func TestRetentionFollowupIsBudgetedAndRecoverable(t *testing.T) {
 	if scheduled != 1 {
 		t.Fatalf("scheduled %d follow-ups", scheduled)
 	}
+	state.allowlist = []string{"follow.example", "other.example"}
+	state.scheduleRetention(ctx, pool, "wss://other.example", "wss://other.example", eventID, published)
+	state.allowlist = []string{"follow.example"}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_probe_followups WHERE event_id = $1`, eventID).Scan(&scheduled); err != nil {
+		t.Fatal(err)
+	}
+	if scheduled != 2 {
+		t.Fatalf("same event on two relays scheduled %d follow-ups", scheduled)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM relay_probe_followups WHERE url_key = 'wss://other.example'`); err != nil {
+		t.Fatal(err)
+	}
 
 	state.allowlist = nil
 	var ran atomic.Int32
@@ -203,5 +215,88 @@ func TestSyntheticAuthorIsVisibleFromTheDatabase(t *testing.T) {
 	}
 	if !SyntheticAuthor(ctx, pool, pubkey) {
 		t.Fatal("another worker could not see the registered identity")
+	}
+	absent := strings.Repeat("34", 32)
+	if SyntheticAuthor(ctx, pool, absent) {
+		t.Fatal("an unknown author was treated as synthetic")
+	}
+	if err := registerSyntheticIdentity(ctx, pool, absent); err != nil {
+		t.Fatal(err)
+	}
+	syntheticPubkeys.Delete(absent)
+	syntheticMisses.Store(absent, time.Now().Add(-time.Second))
+	if !SyntheticAuthor(ctx, pool, absent) {
+		t.Fatal("an expired negative cache hid a newly registered identity")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	failed := strings.Repeat("56", 32)
+	if SyntheticAuthor(canceled, pool, failed) {
+		t.Fatal("a canceled lookup returned a synthetic identity")
+	}
+	if _, ok := syntheticMisses.Load(failed); ok {
+		t.Fatal("a canceled lookup was cached as absence")
+	}
+}
+
+func TestFollowupOwnershipAndRetryBounds(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "relay follow-up ownership"), "probefollow3")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_probe_followups (url_key, endpoint_url, event_id, capability, check_after, published_at, status, attempts)
+		VALUES
+			('wss://retry.example', 'wss://retry.example', $1, 'retention', now() - interval '1 minute', now() - interval '1 hour', 'retryable', 8),
+			('wss://old.example', 'wss://old.example', $2, 'retention', now() - interval '1 minute', now() - interval '8 days', 'pending', 1)
+	`, strings.Repeat("11", 32), strings.Repeat("22", 32)); err != nil {
+		t.Fatal(err)
+	}
+	state := &probeState{worker: "worker-a", allowPrivate: true, globalLimit: 20, minInterval: time.Second, allowlist: []string{"retry.example", "old.example"}}
+	if _, err := state.followOne(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	var retryStatus, oldStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_probe_followups WHERE event_id = $1`, strings.Repeat("11", 32)).Scan(&retryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM relay_probe_followups WHERE event_id = $1`, strings.Repeat("22", 32)).Scan(&oldStatus); err != nil {
+		t.Fatal(err)
+	}
+	if retryStatus != "failed" || oldStatus != "failed" {
+		t.Fatalf("retry=%s age=%s", retryStatus, oldStatus)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_probe_leases (url_key, capability, host, worker_id, lease_token, expires_at)
+		VALUES ('wss://owned.example', 'retention', 'owned.example', 'worker-a', 'lease-a', now() + interval '1 minute')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_probe_attempts (url_key, capability, host, worker_id, lease_token)
+		VALUES ('wss://owned.example', 'retention', 'owned.example', 'worker-a', 'lease-a')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var followupID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO relay_probe_followups (url_key, endpoint_url, event_id, capability, check_after, status, lease_token)
+		VALUES ('wss://owned.example', 'wss://owned.example', $1, 'retention', now(), 'running', 'lease-b')
+		RETURNING id
+	`, strings.Repeat("33", 32)).Scan(&followupID); err != nil {
+		t.Fatal(err)
+	}
+	err := commitProbeResult(ctx, pool, "wss://owned.example", "lease-a", "completed", followupID, "completed", "wrong owner", 10, nil)
+	if err == nil {
+		t.Fatal("a foreign lease completed the follow-up")
+	}
+	var owner string
+	if err := pool.QueryRow(ctx, `SELECT lease_token FROM relay_probe_followups WHERE id = $1`, followupID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "lease-b" {
+		t.Fatalf("follow-up lease changed to %s", owner)
 	}
 }

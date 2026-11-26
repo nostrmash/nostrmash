@@ -53,15 +53,20 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 			probes = state
 			exclude = pubkey
 			RememberSynthetic(pubkey)
+			registered := true
 			for _, pub := range []string{pubkey, state.recipientPub, state.observerPub} {
-				if _, err := pool.Exec(ctx, `
-					INSERT INTO relay_probe_identities (pubkey) VALUES ($1)
-					ON CONFLICT (pubkey) DO NOTHING
-				`, pub); err != nil && !SchemaMissing(err) {
+				if err := registerSyntheticIdentity(ctx, pool, pub); err != nil {
 					log.Error("relay_intel_probe_identity", "error", err.Error())
+					registered = false
 				}
 			}
-			log.Info("relay_intel_probe_identity_ready")
+			if !registered {
+				probes = nil
+				exclude = ""
+				log.Error("relay_intel_probe_disabled", "error", "synthetic identity registry unavailable")
+			} else {
+				log.Info("relay_intel_probe_identity_ready")
+			}
 		}
 	}
 	if cfg.BackfillEnabled {

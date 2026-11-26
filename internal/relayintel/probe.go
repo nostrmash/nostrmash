@@ -20,6 +20,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nostrmash/nostrmash/internal/metrics"
 )
@@ -190,7 +191,7 @@ func (p *probeState) scheduleRetention(ctx context.Context, pool *pgxpool.Pool, 
 		INSERT INTO relay_probe_followups (
 			url_key, endpoint_url, event_id, capability, check_after, published_at, status
 		) VALUES ($1, $2, $3, 'retention', $4, $5, 'pending')
-		ON CONFLICT (event_id, capability) DO NOTHING
+		ON CONFLICT (url_key, event_id, capability) DO NOTHING
 	`, key, relayURL, eventID, published.Add(time.Hour), published.UTC())
 }
 
@@ -206,23 +207,45 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 			LIMIT 200
 		)
 	`)
+	_, _ = pool.Exec(ctx, `
+		UPDATE relay_probe_followups
+		SET status = 'failed', result = 'retry_exhausted', finished_at = clock_timestamp()
+		WHERE finished_at IS NULL AND attempts >= 8
+	`)
+	_, _ = pool.Exec(ctx, `
+		UPDATE relay_probe_followups
+		SET status = 'failed', result = 'observation_expired', finished_at = clock_timestamp()
+		WHERE finished_at IS NULL
+		  AND published_at IS NOT NULL
+		  AND published_at < clock_timestamp() - interval '7 days'
+	`)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var id int64
 	var relayURL, eventID, key, previousToken string
 	var publishedAt, checkAfter *time.Time
-	err := pool.QueryRow(ctx, `
+	var attempts int
+	err = tx.QueryRow(ctx, `
 		UPDATE relay_probe_followups
-		SET status = 'claimed', attempts = attempts + 1
+		SET status = 'claimed', attempts = attempts + 1, claimed_at = clock_timestamp(), lease_token = ''
 		WHERE id = (
 			SELECT id FROM relay_probe_followups
 			WHERE finished_at IS NULL
+			  AND attempts < 8
+			  AND (published_at IS NULL OR published_at > clock_timestamp() - interval '7 days')
 			  AND (
-			    status IN ('pending', 'retryable') AND check_after <= now()
+			    status IN ('pending', 'retryable') AND check_after <= clock_timestamp()
 			    OR status IN ('claimed', 'running') AND (
+			        claimed_at IS NULL OR claimed_at < clock_timestamp() - interval '2 minutes'
+			    ) AND (
 			        lease_token = ''
 			        OR NOT EXISTS (
 			            SELECT 1 FROM relay_probe_leases l
 			            WHERE l.lease_token = relay_probe_followups.lease_token
-			              AND l.expires_at > now()
+			              AND l.expires_at > clock_timestamp()
 			        )
 			    )
 			  )
@@ -230,8 +253,8 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, endpoint_url, event_id, url_key, lease_token, published_at, check_after
-	`).Scan(&id, &relayURL, &eventID, &key, &previousToken, &publishedAt, &checkAfter)
+		RETURNING id, endpoint_url, event_id, url_key, lease_token, published_at, check_after, attempts
+	`).Scan(&id, &relayURL, &eventID, &key, &previousToken, &publishedAt, &checkAfter, &attempts)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) || SchemaMissing(err) {
 			return false, nil
@@ -239,35 +262,63 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 		return false, err
 	}
 	if !p.allowed(relayURL) {
-		_, _ = pool.Exec(ctx, `
+		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_followups
-			SET status = 'skipped', result = 'allowlist_removed', finished_at = now()
-			WHERE id = $1
-		`, id)
+			SET status = 'skipped', result = 'allowlist_removed', finished_at = clock_timestamp()
+			WHERE id = $1 AND status = 'claimed'
+		`, id); err != nil {
+			return false, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	if previousToken != "" {
-		_, _ = pool.Exec(ctx, `
+		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_attempts
-			SET finished_at = now(), status = 'expired'
+			SET finished_at = clock_timestamp(), status = 'expired'
 			WHERE lease_token = $1 AND finished_at IS NULL
-		`, previousToken)
+		`, previousToken); err != nil {
+			return false, err
+		}
 	}
-	token, ok := p.claim(ctx, pool, key, CapRetention, probeHost(relayURL))
-	if !ok {
-		_, _ = pool.Exec(ctx, `
+	seconds := int(p.minInterval.Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	var token string
+	if err = tx.QueryRow(ctx, `
+		SELECT claim_relay_probe($1, $2, $3, $4, $5, $6, 120)
+	`, key, CapRetention, probeHost(relayURL), p.worker, p.globalLimit, seconds).Scan(&token); err != nil {
+		return false, err
+	}
+	if token == "" {
+		if _, err = tx.Exec(ctx, `
 			UPDATE relay_probe_followups
-			SET status = 'pending', lease_token = '', check_after = now() + interval '5 minutes'
-			WHERE id = $1 AND finished_at IS NULL
-		`, id)
+			SET status = 'pending', lease_token = '', check_after = clock_timestamp() + interval '5 minutes'
+			WHERE id = $1 AND status = 'claimed'
+		`, id); err != nil {
+			return false, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		metrics.IncRelayIntelProbe(CapRetention, "skipped")
 		return false, nil
 	}
-	if _, err := pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE relay_probe_followups
 		SET status = 'running', lease_token = $2
-		WHERE id = $1
-	`, id, token); err != nil {
-		p.finish(ctx, pool, token)
+		WHERE id = $1 AND status = 'claimed'
+	`, id, token)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return false, fmt.Errorf("follow-up %d lost its claim", id)
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	published := time.Now().Add(-time.Hour)
@@ -309,11 +360,18 @@ func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, e
 		Capability: CapRetention, Status: obsStatus, Detail: result, Confidence: confidence,
 	}})
 	if err != nil {
+		nextStatus := "retryable"
+		if attempts >= 8 {
+			nextStatus = "failed"
+		}
 		_, _ = pool.Exec(ctx, `
 			UPDATE relay_probe_followups
-			SET status = 'retryable', check_after = now() + interval '5 minutes'
-			WHERE id = $1 AND finished_at IS NULL
-		`, id)
+			SET status = $3,
+			    lease_token = '',
+			    check_after = clock_timestamp() + interval '5 minutes',
+			    finished_at = CASE WHEN $3 = 'failed' THEN clock_timestamp() ELSE NULL END
+			WHERE id = $1 AND lease_token = $2 AND finished_at IS NULL
+		`, id, token, nextStatus)
 		return true, err
 	}
 	return true, nil
@@ -687,23 +745,29 @@ func readSubscription(ctx context.Context, conn *websocket.Conn, sub string, fil
 	retries := 0
 	messages := 0
 	total := 0
-	for messages < 32 && total < 256*1024 && time.Now().Before(deadline) {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
+	_ = conn.SetReadDeadline(deadline)
+	for messages < 32 && total < 256*1024 {
 		if ctx.Err() != nil {
 			return "incomplete", ids, exposed, authState == "ok"
 		}
-		wait := time.Until(deadline)
-		if wait > time.Second {
-			wait = time.Second
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() && time.Now().Before(deadline) && ctx.Err() == nil {
-				continue
-			}
-			if time.Now().After(deadline) {
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				_ = conn.Close()
 				return "timeout", ids, exposed, authState == "ok"
+			}
+			if ctx.Err() != nil {
+				return "incomplete", ids, exposed, authState == "ok"
 			}
 			return "incomplete", ids, exposed, authState == "ok"
 		}
@@ -1148,24 +1212,28 @@ func commitProbeResult(ctx context.Context, pool *pgxpool.Pool, key, token, atte
 		return err
 	}
 	if followupID > 0 {
-		if followStatus == "completed" || followStatus == "skipped" {
-			_, err = tx.Exec(ctx, `
+		var tag pgconn.CommandTag
+		if followStatus == "completed" || followStatus == "skipped" || followStatus == "failed" {
+			tag, err = tx.Exec(ctx, `
 				UPDATE relay_probe_followups
 				SET status = $2, result = $3, elapsed_seconds = $4,
 				    verified_at = clock_timestamp(), finished_at = clock_timestamp()
-				WHERE id = $1
-			`, followupID, followStatus, followResult, elapsed)
+				WHERE id = $1 AND lease_token = $5
+			`, followupID, followStatus, followResult, elapsed, token)
 		} else {
-			_, err = tx.Exec(ctx, `
+			tag, err = tx.Exec(ctx, `
 				UPDATE relay_probe_followups
 				SET status = $2, result = $3, elapsed_seconds = $4,
 				    verified_at = clock_timestamp(), lease_token = '',
 				    check_after = clock_timestamp() + interval '5 minutes'
-				WHERE id = $1 AND finished_at IS NULL
-			`, followupID, followStatus, followResult, elapsed)
+				WHERE id = $1 AND lease_token = $5 AND finished_at IS NULL
+			`, followupID, followStatus, followResult, elapsed, token)
 		}
 		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("follow-up %d is not owned by lease %s", followupID, token)
 		}
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM relay_probe_leases WHERE lease_token = $1`, token); err != nil {

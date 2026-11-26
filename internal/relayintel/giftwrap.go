@@ -43,7 +43,9 @@ type giftWrapEvidence struct {
 type accessResult struct {
 	Status         string
 	Hit            bool
+	HitAfterAuth   bool
 	Authenticated  bool
+	AuthAttempted  bool
 	SeenBeforeAuth bool
 }
 
@@ -181,10 +183,18 @@ func (p *probeState) readGiftWrap(ctx context.Context, relayURL, eventID string,
 		}
 	}
 	status, ids, exposed, authenticated := readSubscription(ctx, conn, "nm-gift", filter, time.Now().Add(5*time.Second), auth)
-	return accessResult{
-		Status: status, Hit: containsID(ids, eventID) || containsID(exposed, eventID),
-		Authenticated: authenticated, SeenBeforeAuth: containsID(exposed, eventID),
+	after := containsID(ids, eventID)
+	before := containsID(exposed, eventID)
+	result := accessResult{
+		Status: status, HitAfterAuth: authenticated && after, SeenBeforeAuth: before,
+		Authenticated: authenticated, AuthAttempted: authenticate,
 	}
+	if authenticated {
+		result.Hit = result.HitAfterAuth
+	} else {
+		result.Hit = after || before
+	}
+	return result
 }
 
 func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key, token string, evidence giftWrapEvidence) error {
@@ -217,7 +227,7 @@ func (p *probeState) storeGiftWrap(ctx context.Context, pool *pgxpool.Pool, key,
 		metrics.IncRelayIntelProbe("giftwrap", "ok")
 	case "public":
 		detail := "observer_retrieved"
-		if evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverTag.SeenBeforeAuth || evidence.AnonExact.SeenBeforeAuth || evidence.AnonTag.SeenBeforeAuth {
+		if evidence.RecipientExact.SeenBeforeAuth || evidence.RecipientTag.SeenBeforeAuth || evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverTag.SeenBeforeAuth || evidence.AnonExact.SeenBeforeAuth || evidence.AnonTag.SeenBeforeAuth {
 			detail = "retrieved_before_auth"
 		}
 		writes = append(writes,
@@ -240,6 +250,7 @@ func classifyGiftWrap(evidence giftWrapEvidence) string {
 	}
 	if evidence.Checked {
 		if evidence.ObserverExact.Hit || evidence.ObserverTag.Hit || evidence.AnonExact.Hit || evidence.AnonTag.Hit ||
+			evidence.RecipientExact.SeenBeforeAuth || evidence.RecipientTag.SeenBeforeAuth ||
 			evidence.ObserverExact.SeenBeforeAuth || evidence.ObserverTag.SeenBeforeAuth || evidence.AnonExact.SeenBeforeAuth || evidence.AnonTag.SeenBeforeAuth {
 			return "public"
 		}
@@ -284,7 +295,7 @@ func negativeEvidence(result accessResult, authenticatedPath bool) bool {
 }
 
 func pathEstablished(result accessResult, wantHit bool) bool {
-	if result.Status != "complete" || !result.Authenticated || result.Hit != wantHit {
+	if result.Status != "complete" || !result.Authenticated || result.HitAfterAuth != wantHit {
 		return false
 	}
 	return true
