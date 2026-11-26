@@ -131,6 +131,14 @@ func registerSyntheticIdentity(ctx context.Context, pool *pgxpool.Pool, pubkey s
 	return nil
 }
 
+// ClearSyntheticCaches drops process-local synthetic identity caches so a
+// benchmark can measure a cold lookup. It does not change the database.
+func ClearSyntheticCaches() {
+	syntheticPubkeys.Clear()
+	syntheticMisses.Clear()
+	syntheticMissCount.Store(0)
+}
+
 // LoadSyntheticIdentities restores probe pubkeys stored by an earlier worker.
 // A missing table leaves the in-memory set unchanged.
 func LoadSyntheticIdentities(ctx context.Context, pool *pgxpool.Pool) {
