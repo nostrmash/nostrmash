@@ -122,21 +122,20 @@ candidates AS (
         FROM replaceable_state rs
         WHERE rs.pubkey = e.pubkey
           AND rs.kind = e.kind
+          AND rs.d_tag = CASE
+                WHEN e.kind >= 30000 AND e.kind < 40000 THEN COALESCE((
+                    SELECT et.value
+                    FROM event_tags et
+                    WHERE et.event_id = e.id
+                      AND et.tag_name = 'd'
+                      AND et.value_index = 0
+                    ORDER BY et.tag_index ASC
+                    LIMIT 1
+                ), '')
+                ELSE ''
+              END
           AND rs.created_at = e.created_at
           AND rs.event_id > e.id
-          AND (
-            (e.kind >= 30000 AND e.kind < 40000 AND rs.d_tag = COALESCE((
-                SELECT et.value
-                FROM event_tags et
-                WHERE et.event_id = e.id
-                  AND et.tag_name = 'd'
-                  AND et.value_index = 0
-                ORDER BY et.tag_index ASC
-                LIMIT 1
-            ), ''))
-            OR e.kind < 30000
-            OR e.kind >= 40000
-          )
       )
       AND NOT EXISTS (
         SELECT 1

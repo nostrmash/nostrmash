@@ -1358,6 +1358,10 @@ type RelayConfigHead struct {
 	Title                string
 	UpdatedAt            pgtype.Timestamptz
 	NeedsReplay          bool
+	// Number of bounded memberships written for this head. -1 means the projection has not recorded the set.
+	MembershipCount int32
+	// Canonical text of that membership set. Empty is a real empty set only when membership_count is 0.
+	MembershipDigest string
 }
 
 type RelayCoverageChange struct {
