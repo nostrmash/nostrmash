@@ -79,8 +79,8 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 	for {
 		now := time.Now()
 		if cfg.StatsEnabled && (lastStats.IsZero() || now.Sub(lastStats) >= cfg.StatsInterval) {
-			if err := RefreshStats(ctx, pool, exclude); err != nil {
-				if errors.Is(err, ErrStatsBusy) {
+			if err := RefreshStats(ctx, pool, exclude, cfg.StatsInterval); err != nil {
+				if errors.Is(err, ErrStatsBusy) || errors.Is(err, ErrStatsFresh) {
 					log.Info("relay_intel_stats_refresh_skipped")
 				} else {
 					log.Error("relay_intel_stats_refresh", "error", err.Error())

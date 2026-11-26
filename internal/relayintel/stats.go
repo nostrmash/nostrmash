@@ -15,9 +15,13 @@ import (
 // ErrStatsBusy means another worker already holds the statistics refresh lock.
 var ErrStatsBusy = errors.New("relay intelligence statistics refresh is already running")
 
+// ErrStatsFresh means another worker completed a refresh inside the interval.
+var ErrStatsFresh = errors.New("relay intelligence statistics were refreshed recently")
+
 // RefreshStats rebuilds role aggregates from relay_role_memberships.
-// excludePubkey drops the synthetic probe identity so probes do not become adoption.
-func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string) error {
+// A positive minInterval skips the rebuild when the shared snapshot is newer than that.
+// A non-positive interval forces the rebuild. excludePubkey drops one extra probe identity.
+func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string, minInterval time.Duration) error {
 	if pool == nil {
 		return fmt.Errorf("pool is required")
 	}
@@ -32,6 +36,17 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 	}
 	if !locked {
 		return ErrStatsBusy
+	}
+	if minInterval > 0 {
+		var computed time.Time
+		var failedAt *time.Time
+		err := tx.QueryRow(ctx, `SELECT computed_at, last_failure_at FROM relay_intel_snapshot WHERE id`).Scan(&computed, &failedAt)
+		if err == nil && time.Since(computed) < minInterval && (failedAt == nil || !failedAt.After(computed)) {
+			return ErrStatsFresh
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 	}
 	started := time.Now()
 

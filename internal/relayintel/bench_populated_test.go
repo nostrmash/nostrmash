@@ -212,7 +212,7 @@ func TestPopulatedRelayIntelCost(t *testing.T) {
 	logLatency(t, "canonical head read", readSamples)
 
 	started = time.Now()
-	if err := RefreshStats(ctx, pool, ""); err != nil {
+	if err := RefreshStats(ctx, pool, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("statistics refresh: %s", time.Since(started).Round(time.Millisecond))
