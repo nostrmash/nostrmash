@@ -67,11 +67,29 @@ func (h *Handlers) UpdateReplaceableState(ctx context.Context, eventID string) e
 			    created_at = EXCLUDED.created_at,
 			    derivation_version = EXCLUDED.derivation_version,
 			    updated_at = now()
-			WHERE EXCLUDED.created_at > replaceable_state.created_at
-			   OR (
-			       EXCLUDED.created_at = replaceable_state.created_at
-			       AND EXCLUDED.event_id < replaceable_state.event_id
-			   )
+			WHERE (
+			    EXCLUDED.created_at > replaceable_state.created_at
+			    OR (
+			        EXCLUDED.created_at = replaceable_state.created_at
+			        AND EXCLUDED.event_id < replaceable_state.event_id
+			    )
+			)
+			AND NOT EXISTS (
+			    SELECT 1 FROM deletion_events de
+			    WHERE de.target_event_id = EXCLUDED.event_id
+			      AND de.deleter_pubkey = EXCLUDED.pubkey
+			)
+			AND NOT EXISTS (
+			    SELECT 1 FROM deletion_addresses da
+			    WHERE da.pubkey = EXCLUDED.pubkey
+			      AND da.kind = EXCLUDED.kind
+			      AND da.created_at >= EXCLUDED.created_at
+			      AND (
+			          (EXCLUDED.kind >= 30000 AND EXCLUDED.kind < 40000 AND da.d_tag = EXCLUDED.d_tag)
+			          OR EXCLUDED.kind < 30000
+			          OR EXCLUDED.kind >= 40000
+			      )
+			)
 			RETURNING event_id
 		)
 		SELECT NOT EXISTS (SELECT 1 FROM prior) AND EXISTS (SELECT 1 FROM upsert)

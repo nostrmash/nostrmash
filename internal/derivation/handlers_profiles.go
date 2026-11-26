@@ -3,8 +3,11 @@ package derivation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (h *Handlers) ProjectProfilesLatest(ctx context.Context, eventID string) error {
@@ -41,13 +44,24 @@ func (h *Handlers) projectProfilesLatestWithVersion(ctx context.Context, eventID
 	}
 	var winner metadataWinner
 	err = h.pool.QueryRow(ctx, `
-		SELECT id, created_at, content
-		FROM events
-		WHERE pubkey = $1
-		  AND kind = 0
-		ORDER BY created_at DESC, id ASC
-		LIMIT 1
+		SELECT e.id, e.created_at, e.content
+		FROM replaceable_state rs
+		JOIN events e ON e.id = rs.event_id
+		WHERE rs.pubkey = $1 AND rs.kind = 0 AND rs.d_tag = ''
 	`, pubkey).Scan(&winner.EventID, &winner.CreatedAt, &winner.Content)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = h.pool.QueryRow(ctx, `
+			SELECT id, created_at, content
+			FROM events
+			WHERE pubkey = $1
+			  AND kind = 0
+			ORDER BY created_at DESC, id ASC
+			LIMIT 1
+		`, pubkey).Scan(&winner.EventID, &winner.CreatedAt, &winner.Content)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("load latest metadata event: %w", err)
 	}

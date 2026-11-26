@@ -52,8 +52,20 @@ func sourceReports(before []Head, resolved map[string]resolvedSource, notes []so
 		projection[sourceKey(head.SourceKind, head.DTag)] = head.EventID
 	}
 	noteBy := map[string]Reason{}
+	rank := map[string]int{
+		"projection_missing": 1,
+		"projection_stale":   1,
+		"stale_source":       2,
+		"source_too_large":   2,
+		"source_unreadable":  3,
+		"source_deleted":     4,
+	}
 	for _, note := range notes {
-		noteBy[sourceKey(note.kind, note.dTag)] = note.reason
+		key := sourceKey(note.kind, note.dTag)
+		if previous, ok := noteBy[key]; ok && rank[previous.Code] > rank[note.reason.Code] {
+			continue
+		}
+		noteBy[key] = note.reason
 	}
 	keys := map[string]struct{}{}
 	for key := range projection {

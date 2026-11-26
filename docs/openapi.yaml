@@ -877,11 +877,20 @@ paths:
                 tie_break: lower_event_id
                 preset: balanced
                 constraints_satisfied: true
-                independently_satisfied: true
-                fallbacks: [cohort_only]
                 cohort: { size: 40, truncated: false, trust_data: true, used: personalized }
+                roles:
+                  - role: public_inbox
+                    availability: present
+                    selection:
+                      selected:
+                        - url: wss://in.example.com
+                      constraints_satisfied: true
+                      independently_satisfied: true
                 proposal:
                   note: Unsigned preview. The client must sign and publish.
+                  proposal_safe: true
+                  source_complete: true
+                  ready_to_sign: false
                   public_relays:
                     kind: 10002
                     content: ""

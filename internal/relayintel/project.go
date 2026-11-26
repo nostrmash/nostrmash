@@ -72,6 +72,33 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		       AND EXCLUDED.event_id < relay_config_heads.event_id
 		   )
 		   OR EXCLUDED.event_id = relay_config_heads.event_id
+		   OR (
+		       EXISTS (
+		           SELECT 1 FROM replaceable_state rs
+		           WHERE rs.pubkey = EXCLUDED.pubkey
+		             AND rs.kind = EXCLUDED.source_kind
+		             AND rs.d_tag = EXCLUDED.d_tag
+		             AND rs.event_id = EXCLUDED.event_id
+		       )
+		       AND (
+		           EXISTS (
+		               SELECT 1 FROM deletion_events de
+		               WHERE de.target_event_id = relay_config_heads.event_id
+		                 AND de.deleter_pubkey = relay_config_heads.pubkey
+		           )
+		           OR EXISTS (
+		               SELECT 1 FROM deletion_addresses da
+		               WHERE da.pubkey = relay_config_heads.pubkey
+		                 AND da.kind = relay_config_heads.source_kind
+		                 AND da.created_at >= relay_config_heads.created_at
+		                 AND (
+		                     (relay_config_heads.source_kind >= 30000 AND relay_config_heads.source_kind < 40000 AND da.d_tag = relay_config_heads.d_tag)
+		                     OR relay_config_heads.source_kind < 30000
+		                     OR relay_config_heads.source_kind >= 40000
+		                 )
+		           )
+		       )
+		   )
 	`, head.Pubkey, head.SourceKind, head.DTag, head.EventID, head.CreatedAt,
 		head.ExplicitlyEmpty, head.ClientSideOnly, head.DeclarationSource,
 		head.InvalidEndpoints, head.Truncated, head.Title)
