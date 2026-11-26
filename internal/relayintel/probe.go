@@ -31,10 +31,14 @@ type probeState struct {
 	globalLimit  int
 	minInterval  time.Duration
 	giftwrap     bool
-	giftwrapLog  bool
+	allowlist    []string
+	recipientKey *btcec.PrivateKey
+	recipientPub string
+	observerKey  *btcec.PrivateKey
+	observerPub  string
 }
 
-func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minInterval time.Duration, giftwrap bool) (*probeState, string, error) {
+func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minInterval time.Duration, giftwrap bool, allowlist []string) (*probeState, string, error) {
 	raw, err := hex.DecodeString(secretHex)
 	if err != nil || len(raw) != 32 {
 		return nil, "", fmt.Errorf("RELAY_INTEL_PROBE_SECRET_KEY must be 32-byte hex")
@@ -48,6 +52,18 @@ func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minIn
 	}
 	pub := hex.EncodeToString(schnorr.SerializePubKey(priv.PubKey()))
 	RememberSynthetic(pub)
+	recipient, err := btcec.NewPrivateKey()
+	if err != nil {
+		return nil, "", err
+	}
+	observer, err := btcec.NewPrivateKey()
+	if err != nil {
+		return nil, "", err
+	}
+	recipientPub := hex.EncodeToString(schnorr.SerializePubKey(recipient.PubKey()))
+	observerPub := hex.EncodeToString(schnorr.SerializePubKey(observer.PubKey()))
+	RememberSynthetic(recipientPub)
+	RememberSynthetic(observerPub)
 	host, _ := os.Hostname()
 	if host == "" {
 		host = "worker"
@@ -55,17 +71,21 @@ func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minIn
 	return &probeState{
 		key: priv, pubkey: pub, worker: fmt.Sprintf("%s:%d", host, os.Getpid()),
 		allowPrivate: allowPrivate, globalLimit: globalPerHour, minInterval: minInterval, giftwrap: giftwrap,
+		allowlist: allowlist, recipientKey: recipient, recipientPub: recipientPub,
+		observerKey: observer, observerPub: observerPub,
 	}, pub, nil
 }
 
-// Once probes at most one relay. Gift-wrap probes are not implemented.
+// Once probes at most one approved relay.
 func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 	if p == nil || pool == nil {
 		return nil
 	}
-	if p.giftwrap && !p.giftwrapLog {
-		p.giftwrapLog = true
-		metrics.IncRelayIntelProbe("giftwrap", "disabled")
+	if p.giftwrap {
+		probed, err := p.probeOneGiftWrap(ctx, pool)
+		if err != nil || probed {
+			return err
+		}
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT s.endpoint_url, s.url_key, s.role
@@ -104,6 +124,9 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		capability := CapWriteAccept
 		if item.role == RoleSearch {
 			capability = CapSearch
+		}
+		if !p.allowed(item.url) {
+			continue
 		}
 		token, ok := p.claim(ctx, pool, item.key, capability, probeHost(item.url))
 		if !ok {
@@ -177,7 +200,14 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 		return
 	}
 	id, _ := event["id"].(string)
-	ack := readWriteAck(conn, id, time.Now().Add(5*time.Second))
+	ack, authStatus := readWriteAckWithAuth(conn, id, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
+		return signAuth(p.key, p.pubkey, relayURL, challenge)
+	})
+	if pool != nil && authStatus == "ok" {
+		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusVerified, 0.7, "probe", "auth_succeeded")
+	} else if pool != nil && (authStatus == "unauthorized" || ack == "auth_required") {
+		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusRestricted, 0.6, "probe", authStatus)
+	}
 	if ack != "accepted" {
 		if pool != nil && ack == "rejected" {
 			_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusRestricted, 0.55, "probe", "ok_false")
@@ -279,23 +309,132 @@ func classifyWriteFrame(frame []any, eventID string) string {
 }
 
 func readWriteAck(conn *websocket.Conn, eventID string, deadline time.Time) string {
+	ack, _ := readWriteAckWithAuth(conn, eventID, deadline, nil)
+	return ack
+}
+
+func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, string) {
+	authState := ""
 	for {
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			return "timeout"
+			return "timeout", authState
 		}
 		var frame []any
-		if json.Unmarshal(message, &frame) != nil {
+		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
+			continue
+		}
+		typ, _ := frame[0].(string)
+		if typ == "AUTH" {
+			if auth == nil || len(frame) < 2 {
+				return "auth_required", "required"
+			}
+			challenge, _ := frame[1].(string)
+			if challenge == "" {
+				return "auth_required", "required"
+			}
+			signed, err := auth(challenge)
+			if err != nil {
+				return "auth_required", "failed"
+			}
+			payload, _ := json.Marshal([]any{"AUTH", signed})
+			_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return "auth_required", "failed"
+			}
+			authState = "sent"
 			continue
 		}
 		switch classifyWriteFrame(frame, eventID) {
 		case "accepted":
-			return "accepted"
-		case "rejected", "mismatched", "closed":
-			return classifyWriteFrame(frame, eventID)
+			if authState == "sent" {
+				authState = "ok"
+			}
+			return "accepted", authState
+		case "rejected", "mismatched":
+			return classifyWriteFrame(frame, eventID), authState
+		case "closed":
+			if authState == "sent" {
+				return "unauthorized", "unauthorized"
+			}
+			return "closed", authState
 		}
 	}
+}
+
+func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, []string) {
+	req, _ := json.Marshal([]any{"REQ", sub, filter})
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
+		return "incomplete", nil
+	}
+	var ids []string
+	for messages := 0; messages < 32; messages++ {
+		_ = conn.SetReadDeadline(deadline)
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return "incomplete", ids
+		}
+		var frame []json.RawMessage
+		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
+			continue
+		}
+		var typ string
+		if json.Unmarshal(frame[0], &typ) != nil {
+			continue
+		}
+		switch typ {
+		case "AUTH":
+			if auth == nil || len(frame) < 2 {
+				return "auth_required", ids
+			}
+			var challenge string
+			if json.Unmarshal(frame[1], &challenge) != nil || challenge == "" {
+				return "auth_required", ids
+			}
+			signed, err := auth(challenge)
+			if err != nil {
+				return "auth_required", ids
+			}
+			payload, _ := json.Marshal([]any{"AUTH", signed})
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return "incomplete", ids
+			}
+		case "EVENT":
+			if len(frame) < 3 {
+				continue
+			}
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
+				continue
+			}
+			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 64 * 1024})
+			if !parsed.Valid() || parsed.Event == nil {
+				continue
+			}
+			ids = append(ids, parsed.Event.ID)
+		case "EOSE":
+			if len(frame) < 2 {
+				continue
+			}
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
+				continue
+			}
+			return "complete", ids
+		case "CLOSED":
+			if len(frame) < 2 {
+				continue
+			}
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
+				continue
+			}
+			return "incomplete", ids
+		}
+	}
+	return "incomplete", ids
 }
 
 func classifySearch(positiveHit, negativeHit bool) string {

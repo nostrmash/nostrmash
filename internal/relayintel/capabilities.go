@@ -7,16 +7,22 @@ import (
 )
 
 const (
-	CapConnect       = "connect"
-	CapRead          = "read_subscription"
-	CapWriteAccept   = "write_accept"
-	CapWriteRetrieve = "write_retrieve"
-	CapSearch        = "search"
-	CapAuth          = "auth"
-	CapPayment       = "payment"
-	CapGiftWrap      = "giftwrap"
-	CapRetention     = "retention"
-	CapNIP11         = "nip11"
+	CapConnect         = "connect"
+	CapRead            = "read_subscription"
+	CapWriteAccept     = "write_accept"
+	CapWriteRetrieve   = "write_retrieve"
+	CapSearch          = "search"
+	CapAuth            = "auth"
+	CapPayment         = "payment"
+	CapGiftWrap        = "giftwrap"
+	CapGiftWrapAccept  = "giftwrap_accept"
+	CapGiftWrapPrivate = "giftwrap_private"
+	CapGiftWrapPublic  = "giftwrap_public"
+	CapAuthWrite       = "auth_write"
+	CapAuthGiftWrap    = "auth_giftwrap"
+	CapKeyPackage      = "keypackage"
+	CapRetention       = "retention"
+	CapNIP11           = "nip11"
 
 	StatusAdvertised  = "advertised"
 	StatusVerified    = "verified"
@@ -164,16 +170,22 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 		now = time.Now()
 	}
 	out := map[string]Capability{
-		CapConnect:       {Name: CapConnect, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapRead:          {Name: CapRead, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapWriteAccept:   {Name: CapWriteAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapWriteRetrieve: {Name: CapWriteRetrieve, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapSearch:        {Name: CapSearch, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapAuth:          {Name: CapAuth, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapPayment:       {Name: CapPayment, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapGiftWrap:      {Name: CapGiftWrap, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapRetention:     {Name: CapRetention, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapNIP11:         {Name: CapNIP11, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapConnect:         {Name: CapConnect, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapRead:            {Name: CapRead, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapWriteAccept:     {Name: CapWriteAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapWriteRetrieve:   {Name: CapWriteRetrieve, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapSearch:          {Name: CapSearch, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapAuth:            {Name: CapAuth, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapPayment:         {Name: CapPayment, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapGiftWrap:        {Name: CapGiftWrap, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapAccept:  {Name: CapGiftWrapAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapPrivate: {Name: CapGiftWrapPrivate, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapPublic:  {Name: CapGiftWrapPublic, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapAuthWrite:       {Name: CapAuthWrite, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapAuthGiftWrap:    {Name: CapAuthGiftWrap, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapKeyPackage:      {Name: CapKeyPackage, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapRetention:       {Name: CapRetention, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapNIP11:           {Name: CapNIP11, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
 	}
 	if ev.Probe.At != nil {
 		age := now.Sub(*ev.Probe.At)

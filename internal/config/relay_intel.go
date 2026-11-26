@@ -23,6 +23,7 @@ type RelayIntelConfig struct {
 	ActiveProbes        bool
 	ProbeSecretKey      string
 	GiftwrapProbes      bool
+	ProbeAllowlist      []string
 	ProbeGlobalPerHour  int
 	ProbeMinInterval    time.Duration
 }
@@ -68,14 +69,18 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 		BackfillInterval:    backfillInterval,
 		ActiveProbes:        getEnvBool("RELAY_INTEL_ACTIVE_PROBES", false),
 		GiftwrapProbes:      getEnvBool("RELAY_INTEL_GIFTWRAP_PROBES", false),
+		ProbeAllowlist:      splitProbeHosts(os.Getenv("RELAY_INTEL_PROBE_ALLOWLIST")),
 		ProbeGlobalPerHour:  perHour,
 		ProbeMinInterval:    probeInterval,
 	}
 	if !cfg.Enabled {
 		cfg.ProjectionEnabled = false
 	}
-	if cfg.GiftwrapProbes {
-		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_GIFTWRAP_PROBES is not implemented; leave it false")
+	if cfg.GiftwrapProbes && !cfg.ActiveProbes {
+		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_GIFTWRAP_PROBES requires RELAY_INTEL_ACTIVE_PROBES")
+	}
+	if cfg.ActiveProbes && len(cfg.ProbeAllowlist) == 0 {
+		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_ACTIVE_PROBES requires RELAY_INTEL_PROBE_ALLOWLIST")
 	}
 	if includeSecret && cfg.ActiveProbes {
 		raw := strings.TrimSpace(os.Getenv("RELAY_INTEL_PROBE_SECRET_KEY"))
@@ -89,4 +94,22 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 		cfg.ProbeSecretKey = raw
 	}
 	return cfg, nil
+}
+
+func splitProbeHosts(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		host := strings.ToLower(strings.TrimSpace(part))
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	return out
 }

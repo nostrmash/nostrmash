@@ -128,13 +128,14 @@ Do not hand-edit this file.
 | `PRIMAL_WS_MAX_REQ_PER_MINUTE` | `api` | optional | `240` | Per-connection request rate limit for Primal WebSocket REQ calls. |
 | `PRIMAL_WS_MAX_SUBSCRIPTIONS` | `api` | optional | `200` | Maximum concurrent Primal WS subscriptions per connection. |
 | `PRIMAL_WS_REQUEST_TIMEOUT` | `api` | optional | `10s` | Timeout for individual Primal WS request handling. |
-| `RELAY_INTEL_ACTIVE_PROBES` | `worker` | optional | `false` | Publish one synthetic kind-1 note per selected relay to test acceptance and retrieval, and send one NIP-50 query to search relays. Off by default. Requires RELAY_INTEL_PROBE_SECRET_KEY on the worker only. |
+| `RELAY_INTEL_ACTIVE_PROBES` | `worker` | optional | `false` | Publish synthetic events to relays named in RELAY_INTEL_PROBE_ALLOWLIST. Off by default. Requires that allowlist and RELAY_INTEL_PROBE_SECRET_KEY on the worker only. Public relay availability is not permission to probe. |
 | `RELAY_INTEL_ALLOW_PRIVATE_NETWORK` | `api, worker` | optional | `false` | Allow loopback and RFC1918 relay URLs for self-hosted verification and probes. Link-local addresses and cloud metadata hostnames stay blocked. This does not turn the API into an open HTTP proxy. |
 | `RELAY_INTEL_BACKFILL_BATCH` | `worker` | optional | `200` | Stored events projected per backfill tick, from 1 to 1000. |
 | `RELAY_INTEL_BACKFILL_ENABLED` | `worker` | optional | `true` | Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. |
 | `RELAY_INTEL_BACKFILL_INTERVAL` | `worker` | optional | `5s` | Delay between backfill batches. |
 | `RELAY_INTEL_ENABLED` | `api, worker` | optional | `true` | Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Turning this off also stops role-row projection. Canonical replaceable-state updates keep running. Apply migration 000133 before running a binary that projects role rows. |
-| `RELAY_INTEL_GIFTWRAP_PROBES` | `worker` | optional | `false` | Must stay false. Setting it true fails startup. Gift-wrap verification is not available, so this flag cannot mark a relay privacy-preserving. |
+| `RELAY_INTEL_GIFTWRAP_PROBES` | `worker` | optional | `false` | Also publish one synthetic NIP-17 gift wrap to approved DM relays and check recipient retrieval against an unrelated observer. Off by default. Requires active probes and the probe allowlist. Acceptance alone is not stored as private access. |
+| `RELAY_INTEL_PROBE_ALLOWLIST` | `worker` | optional | `-` | Comma-separated hostnames that may receive active probes. Required when active probes are on. Gift-wrap probes use the same list. An empty list disables probing. |
 | `RELAY_INTEL_PROBE_GLOBAL_PER_HOUR` | `worker` | optional | `20` | Maximum active probes per worker process per hour, capped at 60. |
 | `RELAY_INTEL_PROBE_MIN_INTERVAL` | `worker` | optional | `24h0m0s` | Minimum time before the same relay is actively probed again. |
 | `RELAY_INTEL_PROBE_SECRET_KEY` | `worker` | optional | `-` | 32-byte hex secp256k1 key for synthetic probes. The API never reads this variable. Do not use a real account. The pubkey is excluded from role statistics. Leave empty unless active probes are on. |

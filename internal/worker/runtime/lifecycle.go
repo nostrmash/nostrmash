@@ -308,6 +308,7 @@ func RunLifecycle(ctx context.Context, log Logger, cfg config.WorkerConfig, boot
 				ProbeSecretKey:      intelCfg.ProbeSecretKey,
 				AllowPrivateNetwork: intelCfg.AllowPrivateNetwork,
 				GiftwrapProbes:      intelCfg.GiftwrapProbes,
+				ProbeAllowlist:      intelCfg.ProbeAllowlist,
 				ProbeGlobalPerHour:  intelCfg.ProbeGlobalPerHour,
 				ProbeMinInterval:    intelCfg.ProbeMinInterval,
 			})

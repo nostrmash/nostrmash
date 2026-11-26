@@ -407,14 +407,21 @@ func privacyComponent(role string, caps map[string]Capability) (float64, float64
 	if role != RoleDMInbox && role != RoleKeyPackage {
 		return 0.5, 0.3, nil
 	}
+	private := caps[CapGiftWrapPrivate]
+	public := caps[CapGiftWrapPublic]
+	accept := caps[CapGiftWrapAccept]
 	wrap := caps[CapGiftWrap]
 	auth := caps[CapAuth]
-	switch wrap.Status {
-	case StatusVerified:
-		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "Gift-wrap behavior was checked with synthetic identities."}}
-	case StatusUnsupported:
+	switch {
+	case private.Status == StatusVerified || wrap.Status == StatusVerified:
+		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "A synthetic gift wrap was retrieved by the recipient and was absent from a completed observer query. This is not a delivery or anonymity guarantee."}}
+	case public.Status == StatusVerified:
+		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "An observer that is not the recipient retrieved the gift wrap. Acceptance does not make this relay private."}}
+	case accept.Status == StatusVerified:
+		return 0.4, 0.45, []Reason{{Code: "giftwrap_accepted_only", Text: "The relay accepted a gift wrap. Recipient-only access was not established."}}
+	case wrap.Status == StatusUnsupported || accept.Status == StatusUnsupported:
 		return 0, 0.8, []Reason{{Code: "giftwrap_unsupported", Text: "The relay rejected gift-wrapped events."}}
-	case StatusAdvertised:
+	case wrap.Status == StatusAdvertised:
 		score := 0.4
 		if auth.Status == StatusRestricted {
 			score = 0.55
@@ -447,15 +454,27 @@ func functionalityComponent(role string, caps map[string]Capability) (float64, f
 		if wrap.Status == StatusUnsupported {
 			return 0, 0.8, []Reason{{Code: "dm_unsupported", Text: "The relay does not accept the gift-wrap kinds used for DMs."}}, "dm_unsupported"
 		}
-		if wrap.Status == StatusVerified {
+		if caps[CapGiftWrapPrivate].Status == StatusVerified || wrap.Status == StatusVerified {
 			return 0.9, 0.8, nil, ""
+		}
+		if caps[CapGiftWrapPublic].Status == StatusVerified {
+			return 0.2, 0.75, []Reason{{Code: "dm_public_giftwrap", Text: "Gift wraps on this relay were readable by an observer. That is not suitable for private messages."}}, ""
 		}
 		read := caps[CapRead]
 		if read.Status == StatusObserved || read.Status == StatusVerified {
 			return 0.45, 0.4, []Reason{{Code: "dm_unverified", Text: "The relay answers ordinary subscriptions. DM acceptance is still unverified."}}, ""
 		}
 		return 0.35, 0.25, nil, ""
-	case RolePublicOutbox, RoleKeyPackage:
+	case RoleKeyPackage:
+		kp := caps[CapKeyPackage]
+		if kp.Status == StatusVerified {
+			return 0.9, 0.8, []Reason{{Code: "keypackage_retrieved", Text: "A signed kind 30443 event was accepted and read back. This is relay transport evidence, not end-to-end Marmot compatibility."}}, ""
+		}
+		if kp.Status == StatusUnsupported {
+			return 0.15, 0.7, []Reason{{Code: "keypackage_unsupported", Text: "The relay rejected a KeyPackage event."}}, "keypackage_unsupported"
+		}
+		return 0.35, 0.25, []Reason{{Code: "keypackage_unknown", Text: "Kind 1 publishing was not treated as KeyPackage support. No interoperable KeyPackage fixture was checked."}}, ""
+	case RolePublicOutbox:
 		write := caps[CapWriteRetrieve]
 		accept := caps[CapWriteAccept]
 		if write.Status == StatusVerified {

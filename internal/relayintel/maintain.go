@@ -26,6 +26,7 @@ type MaintenanceConfig struct {
 	ProbeSecretKey      string
 	AllowPrivateNetwork bool
 	GiftwrapProbes      bool
+	ProbeAllowlist      []string
 	ProbeGlobalPerHour  int
 	ProbeMinInterval    time.Duration
 }
@@ -44,7 +45,7 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 	var probes *probeState
 	exclude := ""
 	if cfg.ActiveProbes {
-		state, pubkey, err := newProbeState(cfg.ProbeSecretKey, cfg.AllowPrivateNetwork, cfg.ProbeGlobalPerHour, cfg.ProbeMinInterval, cfg.GiftwrapProbes)
+		state, pubkey, err := newProbeState(cfg.ProbeSecretKey, cfg.AllowPrivateNetwork, cfg.ProbeGlobalPerHour, cfg.ProbeMinInterval, cfg.GiftwrapProbes, cfg.ProbeAllowlist)
 		if err != nil {
 			log.Error("relay_intel_probe_disabled", "error", err.Error())
 		} else {
@@ -59,9 +60,6 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 			}
 			log.Info("relay_intel_probe_identity_ready")
 		}
-	}
-	if cfg.GiftwrapProbes {
-		log.Error("relay_intel_giftwrap_probes_unimplemented", "error", "NIP-44 gift wrap is not implemented; relays are not marked privacy-verified")
 	}
 	interval := 30 * time.Second
 	if cfg.BackfillEnabled && cfg.BackfillInterval > 0 && cfg.BackfillInterval < interval {

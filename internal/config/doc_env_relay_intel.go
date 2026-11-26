@@ -54,7 +54,13 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_ACTIVE_PROBES",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "false",
-			Description:  "Publish one synthetic kind-1 note per selected relay to test acceptance and retrieval, and send one NIP-50 query to search relays. Off by default. Requires RELAY_INTEL_PROBE_SECRET_KEY on the worker only.",
+			Description:  "Publish synthetic events to relays named in RELAY_INTEL_PROBE_ALLOWLIST. Off by default. Requires that allowlist and RELAY_INTEL_PROBE_SECRET_KEY on the worker only. Public relay availability is not permission to probe.",
+		},
+		{
+			Name:         "RELAY_INTEL_PROBE_ALLOWLIST",
+			Runtimes:     []string{"worker"},
+			DefaultValue: "",
+			Description:  "Comma-separated hostnames that may receive active probes. Required when active probes are on. Gift-wrap probes use the same list. An empty list disables probing.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROBE_SECRET_KEY",
@@ -66,7 +72,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_GIFTWRAP_PROBES",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "false",
-			Description:  "Must stay false. Setting it true fails startup. Gift-wrap verification is not available, so this flag cannot mark a relay privacy-preserving.",
+			Description:  "Also publish one synthetic NIP-17 gift wrap to approved DM relays and check recipient retrieval against an unrelated observer. Off by default. Requires active probes and the probe allowlist. Acceptance alone is not stored as private access.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROBE_GLOBAL_PER_HOUR",
