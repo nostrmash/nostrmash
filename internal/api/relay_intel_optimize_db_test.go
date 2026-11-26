@@ -107,7 +107,7 @@ func TestRelayOptimizeAPIAgainstPostgreSQL(t *testing.T) {
 	if roleByName(t, account, "private_storage")["availability"] != "client_side" {
 		t.Fatal("encrypted private configuration was indexed as a public list")
 	}
-	if strings.Contains(string(mustJSON(cfg)), "nip44-ciphertext") {
+	if strings.Contains(mustJSON(cfg), "nip44-ciphertext") {
 		t.Fatal("private configuration content was returned")
 	}
 
