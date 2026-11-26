@@ -47,6 +47,7 @@ func newProbeState(secretHex string, allowPrivate bool, globalPerHour int, minIn
 		minInterval = 24 * time.Hour
 	}
 	pub := hex.EncodeToString(schnorr.SerializePubKey(priv.PubKey()))
+	RememberSynthetic(pub)
 	host, _ := os.Hostname()
 	if host == "" {
 		host = "worker"
@@ -408,11 +409,37 @@ func signProbeEvent(priv *btcec.PrivateKey, pubkey string) (map[string]any, erro
 }
 
 func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, status string, confidence float64, source, detail string) error {
+	recentFailures := 0
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, key, capability, status, confidence, source, detail); err != nil && !SchemaMissing(err) {
+		return err
+	} else if err == nil {
+		_, _ = pool.Exec(ctx, `
+			DELETE FROM relay_capability_samples
+			WHERE id IN (
+				SELECT id FROM relay_capability_samples
+				WHERE url_key = $1 AND capability = $2
+				ORDER BY observed_at DESC, id DESC
+				OFFSET 20
+			)
+		`, key, capability)
+		_ = pool.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE status IN ('unsupported', 'restricted', 'inconclusive', 'temporary'))
+			FROM (
+				SELECT status FROM relay_capability_samples
+				WHERE url_key = $1 AND capability = $2
+				ORDER BY observed_at DESC, id DESC
+				LIMIT 20
+			) recent
+		`, key, capability).Scan(&recentFailures)
+	}
 	_, err := pool.Exec(ctx, `
 		INSERT INTO relay_capability_observations (
 			url_key, capability, status, confidence, source, detail, sample_count, observed_at
 		) VALUES (
-			$1, $2, $3, $4, $5, jsonb_build_object('text', $6::text), 1, now()
+			$1, $2, $3, $4, $5, jsonb_build_object('text', $6::text, 'recent_failures', $7::int), 1, now()
 		)
 		ON CONFLICT (url_key, capability) DO UPDATE
 		SET status = EXCLUDED.status,
@@ -421,7 +448,7 @@ func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, 
 		    detail = EXCLUDED.detail,
 		    sample_count = relay_capability_observations.sample_count + 1,
 		    observed_at = now()
-	`, key, capability, status, confidence, source, detail)
+	`, key, capability, status, confidence, source, detail, recentFailures)
 	if err != nil {
 		return err
 	}

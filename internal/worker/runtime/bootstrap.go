@@ -55,6 +55,7 @@ func BootstrapRuntime(ctx context.Context, log Logger, cfg config.WorkerConfig, 
 		return Bootstrap{}, func() {}, fmt.Errorf("db connect: %w", err)
 	}
 	metrics.RegisterDBPool(pool)
+	relayintel.LoadSyntheticIdentities(ctx, pool)
 
 	appVersion := runtimebootstrap.ResolveAppVersion()
 	version := ResolveBuildVersion(appVersion, build.Version)

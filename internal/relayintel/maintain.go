@@ -50,6 +50,13 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 		} else {
 			probes = state
 			exclude = pubkey
+			RememberSynthetic(pubkey)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO relay_probe_identities (pubkey) VALUES ($1)
+				ON CONFLICT (pubkey) DO NOTHING
+			`, pubkey); err != nil && !SchemaMissing(err) {
+				log.Error("relay_intel_probe_identity", "error", err.Error())
+			}
 			log.Info("relay_intel_probe_identity_ready")
 		}
 	}

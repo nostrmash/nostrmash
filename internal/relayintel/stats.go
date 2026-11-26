@@ -57,6 +57,7 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 			FROM relay_effective_memberships
 			WHERE public_safe AND endpoint_url <> ''
 			  AND ($1 = '' OR pubkey <> $1)
+			  AND pubkey NOT IN (SELECT pubkey FROM relay_probe_identities)
 			GROUP BY url_key, role, pubkey
 		) base
 		LEFT JOIN trust_scores_global ts ON ts.pubkey = base.pubkey
@@ -74,6 +75,7 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 		WHERE public_safe AND endpoint_url <> ''
 		  AND role <> $2
 		  AND ($1 = '' OR pubkey <> $1)
+		  AND pubkey NOT IN (SELECT pubkey FROM relay_probe_identities)
 		GROUP BY url_key
 	`, excludePubkey, RoleBlocked); err != nil {
 		return fmt.Errorf("insert endpoint adoption: %w", err)
@@ -137,6 +139,7 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string)
 		SELECT role, count(DISTINCT pubkey)
 		FROM relay_effective_memberships
 		WHERE public_safe AND endpoint_url <> '' AND ($1 = '' OR pubkey <> $1)
+		  AND pubkey NOT IN (SELECT pubkey FROM relay_probe_identities)
 		GROUP BY role
 	`, excludePubkey)
 	if err != nil {

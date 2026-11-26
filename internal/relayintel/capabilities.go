@@ -29,25 +29,27 @@ const (
 
 // Capability is one claim about a relay, with the evidence class attached.
 type Capability struct {
-	Name        string     `json:"name"`
-	Status      string     `json:"status"`
-	Confidence  float64    `json:"confidence"`
-	Source      string     `json:"source"`
-	ObservedAt  *time.Time `json:"observed_at,omitempty"`
-	SampleCount int        `json:"sample_count,omitempty"`
-	Detail      string     `json:"detail,omitempty"`
+	Name           string     `json:"name"`
+	Status         string     `json:"status"`
+	Confidence     float64    `json:"confidence"`
+	Source         string     `json:"source"`
+	ObservedAt     *time.Time `json:"observed_at,omitempty"`
+	SampleCount    int        `json:"sample_count,omitempty"`
+	RecentFailures int        `json:"recent_failures,omitempty"`
+	Detail         string     `json:"detail,omitempty"`
 }
 
 // Observation is a stored measurement. It is not a user declaration.
 type Observation struct {
-	URLKey      string
-	Capability  string
-	Status      string
-	Confidence  float64
-	Source      string
-	ObservedAt  time.Time
-	SampleCount int
-	Detail      string
+	URLKey         string
+	Capability     string
+	Status         string
+	Confidence     float64
+	Source         string
+	ObservedAt     time.Time
+	SampleCount    int
+	RecentFailures int
+	Detail         string
 }
 
 // ProbeSnapshot is the existing read-probe rollup. EOSE success is not write,
@@ -318,6 +320,8 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 			current.Confidence = round3(clamp01(obs.Confidence))
 			current.Source = obs.Source
 			current.SampleCount = obs.SampleCount
+			current.RecentFailures = obs.RecentFailures
+			current.Status, current.Confidence = adjustForRecentFailures(current.Status, current.Confidence, obs.RecentFailures, obs.SampleCount)
 			if obs.Detail != "" {
 				current.Detail = obs.Detail
 			}
@@ -329,6 +333,17 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 		}
 	}
 	return out
+}
+
+// adjustForRecentFailures stops one successful sample from hiding a run of failures.
+func adjustForRecentFailures(status string, confidence float64, failures, samples int) (string, float64) {
+	if samples < 2 || failures <= 0 || status != StatusVerified {
+		return status, confidence
+	}
+	if failures*2 >= samples {
+		return StatusObserved, min(confidence, 0.45)
+	}
+	return status, min(confidence, 0.6)
 }
 
 func outranks(next, current string) bool {

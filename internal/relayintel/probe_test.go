@@ -3,6 +3,7 @@ package relayintel
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,29 @@ func TestReadWriteAckStopsOnAMismatchedOK(t *testing.T) {
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`["EVENT",{}]`))
 	if got := readWriteAck(conn, "wanted", time.Now().Add(2*time.Second)); got != "mismatched" {
 		t.Fatalf("ack = %s", got)
+	}
+}
+
+func TestRepeatedFailuresReduceALaterSuccess(t *testing.T) {
+	status, confidence := adjustForRecentFailures(StatusVerified, 0.9, 3, 4)
+	if status == StatusVerified || confidence > 0.45 {
+		t.Fatalf("status=%s confidence=%f", status, confidence)
+	}
+	kept, lowered := adjustForRecentFailures(StatusVerified, 0.9, 1, 4)
+	if kept != StatusVerified || lowered > 0.6 {
+		t.Fatalf("status=%s confidence=%f", kept, lowered)
+	}
+}
+
+func TestSyntheticProbeIdentityIsRecognized(t *testing.T) {
+	RememberSynthetic("ab")
+	if SyntheticPubkey("ab") {
+		t.Fatal("a short value was treated as a pubkey")
+	}
+	pubkey := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	RememberSynthetic(pubkey)
+	if !SyntheticPubkey(strings.ToUpper(pubkey)) {
+		t.Fatal("synthetic pubkey was not recognized")
 	}
 }
 

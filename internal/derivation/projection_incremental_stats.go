@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 // Ledger projection names for applied_stat_deltas. Each event may claim at
@@ -63,7 +64,7 @@ func (h *Handlers) ApplyIncrementalAuthorStats(ctx context.Context, eventID stri
 	// Gift wraps are signed by an ephemeral key. Touching profile and
 	// activity rows for that key creates one stats row per wrap and
 	// does not describe a person.
-	if kind == 1059 {
+	if kind == 1059 || relayintel.SyntheticPubkey(pubkey) {
 		return nil
 	}
 
