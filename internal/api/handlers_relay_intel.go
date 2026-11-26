@@ -161,6 +161,7 @@ type relayConstraintRequest struct {
 	MinCapabilityConfidence float64                        `json:"min_capability_confidence"`
 	Diversity               *float64                       `json:"diversity"`
 	RequireDiversity        bool                           `json:"require_operator_diversity"`
+	RequireVerifiedPrivacy  bool                           `json:"require_verified_privacy"`
 	RetainExisting          *bool                          `json:"retain_existing"`
 	Weights                 *relayintel.Weights            `json:"weights"`
 	Global                  *relayConstraintRequest        `json:"global"`
@@ -182,6 +183,7 @@ type relayRoleConstraint struct {
 	MinCapabilityConfidence *float64            `json:"min_capability_confidence"`
 	Diversity               *float64            `json:"diversity"`
 	RequireDiversity        *bool               `json:"require_operator_diversity"`
+	RequireVerifiedPrivacy  *bool               `json:"require_verified_privacy"`
 	RetainExisting          *bool               `json:"retain_existing"`
 	Weights                 *relayintel.Weights `json:"weights"`
 }
@@ -237,6 +239,7 @@ func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
 		MinCapabilityConfidence: body.MinCapabilityConfidence,
 		Diversity:               body.Diversity,
 		RequireDiversity:        body.RequireDiversity,
+		RequireVerifiedPrivacy:  body.RequireVerifiedPrivacy,
 		RetainExisting:          body.RetainExisting,
 	}
 	if body.Weights != nil {
@@ -251,7 +254,7 @@ func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
 				Preferred: item.Preferred, Custom: item.Custom, PaidAccess: item.PaidAccess,
 				FreeOnly: item.FreeOnly, AuthRead: item.AuthRead, AuthWrite: item.AuthWrite,
 				MinReliability: item.MinReliability, MinCapabilityConfidence: item.MinCapabilityConfidence,
-				Diversity: item.Diversity, RequireDiversity: item.RequireDiversity, RetainExisting: item.RetainExisting, Weights: item.Weights,
+				Diversity: item.Diversity, RequireDiversity: item.RequireDiversity, RequireVerifiedPrivacy: item.RequireVerifiedPrivacy, RetainExisting: item.RetainExisting, Weights: item.Weights,
 			}
 		}
 	}

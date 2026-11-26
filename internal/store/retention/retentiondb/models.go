@@ -1332,6 +1332,18 @@ type RelayCapabilityObservation struct {
 	ObservedAt  pgtype.Timestamptz
 }
 
+type RelayCapabilitySample struct {
+	ID         int64
+	UrlKey     string
+	Capability string
+	Status     string
+	Confidence float64
+	Source     string
+	Detail     string
+	ObservedAt pgtype.Timestamptz
+	AttemptID  pgtype.Int8
+}
+
 type RelayConfigHead struct {
 	Pubkey               string
 	SourceKind           int32
@@ -1490,6 +1502,44 @@ type RelayPreferenceListsLatest struct {
 	Kind      int32
 	Relays    []byte
 	UpdatedAt pgtype.Timestamptz
+}
+
+type RelayProbeAttempt struct {
+	ID         int64
+	UrlKey     string
+	Capability string
+	Host       string
+	WorkerID   string
+	LeaseToken string
+	StartedAt  pgtype.Timestamptz
+	FinishedAt pgtype.Timestamptz
+	Status     string
+}
+
+type RelayProbeFollowup struct {
+	ID          int64
+	UrlKey      string
+	EndpointUrl string
+	EventID     string
+	Capability  string
+	CheckAfter  pgtype.Timestamptz
+	FinishedAt  pgtype.Timestamptz
+	Result      string
+}
+
+type RelayProbeIdentity struct {
+	Pubkey    string
+	CreatedAt pgtype.Timestamptz
+}
+
+type RelayProbeLease struct {
+	UrlKey     string
+	Capability string
+	Host       string
+	WorkerID   string
+	LeaseToken string
+	StartedAt  pgtype.Timestamptz
+	ExpiresAt  pgtype.Timestamptz
 }
 
 type RelayProbeObservation struct {

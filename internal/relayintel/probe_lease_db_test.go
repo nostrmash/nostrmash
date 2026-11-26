@@ -53,8 +53,24 @@ func TestStaleLeaseCannotPublishEvidence(t *testing.T) {
 	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", "stale-token"); err == nil {
 		t.Fatal("a stale token published evidence")
 	}
+	if err := storeObservation(ctx, pool, "wss://other.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", token); err == nil {
+		t.Fatal("a token for one endpoint published another")
+	}
 	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", token); err != nil {
 		t.Fatal(err)
+	}
+	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, StatusVerified, 0.8, "probe", "ok", token); err != nil {
+		t.Fatal(err)
+	}
+	var samples int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM relay_capability_samples
+		WHERE url_key = $1 AND capability = $2 AND status = $3 AND detail = 'ok'
+	`, "wss://evidence.example", CapWriteAccept, StatusVerified).Scan(&samples); err != nil {
+		t.Fatal(err)
+	}
+	if samples != 1 {
+		t.Fatalf("duplicate completion stored %d samples", samples)
 	}
 	if err := storeObservation(ctx, pool, "wss://evidence.example", CapWriteAccept, "inconclusive", 0.2, "probe", "timeout", token); err != nil {
 		t.Fatal(err)

@@ -52,13 +52,13 @@ func TestAuthChallengeMustMatchTheSubmittedEvent(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`["EVENT",{}]`))
-	ack, authStatus := readWriteAckWithAuth(conn, "wanted", time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+	ack, authStatus := readWriteAckWithAuth(conn, "wanted", nil, time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
 		if challenge != "challenge-1" {
 			t.Fatalf("challenge = %s", challenge)
 		}
 		return signAuth(key, pubkey, wsURL(server), challenge)
 	})
-	if ack != "accepted" || authStatus != "ok" {
+	if ack != "accepted" || authStatus != "sent" {
 		t.Fatalf("ack=%s auth=%s", ack, authStatus)
 	}
 }
@@ -84,10 +84,21 @@ func TestNewerExposureOverridesOlderPrivacy(t *testing.T) {
 	if privacyAssessment(exposed) != "recipient_only_verified" {
 		t.Fatal(privacyAssessment(exposed))
 	}
-	if privacyAssessment(map[string]Capability{
+	if privacyAssessmentAt(map[string]Capability{
 		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &stale},
-	}) != "stale" {
+	}, now) != "stale" {
 		t.Fatal("stale private evidence still counted as current")
+	}
+	if privacyAssessmentAt(map[string]Capability{
+		CapGiftWrapPublic: {Status: StatusStale, ObservedAt: &stale},
+	}, now) != "previous_exposure_unresolved" {
+		t.Fatal("a stale exposure disappeared")
+	}
+	if privacyAssessmentAt(map[string]Capability{
+		CapGiftWrapPublic:  {Status: StatusVerified, ObservedAt: &older},
+		CapGiftWrapPrivate: {Status: StatusVerified, ObservedAt: &now},
+	}, now) != "recipient_only_verified" {
+		t.Fatal("a newer complete private result did not replace exposure")
 	}
 	if classifyGiftWrap(giftWrapEvidence{Accept: "accepted", Observer: "incomplete", ObserverHit: true}) != "public" {
 		t.Fatal("an observed unauthorized hit was discarded because EOSE did not arrive")
@@ -132,7 +143,7 @@ func TestAuthAcknowledgementIsNotPublication(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`["EVENT",{}]`))
-	ack, authStatus := readWriteAckWithAuth(conn, "wanted", time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+	ack, authStatus := readWriteAckWithAuth(conn, "wanted", nil, time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
 		return signAuth(key, pubkey, wsURL(server), challenge)
 	})
 	if ack != "accepted" || authStatus != "ok" {
@@ -173,7 +184,7 @@ func TestGiftWrapProbeRequiresRecipientOnlyEvidence(t *testing.T) {
 	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
 	recipientPub := pubOf(recipient)
 	var published map[string]any
-	server := giftWrapServer(t, recipientPub, &published, false)
+	server := giftWrapServer(t, recipientPub, &published, "private")
 	defer server.Close()
 	state := &probeState{
 		key: sender, pubkey: pubOf(sender), allowPrivate: true,
@@ -185,7 +196,7 @@ func TestGiftWrapProbeRequiresRecipientOnlyEvidence(t *testing.T) {
 	if evidence.Outcome != "private" || evidence.Accept != "accepted" {
 		t.Fatalf("evidence = %+v", evidence)
 	}
-	publicServer := giftWrapServer(t, recipientPub, &published, true)
+	publicServer := giftWrapServer(t, recipientPub, &published, "public")
 	defer publicServer.Close()
 	state.allowlist = []string{probeHost(wsURL(publicServer))}
 	public := state.exchangeGiftWrap(t.Context(), nil, wsURL(publicServer))
@@ -208,6 +219,105 @@ func TestKind1WriteDoesNotVerifyKeyPackage(t *testing.T) {
 	}
 	if !reasonCode(relay.Reasons, "keypackage_unknown") {
 		t.Fatalf("reasons = %#v", relay.Reasons)
+	}
+}
+
+func TestObserverQueriesTheRecipientTag(t *testing.T) {
+	sender, recipient, observer := newKey(t), newKey(t), newKey(t)
+	recipientPub := pubOf(recipient)
+	var published map[string]any
+	server := giftWrapServer(t, recipientPub, &published, "tag_leak")
+	defer server.Close()
+	state := &probeState{
+		key: sender, pubkey: pubOf(sender), allowPrivate: true,
+		recipientKey: recipient, recipientPub: recipientPub,
+		observerKey: observer, observerPub: pubOf(observer),
+		allowlist: []string{probeHost(wsURL(server))},
+	}
+	evidence := state.exchangeGiftWrap(t.Context(), nil, wsURL(server))
+	if evidence.Outcome != "public" || !evidence.ObserverTag.Hit {
+		t.Fatalf("tag leak evidence = %+v", evidence)
+	}
+	if evidence.ObserverExact.Hit {
+		t.Fatal("exact-id retrieval was not protected")
+	}
+}
+
+func TestPublicationIsRetriedAfterAuth(t *testing.T) {
+	key := newKey(t)
+	pubkey := pubOf(key)
+	var sawRetry bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		authed := false
+		events := 0
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var frame []json.RawMessage
+			if json.Unmarshal(payload, &frame) != nil || len(frame) == 0 {
+				continue
+			}
+			var typ string
+			_ = json.Unmarshal(frame[0], &typ)
+			switch typ {
+			case "EVENT":
+				events++
+				var event map[string]any
+				_ = json.Unmarshal(frame[1], &event)
+				id, _ := event["id"].(string)
+				if !authed {
+					_ = conn.WriteJSON([]any{"OK", id, false, "auth-required: take a challenge"})
+					_ = conn.WriteJSON([]any{"AUTH", "retry-challenge"})
+					continue
+				}
+				sawRetry = events >= 2
+				_ = conn.WriteJSON([]any{"OK", id, true, ""})
+			case "AUTH":
+				var event map[string]any
+				_ = json.Unmarshal(frame[1], &event)
+				if event["kind"] != float64(22242) {
+					return
+				}
+				authID, _ := event["id"].(string)
+				authed = true
+				_ = conn.WriteJSON([]any{"OK", authID, true, ""})
+			}
+		}
+	}))
+	defer server.Close()
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	event, err := signProbeEvent(key, pubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal([]any{"EVENT", event})
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := event["id"].(string)
+	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(2*time.Second), func(challenge string) (map[string]any, error) {
+		if challenge != "retry-challenge" {
+			t.Fatalf("challenge = %s", challenge)
+		}
+		return signAuth(key, pubkey, wsURL(server), challenge)
+	})
+	if ack != "accepted" || authStatus != "ok" || !sawRetry {
+		t.Fatalf("ack=%s auth=%s retry=%v", ack, authStatus, sawRetry)
 	}
 }
 
@@ -240,7 +350,7 @@ func pubOf(key *btcec.PrivateKey) string {
 	return hex.EncodeToString(schnorr.SerializePubKey(key.PubKey()))
 }
 
-func giftWrapServer(t *testing.T, recipient string, published *map[string]any, public bool) *httptest.Server {
+func giftWrapServer(t *testing.T, recipient string, published *map[string]any, mode string) *httptest.Server {
 	t.Helper()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +359,7 @@ func giftWrapServer(t *testing.T, recipient string, published *map[string]any, p
 			return
 		}
 		defer conn.Close()
+		authed := ""
 		for {
 			_, payload, err := conn.ReadMessage()
 			if err != nil {
@@ -269,7 +380,24 @@ func giftWrapServer(t *testing.T, recipient string, published *map[string]any, p
 				if json.Unmarshal(frame[1], &event) != nil {
 					continue
 				}
+				if event["kind"] == float64(22242) {
+					authed, _ = event["pubkey"].(string)
+					id, _ := event["id"].(string)
+					_ = conn.WriteJSON([]any{"OK", id, true, ""})
+					continue
+				}
 				*published = event
+				id, _ := event["id"].(string)
+				_ = conn.WriteJSON([]any{"OK", id, true, ""})
+			case "AUTH":
+				if len(frame) < 2 {
+					continue
+				}
+				var event map[string]any
+				if json.Unmarshal(frame[1], &event) != nil {
+					continue
+				}
+				authed, _ = event["pubkey"].(string)
 				id, _ := event["id"].(string)
 				_ = conn.WriteJSON([]any{"OK", id, true, ""})
 			case "REQ":
@@ -280,19 +408,50 @@ func giftWrapServer(t *testing.T, recipient string, published *map[string]any, p
 				_ = json.Unmarshal(frame[1], &sub)
 				var filter map[string]any
 				_ = json.Unmarshal(frame[2], &filter)
-				returnEvent := public
-				if values, ok := filter["#p"].([]any); ok {
-					for _, value := range values {
-						if value == recipient {
-							returnEvent = true
-						}
-					}
+				if mode != "public" && authed == "" {
+					_ = conn.WriteJSON([]any{"AUTH", "gift-challenge"})
+					_ = conn.WriteJSON([]any{"EOSE", sub})
+					continue
 				}
-				if returnEvent && *published != nil {
+				if *published != nil && giftVisible(mode, recipient, authed, filter, published) {
 					_ = conn.WriteJSON([]any{"EVENT", sub, *published})
 				}
 				_ = conn.WriteJSON([]any{"EOSE", sub})
 			}
 		}
 	}))
+}
+
+func giftVisible(mode, recipient, authed string, filter map[string]any, published *map[string]any) bool {
+	if published == nil || *published == nil {
+		return false
+	}
+	id, _ := (*published)["id"].(string)
+	exact := false
+	if values, ok := filter["ids"].([]any); ok {
+		for _, value := range values {
+			if value == id {
+				exact = true
+			}
+		}
+	}
+	tagged := false
+	if values, ok := filter["#p"].([]any); ok {
+		for _, value := range values {
+			if value == recipient {
+				tagged = true
+			}
+		}
+	}
+	switch mode {
+	case "public":
+		return true
+	case "tag_leak":
+		if exact {
+			return authed == recipient
+		}
+		return tagged
+	default:
+		return authed == recipient && (exact || tagged)
+	}
 }

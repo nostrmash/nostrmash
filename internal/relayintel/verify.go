@@ -511,6 +511,9 @@ func eventMatchesFilter(event *nostr.Event, filter map[string]any) bool {
 	if tags := stringList(filter["#d"]); len(tags) > 0 && !listHas(tags, firstD(event.Tags)) {
 		return false
 	}
+	if tags := stringList(filter["#p"]); len(tags) > 0 && !hasTagValue(event.Tags, "p", tags) {
+		return false
+	}
 	return true
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nostrmash/nostrmash/internal/metrics"
 )
@@ -83,6 +85,9 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		return nil
 	}
 	p.turn++
+	if followed, err := p.followOne(ctx, pool); err != nil || followed {
+		return err
+	}
 	if p.giftwrap && p.turn%2 == 0 {
 		probed, err := p.probeOneGiftWrap(ctx, pool)
 		if err != nil || probed {
@@ -103,10 +108,16 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		      AND l.capability = CASE WHEN s.role = 'search' THEN 'search' ELSE 'write_accept' END
 		      AND l.expires_at > now()
 		  )
-		  AND lower(split_part(split_part(regexp_replace(s.endpoint_url, '^wss?://', ''), '/', 1), ':', 1)) = ANY($1::text[])
+		  AND relay_probe_host(s.endpoint_url) = ANY($1::text[])
+		  AND NOT EXISTS (
+		    SELECT 1 FROM relay_probe_attempts a
+		    WHERE a.url_key = s.url_key
+		      AND a.capability = CASE WHEN s.role = 'search' THEN 'search' ELSE 'write_accept' END
+		      AND a.started_at > now() - make_interval(secs => $2::int)
+		  )
 		ORDER BY o.observed_at ASC NULLS FIRST, s.trust_weighted DESC, s.url_key ASC
 		LIMIT 50
-	`, p.allowlist)
+	`, p.allowlist, int(p.minInterval.Seconds()))
 	if err != nil {
 		return wrapDB(err)
 	}
@@ -166,6 +177,75 @@ func (p *probeState) claim(ctx context.Context, pool *pgxpool.Pool, key, capabil
 	return token, true
 }
 
+func (p *probeState) scheduleRetention(ctx context.Context, pool *pgxpool.Pool, key, relayURL, eventID string) {
+	if pool == nil || eventID == "" || !p.allowed(relayURL) {
+		return
+	}
+	_, _ = pool.Exec(ctx, `
+		INSERT INTO relay_probe_followups (url_key, endpoint_url, event_id, capability, check_after)
+		VALUES ($1, $2, $3, 'retention', now() + interval '1 hour')
+	`, key, relayURL, eventID)
+}
+
+func (p *probeState) followOne(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	if p == nil || pool == nil {
+		return false, nil
+	}
+	var recent int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM relay_probe_attempts WHERE started_at > now() - interval '1 hour'
+	`).Scan(&recent); err != nil {
+		if SchemaMissing(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if recent >= p.globalLimit {
+		return false, nil
+	}
+	var id int64
+	var relayURL, eventID, key string
+	err := pool.QueryRow(ctx, `
+		UPDATE relay_probe_followups
+		SET finished_at = now(), result = 'checking'
+		WHERE id = (
+			SELECT id FROM relay_probe_followups
+			WHERE finished_at IS NULL AND check_after <= now()
+			ORDER BY check_after, id
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, endpoint_url, event_id, url_key
+	`).Scan(&id, &relayURL, &eventID, &key)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || SchemaMissing(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !p.allowed(relayURL) {
+		_, _ = pool.Exec(ctx, `UPDATE relay_probe_followups SET result = 'skipped' WHERE id = $1`, id)
+		return true, nil
+	}
+	found, fetchErr := fetchEvents(ctx, relayURL, p.allowPrivate, map[string]any{"ids": []string{eventID}, "limit": 1})
+	result := "missing_after_one_interval"
+	if fetchErr == nil {
+		for _, item := range found {
+			if item != nil && item.ID == eventID {
+				result = "retrieved_after_one_interval"
+				_ = storeObservation(ctx, pool, key, CapRetention, StatusVerified, 0.6, "probe", result, "")
+			}
+		}
+	} else {
+		result = "incomplete"
+	}
+	if result == "missing_after_one_interval" {
+		_ = storeObservation(ctx, pool, key, CapRetention, "inconclusive", 0.35, "probe", result, "")
+	}
+	_, _ = pool.Exec(ctx, `UPDATE relay_probe_followups SET result = $2 WHERE id = $1`, id, result)
+	return true, nil
+}
+
 func (p *probeState) finish(ctx context.Context, pool *pgxpool.Pool, token string) {
 	if token == "" {
 		return
@@ -178,6 +258,22 @@ func (p *probeState) finish(ctx context.Context, pool *pgxpool.Pool, token strin
 	_, _ = pool.Exec(ctx, `
 		DELETE FROM relay_probe_leases WHERE lease_token = $1
 	`, token)
+}
+
+func leaseAllows(leased, requested string) bool {
+	if leased == requested {
+		return true
+	}
+	switch leased {
+	case CapWriteAccept:
+		return requested == CapWriteRetrieve || requested == CapAuthWrite || requested == CapRetention
+	case CapSearch:
+		return requested == CapAuthSearch
+	case CapGiftWrapPrivate:
+		return requested == CapGiftWrap || requested == CapGiftWrapAccept || requested == CapGiftWrapPublic || requested == CapAuthGiftWrap || requested == CapRetention
+	default:
+		return false
+	}
 }
 
 func probeHost(raw string) string {
@@ -207,7 +303,7 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 		return
 	}
 	id, _ := event["id"].(string)
-	ack, authStatus := readWriteAckWithAuth(conn, id, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
+	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
 	})
 	if pool != nil && authStatus == "ok" {
@@ -216,14 +312,16 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 		_ = storeObservation(ctx, pool, key, CapAuthWrite, StatusRestricted, 0.6, "probe", authStatus, token)
 	}
 	if ack != "accepted" {
-		if pool != nil && ack == "rejected" {
-			_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusRestricted, 0.55, "probe", "ok_false", token)
+		if pool != nil {
+			status, detail := publicationEvidence(ack)
+			_ = storeObservation(ctx, pool, key, CapWriteAccept, status, 0.55, "probe", detail, token)
 		}
 		metrics.IncRelayIntelProbe("write", ack)
 		return
 	}
 	if pool != nil {
 		_ = storeObservation(ctx, pool, key, CapWriteAccept, StatusVerified, 0.8, "probe", "ok_true", token)
+		p.scheduleRetention(ctx, pool, key, relayURL, id)
 	}
 	found, err := fetchEvents(ctx, relayURL, p.allowPrivate, map[string]any{"ids": []string{id}, "limit": 1})
 	if err == nil {
@@ -253,13 +351,14 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 	}
 	defer conn.Close()
 	id, _ := event["id"].(string)
+	content, _ := event["content"].(string)
 	payload, _ := json.Marshal([]any{"EVENT", event})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		metrics.IncRelayIntelProbe("search", "error")
 		return
 	}
-	ack, authStatus := readWriteAckWithAuth(conn, id, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
+	ack, authStatus := readWriteAckWithAuth(conn, id, payload, time.Now().Add(5*time.Second), func(challenge string) (map[string]any, error) {
 		return signAuth(p.key, p.pubkey, relayURL, challenge)
 	})
 	if pool != nil && authStatus == "ok" {
@@ -268,11 +367,15 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		_ = storeObservation(ctx, pool, key, CapAuthSearch, StatusRestricted, 0.6, "probe", authStatus, token)
 	}
 	if ack != "accepted" {
+		if pool != nil {
+			status, detail := publicationEvidence(ack)
+			_ = storeObservation(ctx, pool, key, CapSearch, status, 0.45, "probe", detail, token)
+		}
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 		return
 	}
-	positive, positiveStatus := readSearchIDs(conn, "nm-search-yes", "nostrmash relay intelligence probe")
-	negative, negativeStatus := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative")
+	positive, positiveStatus := readSearchIDs(conn, "nm-search-yes", content, p.pubkey)
+	negative, negativeStatus := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative-"+id, p.pubkey)
 	if positiveStatus == "unsupported" || negativeStatus == "unsupported" {
 		if pool != nil {
 			_ = storeObservation(ctx, pool, key, CapSearch, StatusUnsupported, 0.7, "probe", "closed", token)
@@ -293,6 +396,9 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		}
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 	default:
+		if pool != nil {
+			_ = storeObservation(ctx, pool, key, CapSearch, "inconclusive", 0.35, "probe", outcome, token)
+		}
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 	}
 }
@@ -309,11 +415,14 @@ func classifyWriteFrame(frame []any, eventID string) string {
 		}
 		id, _ := frame[1].(string)
 		ok, isBool := frame[2].(bool)
-		if !isBool || !ok {
-			return "rejected"
+		if !isBool || id == "" {
+			return "other"
 		}
 		if id != eventID {
 			return "mismatched"
+		}
+		if !ok {
+			return "rejected"
 		}
 		return "accepted"
 	case "NOTICE", "CLOSED":
@@ -323,25 +432,70 @@ func classifyWriteFrame(frame []any, eventID string) string {
 	}
 }
 
+func rejectionReason(frame []any) string {
+	msg := ""
+	if len(frame) >= 4 {
+		msg, _ = frame[3].(string)
+	}
+	return classifyRelayMessage(msg)
+}
+
+func classifyRelayMessage(msg string) string {
+	msg = strings.ToLower(msg)
+	switch {
+	case strings.Contains(msg, "auth-required") || strings.Contains(msg, "auth required"):
+		return "auth_required"
+	case strings.Contains(msg, "rate"):
+		return "rate_limited"
+	case strings.Contains(msg, "payment") || strings.Contains(msg, "invoice"):
+		return "payment_required"
+	case strings.Contains(msg, "unsupported") || strings.Contains(msg, "unknown kind"):
+		return "unsupported"
+	case strings.Contains(msg, "invalid") || strings.Contains(msg, "malformed"):
+		return "invalid"
+	case msg == "":
+		return "rejected"
+	default:
+		return "rejected"
+	}
+}
+
+func publicationEvidence(ack string) (string, string) {
+	switch ack {
+	case "unsupported":
+		return StatusUnsupported, ack
+	case "auth_required", "unauthorized", "payment_required", "rejected":
+		return StatusRestricted, ack
+	case "rate_limited", "timeout", "incomplete", "closed":
+		return "temporary", ack
+	default:
+		return "inconclusive", ack
+	}
+}
+
 func readWriteAck(conn *websocket.Conn, eventID string, deadline time.Time) string {
-	ack, _ := readWriteAckWithAuth(conn, eventID, deadline, nil)
+	ack, _ := readWriteAckWithAuth(conn, eventID, nil, deadline, nil)
 	return ack
 }
 
-func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, string) {
+func readWriteAckWithAuth(conn *websocket.Conn, eventID string, resend []byte, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, string) {
 	authState := ""
 	authEventID := ""
-	attempts := 0
+	challenges := 0
+	retries := 0
 	messages := 0
 	total := 0
 	for {
-		if messages >= 32 || total >= 256*1024 {
+		if messages >= 32 || total >= 256*1024 || time.Now().After(deadline) {
 			return "incomplete", authState
 		}
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			return "timeout", authState
+		}
+		if len(message) > 64*1024 {
+			return "incomplete", authState
 		}
 		messages++
 		total += len(message)
@@ -351,14 +505,14 @@ func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Ti
 		}
 		typ, _ := frame[0].(string)
 		if typ == "AUTH" {
-			if attempts >= 2 || auth == nil || len(frame) < 2 {
+			if challenges >= 2 || auth == nil || len(frame) < 2 {
 				return "auth_required", "required"
 			}
 			challenge, _ := frame[1].(string)
 			if challenge == "" {
 				return "auth_required", "required"
 			}
-			attempts++
+			challenges++
 			signed, err := auth(challenge)
 			if err != nil {
 				return "auth_required", "failed"
@@ -376,43 +530,84 @@ func readWriteAckWithAuth(conn *websocket.Conn, eventID string, deadline time.Ti
 			id, _ := frame[1].(string)
 			if authEventID != "" && id == authEventID {
 				ok, isBool := frame[2].(bool)
-				if !isBool || !ok {
+				if !isBool {
+					continue
+				}
+				if !ok {
 					return "unauthorized", "unauthorized"
 				}
 				authState = "ok"
+				if len(resend) > 0 && retries < 1 {
+					retries++
+					_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					if err := conn.WriteMessage(websocket.TextMessage, resend); err != nil {
+						return "incomplete", authState
+					}
+				}
 				continue
 			}
 		}
 		switch classifyWriteFrame(frame, eventID) {
 		case "accepted":
-			if authState == "sent" {
-				authState = "ok"
-			}
 			return "accepted", authState
-		case "rejected", "mismatched":
-			return classifyWriteFrame(frame, eventID), authState
+		case "rejected":
+			reason := rejectionReason(frame)
+			if reason == "auth_required" && auth != nil && authState != "ok" {
+				continue
+			}
+			if reason == "auth_required" && authState == "ok" && len(resend) > 0 && retries < 1 {
+				retries++
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := conn.WriteMessage(websocket.TextMessage, resend); err != nil {
+					return "incomplete", authState
+				}
+				continue
+			}
+			return reason, authState
+		case "mismatched":
+			ok, isBool := frame[2].(bool)
+			if isBool && !ok {
+				continue
+			}
+			return "mismatched", authState
 		case "closed":
-			if authState == "sent" {
-				return "unauthorized", "unauthorized"
+			text := strings.ToLower(fmt.Sprint(frame))
+			if strings.Contains(text, "auth-required") && authState == "ok" && len(resend) > 0 && retries < 1 {
+				retries++
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := conn.WriteMessage(websocket.TextMessage, resend); err != nil {
+					return "incomplete", authState
+				}
+				continue
 			}
 			return "closed", authState
 		}
 	}
 }
 
-func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, []string) {
+func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, deadline time.Time, auth func(challenge string) (map[string]any, error)) (string, []string, bool) {
 	req, _ := json.Marshal([]any{"REQ", sub, filter})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
-		return "incomplete", nil
+		return "incomplete", nil, false
 	}
 	var ids []string
-	for messages := 0; messages < 32; messages++ {
+	authID := ""
+	authState := ""
+	retries := 0
+	messages := 0
+	total := 0
+	for messages < 32 && total < 256*1024 && time.Now().Before(deadline) {
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			return "incomplete", ids
+			return "incomplete", ids, authState == "ok"
 		}
+		if len(message) > 64*1024 {
+			return "incomplete", ids, authState == "ok"
+		}
+		messages++
+		total += len(message)
 		var frame []json.RawMessage
 		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
 			continue
@@ -423,20 +618,44 @@ func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, d
 		}
 		switch typ {
 		case "AUTH":
-			if auth == nil || len(frame) < 2 {
-				return "auth_required", ids
+			if auth == nil || len(frame) < 2 || authState == "ok" || retries >= 2 {
+				continue
 			}
 			var challenge string
 			if json.Unmarshal(frame[1], &challenge) != nil || challenge == "" {
-				return "auth_required", ids
+				continue
 			}
 			signed, err := auth(challenge)
 			if err != nil {
-				return "auth_required", ids
+				return "auth_required", ids, false
 			}
+			authID, _ = signed["id"].(string)
 			payload, _ := json.Marshal([]any{"AUTH", signed})
+			_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-				return "incomplete", ids
+				return "incomplete", ids, false
+			}
+			authState = "sent"
+		case "OK":
+			if len(frame) < 3 || authID == "" {
+				continue
+			}
+			var id string
+			var ok bool
+			if json.Unmarshal(frame[1], &id) != nil || json.Unmarshal(frame[2], &ok) != nil || id != authID {
+				continue
+			}
+			if !ok {
+				return "unauthorized", ids, false
+			}
+			authState = "ok"
+			ids = nil
+			if retries < 2 {
+				retries++
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
+					return "incomplete", nil, true
+				}
 			}
 		case "EVENT":
 			if len(frame) < 3 {
@@ -447,10 +666,13 @@ func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, d
 				continue
 			}
 			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 64 * 1024})
-			if !parsed.Valid() || parsed.Event == nil {
+			if !parsed.Valid() || parsed.Event == nil || !eventMatchesFilter(parsed.Event, filter) {
 				continue
 			}
 			ids = append(ids, parsed.Event.ID)
+			if len(ids) > 8 {
+				return "incomplete", ids, authState == "ok"
+			}
 		case "EOSE":
 			if len(frame) < 2 {
 				continue
@@ -459,7 +681,10 @@ func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, d
 			if json.Unmarshal(frame[1], &got) != nil || got != sub {
 				continue
 			}
-			return "complete", ids
+			if authState == "sent" {
+				continue
+			}
+			return "complete", ids, authState == "ok"
 		case "CLOSED":
 			if len(frame) < 2 {
 				continue
@@ -468,10 +693,37 @@ func readSubscription(conn *websocket.Conn, sub string, filter map[string]any, d
 			if json.Unmarshal(frame[1], &got) != nil || got != sub {
 				continue
 			}
-			return "incomplete", ids
+			text := strings.ToLower(string(message))
+			switch classifyRelayMessage(text) {
+			case "auth_required":
+				return "auth_required", ids, authState == "ok"
+			case "unsupported":
+				return "unsupported", ids, authState == "ok"
+			case "rate_limited", "payment_required":
+				return classifyRelayMessage(text), ids, authState == "ok"
+			default:
+				if strings.Contains(text, "restricted") || strings.Contains(text, "blocked") {
+					return "denied", ids, authState == "ok"
+				}
+				return "incomplete", ids, authState == "ok"
+			}
 		}
 	}
-	return "incomplete", ids
+	return "incomplete", ids, authState == "ok"
+}
+
+func hasTagValue(tags [][]string, name string, wants []string) bool {
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != name {
+			continue
+		}
+		for _, want := range wants {
+			if tag[1] == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func classifySearch(positiveHit, negativeHit bool) string {
@@ -492,20 +744,31 @@ func classifyCompletedSearch(positiveStatus, negativeStatus string, positiveHit,
 	return classifySearch(positiveHit, negativeHit)
 }
 
-func readSearchIDs(conn *websocket.Conn, sub, query string) ([]string, string) {
-	req, _ := json.Marshal([]any{"REQ", sub, map[string]any{"kinds": []int{1}, "search": query, "limit": 5}})
+func readSearchIDs(conn *websocket.Conn, sub, query, author string) ([]string, string) {
+	filter := map[string]any{"kinds": []int{1}, "search": query, "limit": 5}
+	if author != "" {
+		filter["authors"] = []string{author}
+	}
+	req, _ := json.Marshal([]any{"REQ", sub, filter})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
 		return nil, "incomplete"
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	var ids []string
-	for {
+	messages := 0
+	total := 0
+	for messages < 32 && total < 256*1024 && time.Now().Before(deadline) {
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			return ids, "incomplete"
 		}
+		if len(message) > 64*1024 {
+			return ids, "incomplete"
+		}
+		messages++
+		total += len(message)
 		var frame []json.RawMessage
 		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
 			continue
@@ -552,6 +815,7 @@ func readSearchIDs(conn *websocket.Conn, sub, query string) ([]string, string) {
 			return ids, "incomplete"
 		}
 	}
+	return ids, "incomplete"
 }
 
 func containsID(ids []string, want string) bool {
@@ -568,7 +832,7 @@ func signProbeEvent(priv *btcec.PrivateKey, pubkey string) (map[string]any, erro
 	nonceSum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", pubkey, created)))
 	nonce := hex.EncodeToString(nonceSum[:8])
 	tags := [][]string{{"nonce", nonce}}
-	content := "nostrmash relay intelligence probe"
+	content := "nostrmash probe " + nonce
 	canonical, err := json.Marshal([]any{0, pubkey, created, 1, tags, content})
 	if err != nil {
 		return nil, err
@@ -590,27 +854,57 @@ func storeObservation(ctx context.Context, pool *pgxpool.Pool, key, capability, 
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var attemptID *int64
 	if token != "" {
-		var owned int
+		var leasedURL, leasedCap string
+		var current bool
 		err = tx.QueryRow(ctx, `
-			SELECT count(*) FROM relay_probe_leases
-			WHERE lease_token = $1 AND expires_at > now()
-		`, token).Scan(&owned)
+			SELECT l.url_key, l.capability, l.expires_at > now(), a.id
+			FROM relay_probe_leases l
+			JOIN relay_probe_attempts a ON a.lease_token = l.lease_token
+			WHERE l.lease_token = $1
+			FOR UPDATE OF l
+		`, token).Scan(&leasedURL, &leasedCap, &current, &attemptID)
 		if err != nil {
-			return err
+			return fmt.Errorf("probe lease %s cannot publish evidence", token)
 		}
-		if owned != 1 {
+		if !current || leasedURL != key || !leaseAllows(leasedCap, capability) {
 			return fmt.Errorf("probe lease %s cannot publish evidence", token)
 		}
 	}
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, key, capability, status, confidence, source, detail); err != nil {
-		if SchemaMissing(err) {
-			return nil
+	inserted := false
+	if attemptID != nil {
+		var sampleID int64
+		err = tx.QueryRow(ctx, `
+			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail, attempt_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (attempt_id, capability, status, detail) WHERE attempt_id IS NOT NULL DO NOTHING
+			RETURNING id
+		`, key, capability, status, confidence, source, detail, *attemptID).Scan(&sampleID)
+		if err != nil {
+			if SchemaMissing(err) {
+				return nil
+			}
+			if errors.Is(err, pgx.ErrNoRows) {
+				return tx.Commit(ctx)
+			}
+			return err
 		}
-		return err
+		inserted = true
+	} else {
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO relay_capability_samples (url_key, capability, status, confidence, source, detail)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, key, capability, status, confidence, source, detail); err != nil {
+			if SchemaMissing(err) {
+				return nil
+			}
+			return err
+		}
+		inserted = true
+	}
+	if !inserted {
+		return tx.Commit(ctx)
 	}
 	_, _ = tx.Exec(ctx, `
 		DELETE FROM relay_capability_samples

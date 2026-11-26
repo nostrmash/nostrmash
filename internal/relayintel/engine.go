@@ -30,6 +30,7 @@ type Constraints struct {
 	MinCapabilityConfidence float64
 	Diversity               *float64
 	RequireDiversity        bool
+	RequireVerifiedPrivacy  bool
 	RetainExisting          *bool
 	Weights                 Weights
 	HasWeights              bool
@@ -54,6 +55,7 @@ type RoleConstraints struct {
 	MinCapabilityConfidence *float64
 	Diversity               *float64
 	RequireDiversity        *bool
+	RequireVerifiedPrivacy  *bool
 	RetainExisting          *bool
 	Weights                 *Weights
 }
@@ -564,6 +566,9 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 			if floor := verifiedKeyPackageFloor(role, req.Constraints, rc.MinCapabilityConfidence); floor > 0 {
 				applyVerifiedKeyPackage(&relay, role, floor)
 			}
+			if role == RoleDMInbox && rc.RequireVerifiedPrivacy {
+				applyVerifiedPrivacy(&relay, rc.MinCapabilityConfidence)
+			}
 			if _, banned := excluded[item.URL]; banned && isPinned {
 				out.ConstraintsSatisfied = false
 				out.Unsatisfied = append(out.Unsatisfied, Reason{Code: "pinned_excluded", Text: "A relay is both pinned and excluded. The pin was kept."})
@@ -619,6 +624,9 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 		selection.Selected, _ = keepInvestigations(selection.Selected, preview, scoredByURL)
 		selection = reconcileSelection(selection, scoredByURL, roleMembers, maxCount)
 		selection = auditSelection(selection, scored, pinnedURLs(pinned), minCount, maxCount, diversity, rc)
+		if preset.Name == PresetPrivacy && role == RoleDMInbox {
+			selection = noteUnverifiedPrivacy(selection, scoredByURL)
+		}
 		if role == RolePublicOutbox {
 			selection = auditKeyPackageCapability(selection, scored, req.Constraints)
 		}
@@ -986,6 +994,9 @@ func (c Constraints) forRole(role string) Constraints {
 	if item.RequireDiversity != nil {
 		out.RequireDiversity = *item.RequireDiversity
 	}
+	if item.RequireVerifiedPrivacy != nil {
+		out.RequireVerifiedPrivacy = *item.RequireVerifiedPrivacy
+	}
 	if item.RetainExisting != nil {
 		out.RetainExisting = item.RetainExisting
 	}
@@ -1148,7 +1159,7 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 		if relay.Score == nil {
 			thin = true
 		}
-		if absoluteProhibition(relay) || hasViolation(relay, "excluded") || hasViolation(relay, "payment_required") || hasViolation(relay, "auth_rejected") || hasViolation(relay, "min_reliability") || hasViolation(relay, "min_capability_confidence") || hasViolation(relay, "keypackage_unverified") || hasViolation(relay, "search_unsupported") || hasViolation(relay, "dm_unsupported") {
+		if absoluteProhibition(relay) || hasViolation(relay, "excluded") || hasViolation(relay, "payment_required") || hasViolation(relay, "auth_rejected") || hasViolation(relay, "min_reliability") || hasViolation(relay, "min_capability_confidence") || hasViolation(relay, "keypackage_unverified") || hasViolation(relay, "privacy_unverified") || hasViolation(relay, "search_unsupported") || hasViolation(relay, "dm_unsupported") {
 			selection.ConstraintsSatisfied = false
 			code := relay.IneligibleReason
 			if code == "" {
@@ -1276,6 +1287,37 @@ func verifiedKeyPackageFloor(role string, constraints Constraints, roleMinimum f
 	return 0
 }
 
+func applyVerifiedPrivacy(relay *ScoredRelay, minConfidence float64) {
+	if relay == nil {
+		return
+	}
+	private := relay.Capabilities[CapGiftWrapPrivate]
+	if privacyAssessment(relay.Capabilities) == "recipient_only_verified" && (minConfidence <= 0 || private.Confidence >= minConfidence) {
+		return
+	}
+	relay.Violations = append(relay.Violations, Violation{
+		Code: "privacy_unverified", Role: RoleDMInbox, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+		Text: "Recipient-only gift-wrap access is not verified. Acceptance, advertisements, and unresolved exposure do not satisfy this requirement.",
+	})
+}
+
+func noteUnverifiedPrivacy(selection SelectResult, byURL map[string]ScoredRelay) SelectResult {
+	for _, item := range selection.Selected {
+		relay, ok := byURL[item.URL]
+		if ok && privacyAssessment(relay.Capabilities) == "recipient_only_verified" {
+			continue
+		}
+		selection.ConstraintsSatisfied = false
+		if !reasonCodeOn(selection.Unsatisfied, "privacy_unverified") {
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{
+				Code: "privacy_unverified",
+				Text: "The privacy preset keeps the current relays. Recipient-only access is not verified for every selected DM relay.",
+			})
+		}
+	}
+	return selection
+}
+
 func applyVerifiedKeyPackage(relay *ScoredRelay, role string, minConfidence float64) {
 	if relay == nil || minConfidence <= 0 {
 		return
@@ -1349,7 +1391,8 @@ func capabilityConfidence(role string, caps map[string]Capability) float64 {
 	case RoleSearch:
 		return caps[CapSearch].Confidence
 	case RoleDMInbox:
-		if privacyAssessment(caps) == "publicly_accessible" {
+		switch privacyAssessment(caps) {
+		case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
 			return 0
 		}
 		if privacyAssessment(caps) == "recipient_only_verified" && caps[CapGiftWrapPrivate].Confidence > 0 {

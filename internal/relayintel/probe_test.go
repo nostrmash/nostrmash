@@ -17,6 +17,9 @@ func TestWriteAckRequiresTheSubmittedEventID(t *testing.T) {
 	if classifyWriteFrame([]any{"OK", "wanted", false}, "wanted") != "rejected" {
 		t.Fatal("a false OK was treated as acceptance")
 	}
+	if classifyWriteFrame([]any{"OK", "other", false}, "wanted") != "mismatched" {
+		t.Fatal("a false OK for a different id rejected the submitted event")
+	}
 	if classifyWriteFrame([]any{"OK", "wanted", true}, "wanted") != "accepted" {
 		t.Fatal("matching OK was rejected")
 	}

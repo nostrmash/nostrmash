@@ -407,21 +407,27 @@ func reachComponent(in ScoreInput) (float64, float64) {
 }
 
 func privacyAssessment(caps map[string]Capability) string {
+	return privacyAssessmentAt(caps, time.Now())
+}
+
+func privacyAssessmentAt(caps map[string]Capability, now time.Time) string {
 	private := newerCapability(caps[CapGiftWrapPrivate], caps[CapGiftWrap])
 	public := caps[CapGiftWrapPublic]
 	privateAt := observedAt(private)
 	publicAt := observedAt(public)
-	publicVerified := public.Status == StatusVerified
+	publicSeen := public.Status == StatusVerified || public.Status == StatusStale || public.Status == StatusObserved
 	privateVerified := private.Status == StatusVerified
+	privateFresh := privateVerified && !staleAt(privateAt, now)
 	switch {
-	case publicVerified && privateVerified:
-		if privateAt.After(publicAt) && !staleObservation(privateAt) {
-			return "recipient_only_verified"
-		}
+	case publicSeen && privateFresh && privateAt.After(publicAt):
+		return "recipient_only_verified"
+	case publicSeen && privateVerified && privateAt.Equal(publicAt):
+		return "conflicting_evidence"
+	case publicSeen && (public.Status != StatusVerified || staleAt(publicAt, now)):
+		return "previous_exposure_unresolved"
+	case publicSeen:
 		return "publicly_accessible"
-	case publicVerified:
-		return "publicly_accessible"
-	case privateVerified && staleObservation(privateAt):
+	case privateVerified && staleAt(privateAt, now):
 		return "stale"
 	case privateVerified:
 		return "recipient_only_verified"
@@ -450,8 +456,8 @@ func observedAt(cap Capability) time.Time {
 	return *cap.ObservedAt
 }
 
-func staleObservation(at time.Time) bool {
-	return !at.IsZero() && time.Since(at) > ProbeStaleFor
+func staleAt(at, now time.Time) bool {
+	return !at.IsZero() && !now.IsZero() && now.Sub(at) > ProbeStaleFor
 }
 
 func privacyComponent(role string, caps map[string]Capability) (float64, float64, []Reason) {
@@ -464,8 +470,8 @@ func privacyComponent(role string, caps map[string]Capability) (float64, float64
 	switch privacyAssessment(caps) {
 	case "recipient_only_verified":
 		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "The newest complete gift-wrap check was recipient-only. This is not a delivery or anonymity guarantee."}}
-	case "publicly_accessible":
-		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "A newer or equally recent observation showed unauthorized gift-wrap retrieval. Older recipient-only evidence does not override it."}}
+	case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
+		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "Unauthorized gift-wrap retrieval was observed. Older recipient-only evidence does not override it, and age does not erase it."}}
 	case "stale":
 		return 0.35, 0.3, []Reason{{Code: "giftwrap_stale", Text: "The recipient-only observation is older than seven days and has not been confirmed again."}}
 	case "privacy_unknown":
@@ -514,7 +520,7 @@ func functionalityComponent(role string, caps map[string]Capability) (float64, f
 		switch privacyAssessment(caps) {
 		case "recipient_only_verified":
 			return 0.9, 0.8, nil, ""
-		case "publicly_accessible":
+		case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
 			return 0.2, 0.75, []Reason{{Code: "dm_public_giftwrap", Text: "Gift wraps on this relay were readable by an observer. That is not suitable for private messages."}}, ""
 		}
 		read := caps[CapRead]
