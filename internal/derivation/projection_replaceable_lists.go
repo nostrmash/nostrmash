@@ -61,6 +61,7 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				       EXCLUDED.created_at = contact_lists_latest.created_at
 				       AND EXCLUDED.event_id < contact_lists_latest.event_id
 				   )
+				   OR EXCLUDED.event_id = contact_lists_latest.event_id
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert contact_lists_latest: %w", err)

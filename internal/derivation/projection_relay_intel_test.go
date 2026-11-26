@@ -46,7 +46,8 @@ func TestRelayRoleProjectionKeepsMarkersAndLegacyApart(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT ARRAY(SELECT jsonb_array_elements_text(relays_json) FROM relay_lists_latest WHERE pubkey = $1)`, author).Scan(&relays); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(relays, ",") != "wss://both.example.com" {
+	// NIP-01 keeps the lexicographically smaller id when created_at ties.
+	if strings.Join(relays, ",") != "wss://read.example.com,wss://write.example.com" {
 		t.Fatalf("relay_lists_latest = %#v", relays)
 	}
 	rows, err := pool.Query(ctx, `
@@ -67,7 +68,7 @@ func TestRelayRoleProjectionKeepsMarkersAndLegacyApart(t *testing.T) {
 		}
 		got = append(got, role+"|"+endpoint+"|"+marker)
 	}
-	want := "public_inbox|wss://both.example.com| public_outbox|wss://both.example.com|"
+	want := "public_inbox|wss://read.example.com|read public_outbox|wss://write.example.com|write"
 	if strings.Join(got, " ") != want {
 		t.Fatalf("memberships = %#v", got)
 	}
