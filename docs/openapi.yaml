@@ -841,7 +841,7 @@ paths:
                     min_reliability: { type: number }
                     min_capability_confidence: { type: number }
                     diversity: { type: number, description: Soft operator-diversity preference. It does not block signing. }
-                    require_operator_diversity: { type: boolean, description: When true, operator concentration blocks signing if another eligible operator exists. }
+                    require_operator_diversity: { type: boolean, description: "Mandatory operator diversity. The selected configuration must use more than one known operator. It stays unsatisfied when the list is a single operator, operator ownership is unknown, or no eligible alternative exists. It is not waived because no diverse relay is available. Omit it, or leave it false, for the soft diversity preference." }
                     retain_existing: { type: boolean }
                 supplied_relays:
                   type: array

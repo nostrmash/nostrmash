@@ -555,11 +555,14 @@ func (s *Service) plan(ctx context.Context, req PlanRequest) (PlanResponse, erro
 					Text: "Reliability is below the requested minimum.",
 				})
 			}
-			if rc.MinCapabilityConfidence > 0 && capabilityConfidence(role, relay.Capabilities) < rc.MinCapabilityConfidence {
+			if role != RoleKeyPackage && rc.MinCapabilityConfidence > 0 && capabilityConfidence(role, relay.Capabilities) < rc.MinCapabilityConfidence {
 				relay.Violations = append(relay.Violations, Violation{
 					Code: "min_capability_confidence", Role: role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
 					Text: "Capability confidence is below the requested minimum.",
 				})
+			}
+			if floor := verifiedKeyPackageFloor(role, req.Constraints, rc.MinCapabilityConfidence); floor > 0 {
+				applyVerifiedKeyPackage(&relay, role, floor)
 			}
 			if _, banned := excluded[item.URL]; banned && isPinned {
 				out.ConstraintsSatisfied = false
@@ -1145,7 +1148,7 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 		if relay.Score == nil {
 			thin = true
 		}
-		if absoluteProhibition(relay) || hasViolation(relay, "excluded") || hasViolation(relay, "payment_required") || hasViolation(relay, "auth_rejected") || hasViolation(relay, "min_reliability") || hasViolation(relay, "min_capability_confidence") || hasViolation(relay, "search_unsupported") || hasViolation(relay, "dm_unsupported") {
+		if absoluteProhibition(relay) || hasViolation(relay, "excluded") || hasViolation(relay, "payment_required") || hasViolation(relay, "auth_rejected") || hasViolation(relay, "min_reliability") || hasViolation(relay, "min_capability_confidence") || hasViolation(relay, "keypackage_unverified") || hasViolation(relay, "search_unsupported") || hasViolation(relay, "dm_unsupported") {
 			selection.ConstraintsSatisfied = false
 			code := relay.IneligibleReason
 			if code == "" {
@@ -1180,14 +1183,11 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 		selection.ConstraintsSatisfied = false
 		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "retained_over_max", Text: "The final list is longer than the requested maximum."})
 	}
-	if diversity > 0 && diversity < 1 && len(selection.Selected) >= 2 && concentrated(selection.Selected, byURL) && diverseAlternative(selection.Selected, byURL) {
+	if rc.RequireDiversity {
+		selection = rejectMandatoryDiversity(selection, byURL)
+	} else if diversity > 0 && diversity < 1 && len(selection.Selected) >= 2 && concentrated(selection.Selected, byURL) && diverseAlternative(selection.Selected, byURL) {
 		reason := Reason{Code: "operator_concentration", Text: "The final list uses one operator even though a different eligible operator was available. Diversity stays a preference unless require_operator_diversity is set."}
-		if rc.RequireDiversity {
-			if !reasonCodeOn(selection.Unsatisfied, "operator_concentration") {
-				selection.ConstraintsSatisfied = false
-				selection.Unsatisfied = append(selection.Unsatisfied, reason)
-			}
-		} else if !reasonCodeOn(selection.Qualifications, "operator_concentration") {
+		if !reasonCodeOn(selection.Qualifications, "operator_concentration") {
 			selection.Qualifications = append(selection.Qualifications, reason)
 		}
 	}
@@ -1198,6 +1198,96 @@ func auditSelection(selection SelectResult, scored []ScoredRelay, pins []string,
 		selection.IndependentlySatisfied = selection.ConstraintsSatisfied
 	}
 	return selection
+}
+
+// rejectMandatoryDiversity checks the list that was actually selected.
+// A mandatory requirement stays unsatisfied when the list uses one operator,
+// when operator ownership is unknown, and when no eligible alternative exists.
+func rejectMandatoryDiversity(selection SelectResult, byURL map[string]ScoredRelay) SelectResult {
+	if len(selection.Selected) == 0 {
+		return selection
+	}
+	unknown := false
+	operators := map[string]struct{}{}
+	for _, item := range selection.Selected {
+		relay, ok := byURL[item.URL]
+		if !ok || relay.OperatorKey == "" {
+			unknown = true
+			continue
+		}
+		operators[relay.OperatorKey] = struct{}{}
+	}
+	if len(operators) >= 2 && !unknown {
+		return selection
+	}
+	selection.ConstraintsSatisfied = false
+	alternative := eligibleOtherOperator(selection.Selected, byURL)
+	if unknown {
+		text := "Mandatory operator diversity cannot be confirmed because operator ownership is missing for the selected configuration."
+		if !alternative {
+			text += " No eligible relay with different verified operator ownership is available."
+		}
+		if !reasonCodeOn(selection.Unsatisfied, "operator_ownership_unknown") {
+			selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "operator_ownership_unknown", Text: text})
+		}
+		return selection
+	}
+	text := "The selected configuration uses one operator, so mandatory operator diversity is not met."
+	if !alternative {
+		text += " No eligible relay from another operator is available."
+	}
+	if !reasonCodeOn(selection.Unsatisfied, "operator_concentration") {
+		selection.Unsatisfied = append(selection.Unsatisfied, Reason{Code: "operator_concentration", Text: text})
+	}
+	return selection
+}
+
+func eligibleOtherOperator(selected []SelectedRelay, byURL map[string]ScoredRelay) bool {
+	chosen := map[string]struct{}{}
+	known := map[string]struct{}{}
+	for _, item := range selected {
+		chosen[item.URL] = struct{}{}
+		if relay, ok := byURL[item.URL]; ok && relay.OperatorKey != "" {
+			known[relay.OperatorKey] = struct{}{}
+		}
+	}
+	for _, relay := range byURL {
+		if _, ok := chosen[relay.URL]; ok || !relay.Eligible || relay.OperatorKey == "" {
+			continue
+		}
+		if _, same := known[relay.OperatorKey]; same {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func verifiedKeyPackageFloor(role string, constraints Constraints, roleMinimum float64) float64 {
+	if role != RolePublicOutbox && role != RoleKeyPackage {
+		return 0
+	}
+	if item, ok := constraints.ByRole[RoleKeyPackage]; ok && item.MinCapabilityConfidence != nil && *item.MinCapabilityConfidence > 0 {
+		return *item.MinCapabilityConfidence
+	}
+	if role == RoleKeyPackage && roleMinimum > 0 {
+		return roleMinimum
+	}
+	return 0
+}
+
+func applyVerifiedKeyPackage(relay *ScoredRelay, role string, minConfidence float64) {
+	if relay == nil || minConfidence <= 0 {
+		return
+	}
+	kp := relay.Capabilities[CapKeyPackage]
+	if kp.Status == StatusVerified && kp.Confidence >= minConfidence {
+		return
+	}
+	relay.Violations = append(relay.Violations, Violation{
+		Code: "keypackage_unverified", Role: role, Severity: "requirement", Hard: true, ManualRetention: true, BlocksSigning: true,
+		Text: "KeyPackage transport is not verified at the requested confidence. Public writes, advertisements, and unknown evidence do not satisfy it.",
+	})
 }
 
 func concentrated(selected []SelectedRelay, byURL map[string]ScoredRelay) bool {
