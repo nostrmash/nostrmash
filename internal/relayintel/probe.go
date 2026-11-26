@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/nostrmash/nostrmash/internal/nostr"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -71,8 +74,14 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		 AND o.capability = CASE WHEN s.role = 'search' THEN 'search' ELSE 'write_accept' END
 		WHERE s.role IN ('public_outbox', 'search')
 		  AND s.endpoint_type = 'nostr_relay'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM relay_probe_leases l
+		    WHERE l.url_key = s.url_key
+		      AND l.capability = CASE WHEN s.role = 'search' THEN 'search' ELSE 'write_accept' END
+		      AND l.expires_at > now()
+		  )
 		ORDER BY o.observed_at ASC NULLS FIRST, s.trust_weighted DESC, s.url_key ASC
-		LIMIT 20
+		LIMIT 50
 	`)
 	if err != nil {
 		return wrapDB(err)
@@ -95,7 +104,8 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		if item.role == RoleSearch {
 			capability = CapSearch
 		}
-		if !p.claim(ctx, pool, item.key, capability) {
+		token, ok := p.claim(ctx, pool, item.key, capability, probeHost(item.url))
+		if !ok {
 			continue
 		}
 		if item.role == RoleSearch {
@@ -103,34 +113,48 @@ func (p *probeState) Once(ctx context.Context, pool *pgxpool.Pool) error {
 		} else {
 			p.write(ctx, pool, item.url, item.key)
 		}
-		p.finish(ctx, pool, item.key, capability)
+		p.finish(ctx, pool, token)
 		return nil
 	}
 	return nil
 }
 
-func (p *probeState) claim(ctx context.Context, pool *pgxpool.Pool, key, capability string) bool {
+func (p *probeState) claim(ctx context.Context, pool *pgxpool.Pool, key, capability, host string) (string, bool) {
 	seconds := int(p.minInterval.Seconds())
 	if seconds < 1 {
 		seconds = 1
 	}
-	var ok bool
+	var token string
 	err := pool.QueryRow(ctx, `
-		SELECT claim_relay_probe($1, $2, $3, $4, $5, 120)
-	`, key, capability, p.worker, p.globalLimit, seconds).Scan(&ok)
-	if err != nil || !ok {
+		SELECT claim_relay_probe($1, $2, $3, $4, $5, $6, 120)
+	`, key, capability, host, p.worker, p.globalLimit, seconds).Scan(&token)
+	if err != nil || token == "" {
 		metrics.IncRelayIntelProbe(capability, "skipped")
-		return false
+		return "", false
 	}
-	return true
+	return token, true
 }
 
-func (p *probeState) finish(ctx context.Context, pool *pgxpool.Pool, key, capability string) {
+func (p *probeState) finish(ctx context.Context, pool *pgxpool.Pool, token string) {
+	if token == "" {
+		return
+	}
 	_, _ = pool.Exec(ctx, `
-		UPDATE relay_probe_leases
-		SET finished_at = now()
-		WHERE url_key = $1 AND capability = $2 AND worker_id = $3 AND finished_at IS NULL
-	`, key, capability, p.worker)
+		UPDATE relay_probe_attempts
+		SET finished_at = now(), status = 'finished'
+		WHERE lease_token = $1 AND finished_at IS NULL
+	`, token)
+	_, _ = pool.Exec(ctx, `
+		DELETE FROM relay_probe_leases WHERE lease_token = $1
+	`, token)
+}
+
+func probeHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return raw
+	}
+	return parsed.Hostname()
 }
 
 func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, key string) {
@@ -175,7 +199,7 @@ func (p *probeState) write(ctx context.Context, pool *pgxpool.Pool, relayURL, ke
 			}
 		}
 	}
-	metrics.IncRelayIntelProbe("write", "ok")
+	metrics.IncRelayIntelProbe("write", "incomplete")
 }
 
 func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, key string) {
@@ -201,16 +225,16 @@ func (p *probeState) search(ctx context.Context, pool *pgxpool.Pool, relayURL, k
 		metrics.IncRelayIntelProbe("search", "inconclusive")
 		return
 	}
-	positive, positiveClosed := readSearchIDs(conn, "nm-search-yes", "nostrmash relay intelligence probe")
-	negative, negativeClosed := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative")
-	if positiveClosed || negativeClosed {
+	positive, positiveStatus := readSearchIDs(conn, "nm-search-yes", "nostrmash relay intelligence probe")
+	negative, negativeStatus := readSearchIDs(conn, "nm-search-no", "nostrmash-relay-intel-negative")
+	if positiveStatus == "unsupported" || negativeStatus == "unsupported" {
 		if pool != nil {
 			_ = storeObservation(ctx, pool, key, CapSearch, StatusUnsupported, 0.7, "probe", "closed")
 		}
 		metrics.IncRelayIntelProbe("search", "unsupported")
 		return
 	}
-	outcome := classifySearch(containsID(positive, id), containsID(negative, id))
+	outcome := classifyCompletedSearch(positiveStatus, negativeStatus, containsID(positive, id), containsID(negative, id))
 	switch outcome {
 	case "verified":
 		if pool != nil {
@@ -284,11 +308,18 @@ func classifySearch(positiveHit, negativeHit bool) string {
 	}
 }
 
-func readSearchIDs(conn *websocket.Conn, sub, query string) ([]string, bool) {
+func classifyCompletedSearch(positiveStatus, negativeStatus string, positiveHit, negativeHit bool) string {
+	if positiveStatus != "complete" || negativeStatus != "complete" {
+		return "inconclusive"
+	}
+	return classifySearch(positiveHit, negativeHit)
+}
+
+func readSearchIDs(conn *websocket.Conn, sub, query string) ([]string, string) {
 	req, _ := json.Marshal([]any{"REQ", sub, map[string]any{"kinds": []int{1}, "search": query, "limit": 5}})
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if err := conn.WriteMessage(websocket.TextMessage, req); err != nil {
-		return nil, false
+		return nil, "incomplete"
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	var ids []string
@@ -296,46 +327,52 @@ func readSearchIDs(conn *websocket.Conn, sub, query string) ([]string, bool) {
 		_ = conn.SetReadDeadline(deadline)
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			return ids, false
+			return ids, "incomplete"
 		}
-		var frame []any
+		var frame []json.RawMessage
 		if json.Unmarshal(message, &frame) != nil || len(frame) == 0 {
 			continue
 		}
-		typ, _ := frame[0].(string)
+		var typ string
+		if json.Unmarshal(frame[0], &typ) != nil {
+			continue
+		}
 		switch typ {
 		case "EVENT":
 			if len(frame) < 3 {
 				continue
 			}
-			if got, _ := frame[1].(string); got != sub {
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
 				continue
 			}
-			if body, ok := frame[2].(map[string]any); ok {
-				if id, _ := body["id"].(string); id != "" {
-					ids = append(ids, id)
-				}
+			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 32 * 1024})
+			if !parsed.Valid() || parsed.Event == nil {
+				continue
 			}
+			ids = append(ids, parsed.Event.ID)
 		case "EOSE":
 			if len(frame) < 2 {
 				continue
 			}
-			if got, _ := frame[1].(string); got != sub {
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
 				continue
 			}
-			return ids, false
+			return ids, "complete"
 		case "CLOSED":
 			if len(frame) < 2 {
 				continue
 			}
-			if got, _ := frame[1].(string); got != sub {
+			var got string
+			if json.Unmarshal(frame[1], &got) != nil || got != sub {
 				continue
 			}
-			text := strings.ToLower(fmt.Sprint(frame))
+			text := strings.ToLower(string(message))
 			if strings.Contains(text, "unsupported") || strings.Contains(text, "not supported") {
-				return ids, true
+				return ids, "unsupported"
 			}
-			return ids, false
+			return ids, "incomplete"
 		}
 	}
 }

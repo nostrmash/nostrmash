@@ -34,6 +34,12 @@ func TestSearchVerificationNeedsANegativeMiss(t *testing.T) {
 	if classifySearch(false, false) != "inconclusive" {
 		t.Fatal("an empty search was treated as proof of no support")
 	}
+	if classifyCompletedSearch("complete", "incomplete", true, false) != "inconclusive" {
+		t.Fatal("a timed-out negative query verified search")
+	}
+	if classifyCompletedSearch("incomplete", "complete", true, false) != "inconclusive" {
+		t.Fatal("a timed-out positive query verified search")
+	}
 }
 
 func TestReadWriteAckStopsOnAMismatchedOK(t *testing.T) {
@@ -50,7 +56,10 @@ func TestReadWriteAckStopsOnAMismatchedOK(t *testing.T) {
 	}))
 	defer server.Close()
 	dialer := websocket.Dialer{}
-	conn, _, err := dialer.Dial(wsURL(server), nil)
+	conn, resp, err := dialer.Dial(wsURL(server), nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
