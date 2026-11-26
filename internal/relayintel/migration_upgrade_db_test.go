@@ -46,9 +46,9 @@ func TestUpgradeFromDevelopPreservesHistoricalRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO event_relays (event_id, relay_url)
-		VALUES ($1, 'wss://historical.example')
-	`, eventID); err != nil {
+		INSERT INTO event_relays (event_id, relay_url, pubkey)
+		VALUES ($1, 'wss://historical.example', $2)
+	`, eventID, pubkey); err != nil {
 		t.Fatal(err)
 	}
 
