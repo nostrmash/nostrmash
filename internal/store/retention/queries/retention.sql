@@ -117,6 +117,49 @@ candidates AS (
             OR (j.status = 'dead' AND j.updated_at > @dead_grace_before)
           )
       )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM replaceable_state rs
+        WHERE rs.pubkey = e.pubkey
+          AND rs.kind = e.kind
+          AND rs.d_tag = CASE
+                WHEN e.kind >= 30000 AND e.kind < 40000 THEN COALESCE((
+                    SELECT et.value
+                    FROM event_tags et
+                    WHERE et.event_id = e.id
+                      AND et.tag_name = 'd'
+                      AND et.value_index = 0
+                    ORDER BY et.tag_index ASC
+                    LIMIT 1
+                ), '')
+                ELSE ''
+              END
+          AND rs.created_at = e.created_at
+          AND rs.event_id > e.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM relay_intel_repairs repair
+        WHERE repair.winner_event_id = e.id
+          AND repair.status IN ('pending', 'queued', 'running')
+          AND (
+            EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+                  AND rs.event_id IN (repair.winner_event_id, repair.loser_event_id)
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+            )
+          )
+      )
     ORDER BY p.created_at ASC, p.event_id ASC
     LIMIT @row_limit
 ),

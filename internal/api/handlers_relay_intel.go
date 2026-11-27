@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,6 +89,19 @@ func (h Handlers) GetProfileRelayRecommendations(w http.ResponseWriter, r *http.
 }
 
 func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	if err := h.optimizeGate.acquire(r.Context()); err != nil {
+		if errors.Is(err, errOptimizeOverloaded) {
+			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Cache-Control", "no-store")
+			writeError(r.Context(), w, http.StatusServiceUnavailable, "overloaded", "relay optimization is busy, retry shortly")
+			metrics.ObserveRelayIntelRequest("optimize", "rejected", time.Since(started).Seconds())
+			return
+		}
+		metrics.ObserveRelayIntelRequest("optimize", "cancelled", time.Since(started).Seconds())
+		return
+	}
+	defer h.optimizeGate.release()
 	h.serveRelayIntel(w, r, "optimize", func(svc *relayintel.Service) (any, error) {
 		var body relayOptimizeRequest
 		if err := decodeRelayIntelBody(w, r, &body); err != nil {
@@ -101,12 +115,13 @@ func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
 			return nil, input("pubkey must be 64 hex characters or an npub")
 		}
 		req := relayintel.PlanRequest{
-			Pubkey:       pubkey,
-			Preset:       body.Preset,
-			Roles:        body.Roles,
-			Supplied:     make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
-			SourceEvents: body.SourceEvents,
-			AllowCreate:  body.AllowCreate,
+			Pubkey:        pubkey,
+			Preset:        body.Preset,
+			Roles:         body.Roles,
+			Supplied:      make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
+			SourceEvents:  body.SourceEvents,
+			AllowCreate:   body.AllowCreate,
+			AllowRecreate: body.AllowRecreate,
 		}
 		if body.Constraints != nil {
 			req.Constraints = constraintFromRequest(*body.Constraints)
@@ -135,13 +150,14 @@ func (h Handlers) PostRelayVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 type relayOptimizeRequest struct {
-	Pubkey       string                  `json:"pubkey"`
-	Preset       string                  `json:"preset"`
-	Roles        []string                `json:"roles"`
-	Constraints  *relayConstraintRequest `json:"constraints"`
-	Supplied     []relaySuppliedRequest  `json:"supplied_relays"`
-	SourceEvents []json.RawMessage       `json:"source_events"`
-	AllowCreate  bool                    `json:"allow_create"`
+	Pubkey        string                  `json:"pubkey"`
+	Preset        string                  `json:"preset"`
+	Roles         []string                `json:"roles"`
+	Constraints   *relayConstraintRequest `json:"constraints"`
+	Supplied      []relaySuppliedRequest  `json:"supplied_relays"`
+	SourceEvents  []json.RawMessage       `json:"source_events"`
+	AllowCreate   bool                    `json:"allow_create"`
+	AllowRecreate bool                    `json:"allow_recreate"`
 }
 
 type relayConstraintRequest struct {
@@ -158,6 +174,7 @@ type relayConstraintRequest struct {
 	MinReliability          float64                        `json:"min_reliability"`
 	MinCapabilityConfidence float64                        `json:"min_capability_confidence"`
 	Diversity               *float64                       `json:"diversity"`
+	RequireDiversity        bool                           `json:"require_operator_diversity"`
 	RetainExisting          *bool                          `json:"retain_existing"`
 	Weights                 *relayintel.Weights            `json:"weights"`
 	Global                  *relayConstraintRequest        `json:"global"`
@@ -178,6 +195,7 @@ type relayRoleConstraint struct {
 	MinReliability          *float64            `json:"min_reliability"`
 	MinCapabilityConfidence *float64            `json:"min_capability_confidence"`
 	Diversity               *float64            `json:"diversity"`
+	RequireDiversity        *bool               `json:"require_operator_diversity"`
 	RetainExisting          *bool               `json:"retain_existing"`
 	Weights                 *relayintel.Weights `json:"weights"`
 }
@@ -232,6 +250,7 @@ func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
 		MinReliability:          body.MinReliability,
 		MinCapabilityConfidence: body.MinCapabilityConfidence,
 		Diversity:               body.Diversity,
+		RequireDiversity:        body.RequireDiversity,
 		RetainExisting:          body.RetainExisting,
 	}
 	if body.Weights != nil {
@@ -246,7 +265,7 @@ func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
 				Preferred: item.Preferred, Custom: item.Custom, PaidAccess: item.PaidAccess,
 				FreeOnly: item.FreeOnly, AuthRead: item.AuthRead, AuthWrite: item.AuthWrite,
 				MinReliability: item.MinReliability, MinCapabilityConfidence: item.MinCapabilityConfidence,
-				Diversity: item.Diversity, RetainExisting: item.RetainExisting, Weights: item.Weights,
+				Diversity: item.Diversity, RequireDiversity: item.RequireDiversity, RetainExisting: item.RetainExisting, Weights: item.Weights,
 			}
 		}
 	}
@@ -271,6 +290,10 @@ func (h Handlers) serveRelayIntel(w http.ResponseWriter, r *http.Request, endpoi
 	}
 	payload, err := fn(svc)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			metrics.ObserveRelayIntelRequest(endpoint, "cancelled", time.Since(started).Seconds())
+			return
+		}
 		h.writeRelayIntelError(w, r, err)
 		metrics.ObserveRelayIntelRequest(endpoint, "error", time.Since(started).Seconds())
 		return

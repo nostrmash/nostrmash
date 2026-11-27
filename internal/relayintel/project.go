@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -29,6 +31,9 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if err := LockCoordinate(ctx, tx, head.Pubkey, head.SourceKind, head.DTag); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, $3)`, head.Pubkey, head.SourceKind, head.DTag); err != nil && !SchemaMissing(err) {
+		return fmt.Errorf("lock canonical coordinate: %w", err)
+	}
 	var locked string
 	err = tx.QueryRow(ctx, `
 		SELECT event_id FROM relay_config_heads
@@ -45,16 +50,19 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if blocked {
 		return nil
 	}
+	memberCount, memberDigest := MembershipDigest(parsed.Members)
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO relay_config_heads (
 			pubkey, source_kind, d_tag, event_id, created_at,
 			explicitly_empty, client_side_only, declaration_source,
-			invalid_endpoint_count, truncated, title
-		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8,
-			$9, $10, $11
+			invalid_endpoint_count, truncated, title, needs_replay,
+			membership_count, membership_digest
 		)
+		SELECT $1, $2, $3, $4, $5,
+			$6, $7, $8,
+			$9, $10, $11, false,
+			$12, $13
+		WHERE relay_intel_may_project($1, $2, $3, $4, $5, NULL::text, NULL::bigint)
 		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
 		SET event_id = EXCLUDED.event_id,
 		    created_at = EXCLUDED.created_at,
@@ -64,16 +72,18 @@ func Project(ctx context.Context, tx pgx.Tx, in EventInput) error {
 		    invalid_endpoint_count = EXCLUDED.invalid_endpoint_count,
 		    truncated = EXCLUDED.truncated,
 		    title = EXCLUDED.title,
+		    needs_replay = false,
+		    membership_count = EXCLUDED.membership_count,
+		    membership_digest = EXCLUDED.membership_digest,
 		    updated_at = now()
-		WHERE EXCLUDED.created_at > relay_config_heads.created_at
-		   OR (
-		       EXCLUDED.created_at = relay_config_heads.created_at
-		       AND EXCLUDED.event_id < relay_config_heads.event_id
-		   )
-		   OR EXCLUDED.event_id = relay_config_heads.event_id
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, EXCLUDED.source_kind, EXCLUDED.d_tag,
+		    EXCLUDED.event_id, EXCLUDED.created_at,
+		    relay_config_heads.event_id, relay_config_heads.created_at
+		)
 	`, head.Pubkey, head.SourceKind, head.DTag, head.EventID, head.CreatedAt,
 		head.ExplicitlyEmpty, head.ClientSideOnly, head.DeclarationSource,
-		head.InvalidEndpoints, head.Truncated, head.Title)
+		head.InvalidEndpoints, head.Truncated, head.Title, memberCount, memberDigest)
 	if err != nil {
 		return fmt.Errorf("upsert relay config head: %w", err)
 	}
@@ -119,11 +129,21 @@ func deletionBlocks(ctx context.Context, tx pgx.Tx, pubkey string, kind int, dTa
 		}
 		return false, fmt.Errorf("check event deletion: %w", err)
 	}
-	err = tx.QueryRow(ctx, `
+	addressSQL := `
 		SELECT 1 FROM deletion_addresses
-		WHERE pubkey = $1 AND kind = $2 AND d_tag = $3 AND created_at >= $4
+		WHERE pubkey = $1 AND kind = $2 AND created_at >= $4 AND d_tag = $3
 		LIMIT 1
-	`, pubkey, kind, dTag, createdAt).Scan(&one)
+	`
+	addressArgs := []any{pubkey, kind, dTag, createdAt}
+	if !AddressableKind(kind) {
+		addressSQL = `
+			SELECT 1 FROM deletion_addresses
+			WHERE pubkey = $1 AND kind = $2 AND created_at >= $3
+			LIMIT 1
+		`
+		addressArgs = []any{pubkey, kind, createdAt}
+	}
+	err = tx.QueryRow(ctx, addressSQL, addressArgs...).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -147,35 +167,116 @@ func clearIfWinner(ctx context.Context, tx pgx.Tx, in EventInput) error {
 	if err := LockCoordinate(ctx, tx, in.Pubkey, in.Kind, ""); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, in.Pubkey, in.Kind); err != nil && !SchemaMissing(err) {
+		return fmt.Errorf("lock canonical coordinate: %w", err)
+	}
+	blocked, err := deletionBlocks(ctx, tx, in.Pubkey, in.Kind, "", in.EventID, in.CreatedAt)
+	if err != nil || blocked {
+		return err
+	}
 	var existingID string
 	var existingCreated int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT event_id, created_at
 		FROM relay_config_heads
 		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
 	`, in.Pubkey, in.Kind).Scan(&existingID, &existingCreated)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil
-		}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("load relay config head: %w", err)
 	}
-	if !wins(in.CreatedAt, in.EventID, existingCreated, existingID) {
+	if err == nil && !wins(in.CreatedAt, in.EventID, existingCreated, existingID) {
+		return nil
+	}
+	source := SourceModern
+	if in.Kind == KindLegacyContact {
+		source = SourceLegacy
+	}
+	head := Head{
+		Pubkey: in.Pubkey, SourceKind: in.Kind, EventID: in.EventID, CreatedAt: in.CreatedAt,
+		ExplicitlyEmpty: true, DeclarationSource: source,
+	}
+	emptyCount, emptyDigest := MembershipDigest(nil)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO relay_config_heads (
+			pubkey, source_kind, d_tag, event_id, created_at,
+			explicitly_empty, client_side_only, declaration_source,
+			invalid_endpoint_count, truncated, title, needs_replay,
+			membership_count, membership_digest
+		)
+		SELECT $1, $2, '', $3, $4,
+			true, false, $5,
+			0, false, '', false,
+			$6, $7
+		WHERE relay_intel_may_project($1, $2, '', $3, $4, NULL::text, NULL::bigint)
+		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
+		SET event_id = EXCLUDED.event_id,
+		    created_at = EXCLUDED.created_at,
+		    explicitly_empty = true,
+		    declaration_source = EXCLUDED.declaration_source,
+		    invalid_endpoint_count = 0,
+		    truncated = false,
+		    needs_replay = false,
+		    membership_count = EXCLUDED.membership_count,
+		    membership_digest = EXCLUDED.membership_digest,
+		    updated_at = now()
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, EXCLUDED.source_kind, EXCLUDED.d_tag,
+		    EXCLUDED.event_id, EXCLUDED.created_at,
+		    relay_config_heads.event_id, relay_config_heads.created_at
+		)
+	`, head.Pubkey, head.SourceKind, head.EventID, head.CreatedAt, head.DeclarationSource, emptyCount, emptyDigest)
+	if err != nil {
+		return fmt.Errorf("record cleared relay head: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
 		return nil
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM relay_role_memberships
 		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
-	`, in.Pubkey, in.Kind); err != nil {
+		  AND created_at <= $3
+	`, in.Pubkey, in.Kind, in.CreatedAt); err != nil {
 		return fmt.Errorf("delete cleared memberships: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM relay_config_heads
-		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = ''
-	`, in.Pubkey, in.Kind); err != nil {
-		return fmt.Errorf("delete cleared head: %w", err)
-	}
 	return nil
+}
+
+// MembershipDigest is the canonical text of one bounded membership set.
+// relay_intel_membership_digest builds the same text from the stored rows.
+func MembershipDigest(members []Membership) (int, string) {
+	type row struct{ role, url, marker string }
+	chosen := make([]row, 0, len(members))
+	index := map[string]int{}
+	for _, member := range members {
+		key := member.Role + "\x00" + member.URLKey
+		if at, ok := index[key]; ok {
+			chosen[at].marker = member.Marker
+			continue
+		}
+		index[key] = len(chosen)
+		chosen = append(chosen, row{role: member.Role, url: member.URLKey, marker: member.Marker})
+	}
+	sort.Slice(chosen, func(i, j int) bool {
+		if chosen[i].role != chosen[j].role {
+			return chosen[i].role < chosen[j].role
+		}
+		if chosen[i].url != chosen[j].url {
+			return chosen[i].url < chosen[j].url
+		}
+		return chosen[i].marker < chosen[j].marker
+	})
+	var b strings.Builder
+	for i, item := range chosen {
+		if i > 0 {
+			b.WriteByte(30)
+		}
+		b.WriteString(item.role)
+		b.WriteByte(31)
+		b.WriteString(item.url)
+		b.WriteByte(31)
+		b.WriteString(item.marker)
+	}
+	return len(chosen), b.String()
 }
 
 func replaceMembers(ctx context.Context, tx pgx.Tx, head Head, members []Membership) error {

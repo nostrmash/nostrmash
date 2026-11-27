@@ -52,15 +52,17 @@ type RankingsResponse struct {
 // ConfigResponse is one account's effective public relay configuration.
 type ConfigResponse struct {
 	Meta
-	Account AccountConfig `json:"account"`
-	Note    string        `json:"note"`
+	Account AccountConfig  `json:"account"`
+	Sources []SourceReport `json:"sources,omitempty"`
+	Note    string         `json:"note"`
 }
 
 // DiagnosticsResponse is the account-level finding list.
 type DiagnosticsResponse struct {
 	Meta
-	Pubkey   string    `json:"pubkey"`
-	Findings []Finding `json:"findings"`
+	Pubkey   string         `json:"pubkey"`
+	Sources  []SourceReport `json:"sources,omitempty"`
+	Findings []Finding      `json:"findings"`
 }
 
 // CapabilitiesResponse is the evidence record for one endpoint.
@@ -127,7 +129,7 @@ func (s *Service) Config(ctx context.Context, pubkey string) (ConfigResponse, er
 		return ConfigResponse{}, invalidf("pubkey must be 64 hex characters or an npub")
 	}
 	return cached(s, "cfg:"+pubkey, 30*time.Second, func() (ConfigResponse, error) {
-		heads, members, err := loadAccount(ctx, s.pool, pubkey)
+		account, _, _, reports, err := s.resolveAccount(ctx, pubkey, nil)
 		if err != nil {
 			return ConfigResponse{}, err
 		}
@@ -137,8 +139,9 @@ func (s *Service) Config(ctx context.Context, pubkey string) (ConfigResponse, er
 		}
 		resp := ConfigResponse{
 			Meta:    newMeta(time.Now().UTC()),
-			Account: EffectiveConfig(pubkey, heads, members),
-			Note:    "Kind 10013 is not decrypted. A public_safe false URL was published by the account and is excluded from global rankings. An empty modern list is not the same as a missing one, and a kind 3 list is ignored while a kind 10002 exists.",
+			Account: account,
+			Sources: reports,
+			Note:    "Kind 10013 is not decrypted. A public_safe false URL was published by the account and is excluded from global rankings. An empty modern list is not the same as a missing one, and a kind 3 list is ignored while a kind 10002 exists. sources compares the projection with canonical replaceable state.",
 		}
 		if ready {
 			resp.StatsComputedAt = &computed
@@ -193,7 +196,33 @@ func (s *Service) Optimize(ctx context.Context, req PlanRequest) (PlanResponse, 
 	if s.pool == nil {
 		return PlanResponse{}, ErrNotReady
 	}
+	runOptimizeHook(ctx)
+	if err := ctx.Err(); err != nil {
+		return PlanResponse{}, err
+	}
 	return s.plan(ctx, req)
+}
+
+var (
+	optimizeHookMu sync.Mutex
+	optimizeHook   func(context.Context)
+)
+
+// SetOptimizeHook installs a test hook that runs after an optimization has
+// been admitted and before it reads the database. Production leaves it unset.
+func SetOptimizeHook(fn func(context.Context)) {
+	optimizeHookMu.Lock()
+	optimizeHook = fn
+	optimizeHookMu.Unlock()
+}
+
+func runOptimizeHook(ctx context.Context) {
+	optimizeHookMu.Lock()
+	fn := optimizeHook
+	optimizeHookMu.Unlock()
+	if fn != nil {
+		fn(ctx)
+	}
 }
 
 // Verify checks a signed event on the relays the client names. It does not publish.
@@ -357,11 +386,10 @@ func (s *Service) diagnostics(ctx context.Context, pubkey string) (DiagnosticsRe
 	if s.pool == nil {
 		return DiagnosticsResponse{}, ErrNotReady
 	}
-	heads, members, err := loadAccount(ctx, s.pool, pubkey)
+	account, _, _, reports, err := s.resolveAccount(ctx, pubkey, nil)
 	if err != nil {
 		return DiagnosticsResponse{}, err
 	}
-	account := EffectiveConfig(pubkey, heads, members)
 	keys := make([]string, 0)
 	seen := map[string]struct{}{}
 	for _, role := range account.Roles {
@@ -414,6 +442,7 @@ func (s *Service) diagnostics(ctx context.Context, pubkey string) (DiagnosticsRe
 	resp := DiagnosticsResponse{
 		Meta:     newMeta(now),
 		Pubkey:   pubkey,
+		Sources:  reports,
 		Findings: Diagnose(account, health, now),
 	}
 	computed, ready, err := loadSnapshotTime(ctx, s.pool)

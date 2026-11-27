@@ -347,6 +347,9 @@ Relay intelligence:
 - `nostrmash_relay_intel_capability_observations_total{capability,status}`
 - `nostrmash_relay_intel_probe_total{class,outcome}`
 - `nostrmash_relay_intel_fallbacks_total{reason}`
+- `nostrmash_relay_intel_membership_integrity_pending`
+- `nostrmash_relay_intel_optimize_admission_total{result}`
+- `nostrmash_relay_intel_optimize_in_flight`
 
 `endpoint`, `role`, `kind`, `capability`, `class`, and `outcome` are fixed vocabularies. Pubkeys and relay URLs are not labels. See [architecture/relay-intelligence.md](architecture/relay-intelligence.md).
 

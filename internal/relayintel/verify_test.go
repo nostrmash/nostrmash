@@ -114,6 +114,64 @@ func TestVerifyIgnoresAForgedMatchingID(t *testing.T) {
 	}
 }
 
+func TestVerifyClosedSubscriptionID(t *testing.T) {
+	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
+	var event map[string]any
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatal(err)
+	}
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serve := func(match bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, payload, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				var frame []json.RawMessage
+				if json.Unmarshal(payload, &frame) != nil || len(frame) < 2 {
+					continue
+				}
+				var sub string
+				_ = json.Unmarshal(frame[1], &sub)
+				closedSub := "someone-else"
+				if match {
+					closedSub = sub
+				}
+				_ = conn.WriteJSON([]any{"CLOSED", closedSub, "error: restricted"})
+				if match {
+					return
+				}
+				_ = conn.WriteJSON([]any{"EVENT", sub, event})
+				_ = conn.WriteJSON([]any{"EOSE", sub})
+			}
+		}))
+	}
+	ignored := serve(false)
+	defer ignored.Close()
+	matched := serve(true)
+	defer matched.Close()
+	ok, err := VerifyEvent(context.Background(), raw, []string{wsURL(ignored)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ok.Relays) != 1 || !ok.Relays[0].Retrieved || ok.Relays[0].Outcome == "closed" {
+		t.Fatalf("unrelated CLOSED failed the subscription: %+v", ok.Relays)
+	}
+	closed, err := VerifyEvent(context.Background(), raw, []string{wsURL(matched)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closed.Relays) != 1 || closed.Relays[0].Retrieved || closed.Relays[0].Outcome != "closed" {
+		t.Fatalf("matching CLOSED = %+v", closed.Relays)
+	}
+}
+
 func TestVerifyRejectsInternalTargets(t *testing.T) {
 	raw := signedEvent(t, KindPublicRelayList, 1_700_000_000, [][]string{{"r", "wss://relay.example.com"}}, "")
 	for _, target := range []string{"wss://169.254.169.254", "wss://metadata.google.internal", "ws://127.0.0.1"} {

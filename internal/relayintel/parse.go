@@ -200,6 +200,7 @@ func markerRoles(marker string) []string {
 func parsePlainList(in EventInput) (Parsed, error) {
 	role := RoleForKind(in.Kind)
 	dTag := ""
+	dSeen := false
 	title := ""
 	tagName := "relay"
 	// Favorite lists and relay sets use "relay". Some historical events also
@@ -215,10 +216,13 @@ func parsePlainList(in EventInput) (Parsed, error) {
 		}
 		switch tag[0] {
 		case "d":
-			// Only addressable relay sets are keyed by the d tag.
-			// Replaceable lists ignore it, or two d values would not replace.
-			if in.Kind == KindRelaySet && dTag == "" && len(tag) >= 2 {
-				dTag = strings.TrimSpace(tag[1])
+			// The first d tag is the coordinate, including an explicit empty
+			// value. A later d tag does not replace it. Whitespace is kept.
+			if in.Kind == KindRelaySet && !dSeen {
+				dSeen = true
+				if len(tag) >= 2 {
+					dTag = tag[1]
+				}
 				if len(dTag) > 1024 {
 					return Parsed{}, fmt.Errorf("%w: d tag is too long", ErrInvalidInput)
 				}

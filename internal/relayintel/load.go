@@ -50,7 +50,13 @@ type registryRow struct {
 	Summary     []byte
 }
 
-func loadAccount(ctx context.Context, pool *pgxpool.Pool, pubkey string) ([]Head, []Membership, error) {
+// dbQuery is the read surface shared by a pool and a transaction.
+type dbQuery interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func loadAccount(ctx context.Context, pool dbQuery, pubkey string) ([]Head, []Membership, error) {
 	heads := make([]Head, 0)
 	rows, err := pool.Query(ctx, `
 		SELECT pubkey, source_kind, d_tag, event_id, created_at,
@@ -293,7 +299,7 @@ func loadEndpointUsers(ctx context.Context, pool *pgxpool.Pool, keys []string) (
 	return out, rows.Err()
 }
 
-func loadEventRaw(ctx context.Context, pool *pgxpool.Pool, ids []string) (map[string]json.RawMessage, error) {
+func loadEventRaw(ctx context.Context, pool dbQuery, ids []string) (map[string]json.RawMessage, error) {
 	out := map[string]json.RawMessage{}
 	if len(ids) == 0 || pool == nil {
 		return out, nil

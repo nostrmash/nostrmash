@@ -13,6 +13,7 @@ import (
 	"github.com/nostrmash/nostrmash/internal/jobs"
 	"github.com/nostrmash/nostrmash/internal/meili"
 	"github.com/nostrmash/nostrmash/internal/metrics"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 	"github.com/nostrmash/nostrmash/internal/runtimebootstrap"
 	"github.com/nostrmash/nostrmash/internal/store"
 )
@@ -47,6 +48,7 @@ type Bootstrap struct {
 }
 
 func BootstrapRuntime(ctx context.Context, log Logger, cfg config.WorkerConfig, build BuildInfo) (Bootstrap, func(), error) {
+	relayintel.SetProjectionEnabled(cfg.RelayIntel.Enabled && cfg.RelayIntel.ProjectionEnabled)
 	pool, err := store.OpenPool(ctx, cfg.Shared.Database.URL, cfg.Shared.Database.MaxConns, "nostrmash-"+cfg.Shared.ServiceName)
 	if err != nil {
 		log.Error("db_connect", "error", err)

@@ -20,21 +20,23 @@ import (
 // GlobalSuccess is the deprecated name for that sample. It is not network-wide
 // propagation.
 type VerifyResult struct {
-	SignatureValid  bool         `json:"signature_valid"`
-	SignatureError  string       `json:"signature_error,omitempty"`
-	EventID         string       `json:"event_id,omitempty"`
-	Pubkey          string       `json:"pubkey,omitempty"`
-	Kind            int          `json:"kind,omitempty"`
-	CreatedAt       int64        `json:"created_at,omitempty"`
-	Relays          []RelayCheck `json:"relays"`
-	RetrievedCount  int          `json:"retrieved_count"`
-	Agreement       bool         `json:"latest_agreement"`
-	Partial         bool         `json:"partial"`
-	SampleVerified  bool         `json:"sample_verified"`
-	SampleAgreement bool         `json:"sample_agreement"`
-	GlobalSuccess   bool         `json:"global_success"`
-	Reason          string       `json:"reason,omitempty"`
-	Note            string       `json:"note"`
+	SignatureValid       bool         `json:"signature_valid"`
+	SignatureError       string       `json:"signature_error,omitempty"`
+	EventID              string       `json:"event_id,omitempty"`
+	Pubkey               string       `json:"pubkey,omitempty"`
+	Kind                 int          `json:"kind,omitempty"`
+	CreatedAt            int64        `json:"created_at,omitempty"`
+	Relays               []RelayCheck `json:"relays"`
+	RetrievedCount       int          `json:"retrieved_count"`
+	ExactRetrievedCount  int          `json:"exact_retrieved_count"`
+	LatestAgreementCount int          `json:"latest_agreement_count"`
+	Agreement            bool         `json:"latest_agreement"`
+	Partial              bool         `json:"partial"`
+	SampleVerified       bool         `json:"sample_verified"`
+	SampleAgreement      bool         `json:"sample_agreement"`
+	GlobalSuccess        bool         `json:"global_success"`
+	Reason               string       `json:"reason,omitempty"`
+	Note                 string       `json:"note"`
 }
 
 // RelayCheck is one relay's retrieval result. Error is a short code.
@@ -129,11 +131,15 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 	wg.Wait()
 	result.Relays = append(result.Relays, checks...)
 
-	timeouts, conflicts, unavailable, missing := 0, 0, 0, 0
+	timeouts, conflicts, unavailable, missing, incomplete := 0, 0, 0, 0, 0
 	for _, item := range result.Relays {
+		if item.Retrieved {
+			result.ExactRetrievedCount++
+		}
 		switch item.Outcome {
 		case "retrieved":
 			if item.LatestVerified && item.LatestAgrees {
+				result.LatestAgreementCount++
 				result.RetrievedCount++
 			} else {
 				unavailable++
@@ -144,16 +150,20 @@ func VerifyEvent(ctx context.Context, eventJSON []byte, relays []string, allowPr
 			conflicts++
 		case "not_found":
 			missing++
+		case "incomplete":
+			incomplete++
 		default:
 			unavailable++
 		}
 	}
-	result.Agreement = conflicts == 0 && result.RetrievedCount > 0 && unavailable == 0 && missing == 0 && timeouts == 0
-	result.Partial = result.RetrievedCount > 0 && (missing > 0 || timeouts > 0 || unavailable > 0 || conflicts > 0)
+	result.Agreement = conflicts == 0 && result.LatestAgreementCount > 0 && unavailable == 0 && missing == 0 && timeouts == 0 && incomplete == 0
+	result.Partial = result.ExactRetrievedCount > 0 && (missing > 0 || timeouts > 0 || unavailable > 0 || conflicts > 0 || incomplete > 0)
 	switch {
 	case conflicts > 0:
 		result.Reason = "conflict"
-	case len(targets) < 2 || result.RetrievedCount < 2:
+	case incomplete > 0 && result.LatestAgreementCount < 2:
+		result.Reason = "incomplete"
+	case len(targets) < 2 || result.LatestAgreementCount < 2:
 		result.Reason = "insufficient_relay_sample"
 	case timeouts > 0:
 		result.Reason = "timeout"
@@ -328,6 +338,15 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 	}
 	defer conn.Close()
 	conn.SetReadLimit(64 * 1024)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
 	sub := "nm-verify"
 	req, err := json.Marshal([]any{"REQ", sub, filter})
 	if err != nil {
@@ -343,10 +362,17 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 		deadline = time.Now().Add(5 * time.Second)
 	}
 	total := 0
-	for messages := 0; messages < 12 && len(events) < 8; messages++ {
+	matched := 0
+	for messages := 0; messages < 32; messages++ {
+		if err := ctx.Err(); err != nil {
+			return events, err
+		}
 		_ = conn.SetReadDeadline(deadline)
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return events, ctx.Err()
+			}
 			return events, err
 		}
 		total += len(payload)
@@ -371,9 +397,13 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 				continue
 			}
 			parsed := nostr.ParseAndValidate(frame[2], nostr.Options{MaxRawJSONBytes: 64 * 1024, MaxContentBytes: 32 * 1024})
-			if !parsed.Valid() || parsed.Event == nil {
+			if !parsed.Valid() || parsed.Event == nil || !eventMatchesFilter(parsed.Event, filter) {
 				continue
 			}
+			if matched >= 8 {
+				continue
+			}
+			matched++
 			events = append(events, parsed.Event)
 		case "EOSE":
 			if len(frame) < 2 {
@@ -385,6 +415,13 @@ func fetchEvents(ctx context.Context, relayURL string, allowPrivate bool, filter
 			}
 			return events, nil
 		case "CLOSED":
+			if len(frame) < 2 {
+				continue
+			}
+			var subID string
+			if json.Unmarshal(frame[1], &subID) != nil || subID != sub {
+				continue
+			}
 			return events, errClosed
 		case "AUTH":
 			return events, errAuth
@@ -444,11 +481,98 @@ func outcomeFor(code string) string {
 	switch code {
 	case "timeout":
 		return "timeout"
+	case "closed":
+		return "closed"
+	case "incomplete":
+		return "incomplete"
 	case "rejected", "auth_required":
 		return "rejected"
 	default:
 		return "unavailable"
 	}
+}
+
+func eventMatchesFilter(event *nostr.Event, filter map[string]any) bool {
+	if event == nil {
+		return false
+	}
+	if ids := stringList(filter["ids"]); len(ids) > 0 && !listHas(ids, event.ID) {
+		return false
+	}
+	if authors := stringList(filter["authors"]); len(authors) > 0 && !listHasFold(authors, event.Pubkey) {
+		return false
+	}
+	if kinds := intList(filter["kinds"]); len(kinds) > 0 && !intHas(kinds, event.Kind) {
+		return false
+	}
+	if tags := stringList(filter["#d"]); len(tags) > 0 && !listHas(tags, firstD(event.Tags)) {
+		return false
+	}
+	return true
+}
+
+func stringList(raw any) []string {
+	switch values := raw.(type) {
+	case []string:
+		return values
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func intList(raw any) []int {
+	switch values := raw.(type) {
+	case []int:
+		return values
+	case []any:
+		out := make([]int, 0, len(values))
+		for _, item := range values {
+			switch number := item.(type) {
+			case int:
+				out = append(out, number)
+			case float64:
+				out = append(out, int(number))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func listHas(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func listHasFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func intHas(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func replaceableKind(kind int) bool {
@@ -457,9 +581,13 @@ func replaceableKind(kind int) bool {
 
 func firstD(tags [][]string) string {
 	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == "d" {
-			return tag[1]
+		if len(tag) == 0 || tag[0] != "d" {
+			continue
 		}
+		if len(tag) < 2 {
+			return ""
+		}
+		return tag[1]
 	}
 	return ""
 }

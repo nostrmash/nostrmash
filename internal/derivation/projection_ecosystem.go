@@ -572,16 +572,14 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	if kind != 10050 && kind != 10019 {
 		return nil
 	}
-	var winnerID string
-	var createdAt int64
-	if err := h.pool.QueryRow(ctx, `
-		SELECT id, created_at FROM events
-		WHERE pubkey = $1 AND kind = $2
-		ORDER BY created_at DESC, id ASC
-		LIMIT 1
-	`, pubkey, kind).Scan(&winnerID, &createdAt); err != nil {
+	winnerID, createdAt, _, found, err := loadAuthoritativeReplaceable(ctx, h.pool, pubkey, kind, "")
+	if err != nil {
 		return fmt.Errorf("load latest extended list: %w", err)
 	}
+	if !found {
+		return nil
+	}
+	runProjectionReadBarrier(winnerID)
 	tags, err := h.loadEventTags(ctx, winnerID)
 	if err != nil {
 		return err
@@ -596,25 +594,36 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	if err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, pubkey, kind); err != nil {
+		return fmt.Errorf("lock extended list coordinate: %w", err)
+	}
 	switch kind {
 	case 10050:
 		relays, _ := json.Marshal(tagValues(tags, "relay"))
 		var previousRelays []byte
 		_ = tx.QueryRow(ctx, `SELECT relays_json FROM dm_relay_lists_latest WHERE pubkey = $1`, pubkey).Scan(&previousRelays)
-		if err := diffRelayRefColumnTx(ctx, tx, "dm_ref_count", previousRelays, normalizeRelayList(tagValues(tags, "relay"))); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO dm_relay_lists_latest (pubkey, event_id, created_at, relays_json, derivation_version)
-			VALUES ($1, $2, $3, $4, $5)
+			SELECT $1, $2, $3, $4, $5
+			WHERE relay_intel_may_project($1, 10050, '', $2, $3, NULL::text, NULL::bigint)
 			ON CONFLICT (pubkey) DO UPDATE
 			SET event_id = EXCLUDED.event_id,
 			    created_at = EXCLUDED.created_at,
 			    relays_json = EXCLUDED.relays_json,
 			    derivation_version = EXCLUDED.derivation_version,
 			    updated_at = now()
-		`, pubkey, winnerID, createdAt, relays, writeVersion); err != nil {
+			WHERE relay_intel_may_project(
+			    EXCLUDED.pubkey, 10050, '', EXCLUDED.event_id, EXCLUDED.created_at,
+			    dm_relay_lists_latest.event_id, dm_relay_lists_latest.created_at
+			)
+		`, pubkey, winnerID, createdAt, relays, writeVersion)
+		if err != nil {
 			return fmt.Errorf("upsert dm relay list: %w", err)
+		}
+		if tag.RowsAffected() > 0 {
+			if err := diffRelayRefColumnTx(ctx, tx, "dm_ref_count", previousRelays, normalizeRelayList(tagValues(tags, "relay"))); err != nil {
+				return err
+			}
 		}
 	case 10019:
 		relays, _ := json.Marshal(tagValues(tags, "relay"))
@@ -638,7 +647,8 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 		mintJSON, _ := json.Marshal(mints)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO nutzap_info_latest (pubkey, event_id, created_at, relays_json, mints_json, p2pk, derivation_version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			SELECT $1, $2, $3, $4, $5, $6, $7
+			WHERE relay_intel_may_project($1, 10019, '', $2, $3, NULL::text, NULL::bigint)
 			ON CONFLICT (pubkey) DO UPDATE
 			SET event_id = EXCLUDED.event_id,
 			    created_at = EXCLUDED.created_at,
@@ -647,6 +657,10 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 			    p2pk = EXCLUDED.p2pk,
 			    derivation_version = EXCLUDED.derivation_version,
 			    updated_at = now()
+			WHERE relay_intel_may_project(
+			    EXCLUDED.pubkey, 10019, '', EXCLUDED.event_id, EXCLUDED.created_at,
+			    nutzap_info_latest.event_id, nutzap_info_latest.created_at
+			)
 		`, pubkey, winnerID, createdAt, relays, mintJSON, p2pk, writeVersion); err != nil {
 			return fmt.Errorf("upsert nutzap info: %w", err)
 		}

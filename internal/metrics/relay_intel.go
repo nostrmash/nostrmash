@@ -3,17 +3,20 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
-	relayIntelRequests     *prometheus.CounterVec
-	relayIntelDuration     *prometheus.HistogramVec
-	relayIntelCache        *prometheus.CounterVec
-	relayIntelProjections  *prometheus.CounterVec
-	relayIntelDeclarers    *prometheus.GaugeVec
-	relayIntelStatsAge     prometheus.Gauge
-	relayIntelBackfill     *prometheus.CounterVec
-	relayIntelBackfillDone *prometheus.GaugeVec
-	relayIntelCapabilities *prometheus.CounterVec
-	relayIntelProbes       *prometheus.CounterVec
-	relayIntelFallbacks    *prometheus.CounterVec
+	relayIntelRequests          *prometheus.CounterVec
+	relayIntelDuration          *prometheus.HistogramVec
+	relayIntelCache             *prometheus.CounterVec
+	relayIntelProjections       *prometheus.CounterVec
+	relayIntelDeclarers         *prometheus.GaugeVec
+	relayIntelStatsAge          prometheus.Gauge
+	relayIntelBackfill          *prometheus.CounterVec
+	relayIntelBackfillDone      *prometheus.GaugeVec
+	relayIntelCapabilities      *prometheus.CounterVec
+	relayIntelProbes            *prometheus.CounterVec
+	relayIntelFallbacks         *prometheus.CounterVec
+	relayIntelMembershipPending prometheus.Gauge
+	relayIntelOptimizeAdmission *prometheus.CounterVec
+	relayIntelOptimizeInFlight  prometheus.Gauge
 )
 
 func registerRelayIntelMetrics() {
@@ -94,6 +97,25 @@ func registerRelayIntelMetrics() {
 		},
 		[]string{"reason"},
 	)
+	relayIntelMembershipPending = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "nostrmash_relay_intel_membership_integrity_pending",
+			Help: "Live relay heads whose membership integrity metadata is not yet recorded. Zero means the historical upgrade pass has no remaining eligible heads.",
+		},
+	)
+	relayIntelOptimizeAdmission = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nostrmash_relay_intel_optimize_admission_total",
+			Help: "Optimization admission decisions. rejected is a deliberate overload response, not a completed optimization.",
+		},
+		[]string{"result"},
+	)
+	relayIntelOptimizeInFlight = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "nostrmash_relay_intel_optimize_in_flight",
+			Help: "Optimization requests currently holding a concurrency slot in this process.",
+		},
+	)
 	registry.MustRegister(
 		relayIntelRequests,
 		relayIntelDuration,
@@ -106,6 +128,9 @@ func registerRelayIntelMetrics() {
 		relayIntelCapabilities,
 		relayIntelProbes,
 		relayIntelFallbacks,
+		relayIntelMembershipPending,
+		relayIntelOptimizeAdmission,
+		relayIntelOptimizeInFlight,
 	)
 }
 
@@ -161,6 +186,32 @@ func IncRelayIntelProbe(class, outcome string) {
 	relayIntelProbes.WithLabelValues(boundToken(class), boundRelayIntelOutcome(outcome)).Inc()
 }
 
+func SetRelayIntelMembershipIntegrityPending(count float64) {
+	ensureRegistered()
+	if count < 0 {
+		count = 0
+	}
+	relayIntelMembershipPending.Set(count)
+}
+
+func IncRelayIntelOptimizeAdmission(result string) {
+	ensureRegistered()
+	switch result {
+	case "accepted", "rejected", "cancelled":
+	default:
+		result = "other"
+	}
+	relayIntelOptimizeAdmission.WithLabelValues(result).Inc()
+}
+
+func SetRelayIntelOptimizeInFlight(count float64) {
+	ensureRegistered()
+	if count < 0 {
+		count = 0
+	}
+	relayIntelOptimizeInFlight.Set(count)
+}
+
 func IncRelayIntelFallback(reason string) {
 	ensureRegistered()
 	relayIntelFallbacks.WithLabelValues(boundToken(reason)).Inc()
@@ -177,7 +228,7 @@ func boundRelayIntelEndpoint(endpoint string) string {
 
 func boundRelayIntelOutcome(outcome string) string {
 	switch outcome {
-	case "ok", "error", "empty", "fallback", "insufficient_evidence", "skipped", "applied", "malformed", "disabled", "timeout", "unsupported", "rejected":
+	case "ok", "error", "empty", "fallback", "insufficient_evidence", "skipped", "applied", "malformed", "disabled", "timeout", "unsupported", "rejected", "cancelled":
 		return outcome
 	default:
 		return "other"

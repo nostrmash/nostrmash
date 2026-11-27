@@ -1345,6 +1345,11 @@ type RelayConfigHead struct {
 	Truncated            bool
 	Title                string
 	UpdatedAt            pgtype.Timestamptz
+	NeedsReplay          bool
+	// Number of bounded memberships written for this head. -1 means the projection has not recorded the set.
+	MembershipCount int32
+	// Canonical text of that membership set. Empty is a real empty set only when membership_count is 0.
+	MembershipDigest string
 }
 
 type RelayCoverageChange struct {
@@ -1417,11 +1422,46 @@ type RelayIntelBackfillCursor struct {
 	UpdatedAt     pgtype.Timestamptz
 }
 
+type RelayIntelRepair struct {
+	WinnerEventID string
+	LoserEventID  string
+	Pubkey        string
+	Kind          int32
+	DTag          string
+	Status        string
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+	JobID         pgtype.Int8
+	Attempts      int32
+	LastError     pgtype.Text
+	FinishedAt    pgtype.Timestamptz
+}
+
 type RelayIntelSnapshot struct {
-	ID            bool
-	ComputedAt    pgtype.Timestamptz
-	KindCounts    []byte
-	RoleDeclarers []byte
+	ID             bool
+	ComputedAt     pgtype.Timestamptz
+	KindCounts     []byte
+	RoleDeclarers  []byte
+	LastDurationMs pgtype.Int8
+	LastError      pgtype.Text
+	LastFailureAt  pgtype.Timestamptz
+}
+
+type RelayIntelWorkCursor struct {
+	WorkName        string
+	CursorPubkey    string
+	CursorKind      int32
+	CursorDTag      string
+	CursorCreatedAt int64
+	CursorEventID   string
+	CursorTag       string
+	Idle            bool
+	NextRunAt       pgtype.Timestamptz
+	LastCompletedAt pgtype.Timestamptz
+	LastDurationMs  pgtype.Int8
+	LastError       pgtype.Text
+	LastRows        int64
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type RelayListStatsDaily struct {

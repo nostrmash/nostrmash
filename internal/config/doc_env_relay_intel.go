@@ -6,7 +6,13 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_ENABLED",
 			Runtimes:     []string{"api", "worker"},
 			DefaultValue: "true",
-			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Apply migration 000133 before running a binary that projects role rows.",
+			Description:  "Serve role-aware relay configuration, diagnostics, rankings, and optimization. The API returns 404 when this is false. Turning this off also stops role-row projection, statistics, and backfill. Canonical replaceable-state updates, historical tie repair, and deletion-address backfill keep running. Apply migration 000133 before running a binary that projects role rows.",
+		},
+		{
+			Name:         "RELAY_INTEL_PROJECTION_ENABLED",
+			Runtimes:     []string{"worker"},
+			DefaultValue: "true",
+			Description:  "Write role membership rows while ingesting supported relay-list kinds. False stops that projection only. It does not stop replaceable-state updates, and RELAY_INTEL_ENABLED=false forces this off.",
 		},
 		{
 			Name:         "RELAY_INTEL_ALLOW_PRIVATE_NETWORK",
@@ -30,7 +36,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_BACKFILL_ENABLED",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "true",
-			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again.",
+			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. Turning this off does not stop historical tie repair or deletion-address backfill. Re-enabling it walks relay heads that are missing, stale, or still missing membership integrity metadata.",
 		},
 		{
 			Name:         "RELAY_INTEL_BACKFILL_BATCH",
@@ -61,6 +67,12 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Runtimes:     []string{"worker"},
 			DefaultValue: "false",
 			Description:  "Must stay false. Setting it true fails startup. Gift-wrap verification is not available, so this flag cannot mark a relay privacy-preserving.",
+		},
+		{
+			Name:         "RELAY_INTEL_OPTIMIZE_CONCURRENCY",
+			Runtimes:     []string{"api"},
+			DefaultValue: "4",
+			Description:  "Maximum optimizations running at once in one API process. A further request returns 503 with error code overloaded and Retry-After, and is not queued. This does not limit configuration inspection, diagnostics, recommendations, or cached rankings. Raise it for a self-hosted deployment with spare database connections.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROBE_GLOBAL_PER_HOUR",
