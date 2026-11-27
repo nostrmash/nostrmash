@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/nostrmash/nostrmash/internal/nip05"
 	"github.com/nostrmash/nostrmash/internal/nostr"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 func (h *Handlers) ProjectEventAttributes(ctx context.Context, eventID string) error {
@@ -361,8 +362,9 @@ func (h *Handlers) projectDMVolumeWithVersion(ctx context.Context, eventID strin
 		return fmt.Errorf("handlers are not initialized")
 	}
 	var kind int
+	var pubkey string
 	var createdAt int64
-	if err := h.pool.QueryRow(ctx, `SELECT kind, created_at FROM events WHERE id = $1`, eventID).Scan(&kind, &createdAt); err != nil {
+	if err := h.pool.QueryRow(ctx, `SELECT kind, pubkey, created_at FROM events WHERE id = $1`, eventID).Scan(&kind, &pubkey, &createdAt); err != nil {
 		return fmt.Errorf("load event for dm volume: %w", err)
 	}
 	protocol := ""
@@ -372,6 +374,13 @@ func (h *Handlers) projectDMVolumeWithVersion(ctx context.Context, eventID strin
 	case 1059:
 		protocol = "nip17"
 	default:
+		return nil
+	}
+	synthetic, lookupErr := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+	if lookupErr != nil {
+		return fmt.Errorf("synthetic identity: %w", lookupErr)
+	}
+	if synthetic {
 		return nil
 	}
 	tags, err := h.loadEventTags(ctx, eventID)
@@ -594,10 +603,8 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 	if err != nil {
 		return err
 	}
-	if kind == 10050 {
-		if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, pubkey, kind); err != nil {
-			return fmt.Errorf("lock dm relay coordinate: %w", err)
-		}
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, pubkey, kind); err != nil {
+		return fmt.Errorf("lock extended list coordinate: %w", err)
 	}
 	switch kind {
 	case 10050:
@@ -649,7 +656,8 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 		mintJSON, _ := json.Marshal(mints)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO nutzap_info_latest (pubkey, event_id, created_at, relays_json, mints_json, p2pk, derivation_version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			SELECT $1, $2, $3, $4, $5, $6, $7
+			WHERE relay_intel_may_project($1, 10019, '', $2, $3, NULL::text, NULL::bigint)
 			ON CONFLICT (pubkey) DO UPDATE
 			SET event_id = EXCLUDED.event_id,
 			    created_at = EXCLUDED.created_at,
@@ -658,6 +666,10 @@ func (h *Handlers) projectExtendedListsWithVersion(ctx context.Context, eventID 
 			    p2pk = EXCLUDED.p2pk,
 			    derivation_version = EXCLUDED.derivation_version,
 			    updated_at = now()
+			WHERE relay_intel_may_project(
+			    EXCLUDED.pubkey, 10019, '', EXCLUDED.event_id, EXCLUDED.created_at,
+			    nutzap_info_latest.event_id, nutzap_info_latest.created_at
+			)
 		`, pubkey, winnerID, createdAt, relays, mintJSON, p2pk, writeVersion); err != nil {
 			return fmt.Errorf("upsert nutzap info: %w", err)
 		}

@@ -570,3 +570,49 @@ func TestCooldownDeferralDoesNotSpin(t *testing.T) {
 		t.Fatalf("attempts=%d deferrals=%d wait=%s", attempts, deferrals, wait)
 	}
 }
+
+func TestConfirmedExposureSurvivesInconclusiveAttempt(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "exposure survives"), "probekeep")
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	raw := "wss://kept.example"
+	_, key, _, ok := normalizeNostr(raw)
+	if !ok || key == "" {
+		t.Fatalf("url %s did not normalize", raw)
+	}
+	when := time.Now().UTC().Add(-time.Minute)
+	token := claimToken(t, ctx, pool, key, CapGiftWrapPrivate, "kept.example", "worker-a", 20, 1)
+	if err := commitProbeResult(ctx, pool, key, token, probeCompletion{
+		AttemptStatus: "public", ObservedAt: when,
+		Writes: []observationWrite{
+			{Capability: CapGiftWrapPublic, Status: StatusVerified, Detail: "exposed", Confidence: 0.8, Retrieved: boolPtr(true), ObservedAt: when},
+			{Capability: CapGiftWrapUnauthExposure, Status: StatusVerified, Detail: "unauthenticated_exposure", Confidence: 0.8, Retrieved: boolPtr(true), Unauthenticated: boolPtr(true), ObservedAt: when},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE relay_probe_attempts SET started_at = now() - interval '2 minutes' WHERE url_key = $1`, key); err != nil {
+		t.Fatal(err)
+	}
+	next := claimToken(t, ctx, pool, key, CapGiftWrapPrivate, "kept.example", "worker-a", 20, 1)
+	later := time.Now().UTC()
+	if err := commitProbeResult(ctx, pool, key, next, probeCompletion{
+		AttemptStatus: "inconclusive", ObservedAt: later,
+		Writes: []observationWrite{
+			{Capability: CapGiftWrapPublic, Status: "inconclusive", Detail: "timeout", Confidence: 0.35, ObservedAt: later},
+			{Capability: CapGiftWrapUnauthExposure, Status: "inconclusive", Detail: "timeout", Confidence: 0.35, ObservedAt: later},
+			{Capability: CapGiftWrapAuthExposure, Status: "inconclusive", Detail: "timeout", Confidence: 0.35, ObservedAt: later},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := NewService(pool, Options{}).Capabilities(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Privacy.Assessment != "publicly_accessible" || !report.Privacy.ExposureConfirmed || report.Privacy.UnauthenticatedExposure == nil || !*report.Privacy.UnauthenticatedExposure || report.Privacy.AuthenticatedObserverExposure != nil {
+		t.Fatalf("inconclusive attempt replaced confirmed exposure: %+v", report.Privacy)
+	}
+}

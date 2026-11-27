@@ -244,6 +244,7 @@ func clearDeletedListProjections(ctx context.Context, tx pgx.Tx, pubkey string, 
 			`DELETE FROM relay_lists_latest WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
 			`DELETE FROM dm_relay_lists_latest WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
 			`DELETE FROM profiles_latest WHERE pubkey = $1 AND metadata_event_id = ANY($2::text[])`,
+			`DELETE FROM nutzap_info_latest WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
 			`SELECT relay_intel_remove_contact_projection($1, event_id)
 			 FROM contact_lists_latest
 			 WHERE pubkey = $1 AND event_id = ANY($2::text[])`,
@@ -265,6 +266,8 @@ func clearDeletedListProjections(ctx context.Context, tx pgx.Tx, pubkey string, 
 		statement = `DELETE FROM relay_lists_latest WHERE pubkey = $1 AND created_at <= $2`
 	case 10050:
 		statement = `DELETE FROM dm_relay_lists_latest WHERE pubkey = $1 AND created_at <= $2`
+	case 10019:
+		statement = `DELETE FROM nutzap_info_latest WHERE pubkey = $1 AND created_at <= $2`
 	default:
 		return nil
 	}

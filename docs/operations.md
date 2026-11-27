@@ -216,7 +216,138 @@ Role-aware recommendations are on by default after migration `000133_relay_role_
 - Active write probes are off. Turning `RELAY_INTEL_ACTIVE_PROBES` on requires `RELAY_INTEL_PROBE_SECRET_KEY` on the worker only. The API never loads that key. Gift-wrap probes are not implemented.
 - `RELAY_INTEL_ALLOW_PRIVATE_NETWORK` is for a self-hosted deployment that must verify loopback or RFC1918 relays. Link-local and metadata hosts stay blocked. Leave it false on the public deployment.
 - Rankings can be empty with `stats_not_ready` until the first successful aggregate refresh. That is not an outage of the popular-relays API.
-- Optimize and verify do not publish events. A single relay read-back is not global propagation.
+- Optimize and verify do not publish events. A single relay read-back is not global propagation. One API process runs at most `RELAY_INTEL_OPTIMIZE_CONCURRENCY` optimizations at once (default 4). The next request is HTTP 503 `overloaded` with `Retry-After: 1`. It is not queued, and it is not the per-client 429 `rate_limited` response. Configuration, diagnostics, recommendations, and cached rankings do not take that slot. `nostrmash_relay_intel_optimize_admission_total{result="rejected"}` counts those refusals. Benchmarks must not record them as completed optimizations.
+
+### Upgrade through migration 000145
+
+`000145_relay_intel_membership_and_retention.sql` adds membership integrity columns and four foreign-key indexes. `cmd/migrate` and boot-time migration apply every pending file inside one transaction. `CREATE INDEX CONCURRENTLY` cannot run there. On a populated database, build the indexes before that transaction so the migration's `CREATE INDEX IF NOT EXISTS` only checks the catalog.
+
+Do not edit `000144` or `000145` after either file has been applied. A checksum mismatch stops migration. Do not renumber them.
+
+`IF NOT EXISTS` does not prove an index is valid or has the right definition. An invalid index left by a failed concurrent build occupies the name, is not used for cascades, and makes the migration skip the build.
+
+#### 1. Pre-upgrade checks
+
+Run these on the primary, in the application schema:
+
+```sql
+SELECT migration_id, checksum
+FROM schema_migrations_audit
+WHERE migration_id LIKE '%000144%' OR migration_id LIKE '%000145%';
+
+SELECT c.relname AS index_name, i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS index_def
+FROM pg_class c
+JOIN pg_index i ON i.indexrelid = c.oid
+WHERE c.relname IN (
+    'idx_relay_role_memberships_source_event',
+    'idx_relay_config_heads_event_id',
+    'idx_dm_relay_lists_latest_event_id',
+    'idx_nutzap_info_latest_event_id'
+);
+
+SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) AS total
+FROM pg_class
+WHERE relname IN (
+    'relay_role_memberships',
+    'relay_config_heads',
+    'dm_relay_lists_latest',
+    'nutzap_info_latest',
+    'events'
+);
+```
+
+Confirm free disk and free WAL space are comfortably larger than the relay-intelligence child tables. A concurrent index build writes the index and its WAL. Finish or roll back `idle in transaction` sessions before building; a concurrent build waits for snapshots those sessions still hold.
+
+Expected definitions, all btree and with no predicate:
+
+- `idx_relay_role_memberships_source_event` on `relay_role_memberships (source_event_id)`
+- `idx_relay_config_heads_event_id` on `relay_config_heads (event_id)`
+- `idx_dm_relay_lists_latest_event_id` on `dm_relay_lists_latest (event_id)`
+- `idx_nutzap_info_latest_event_id` on `nutzap_info_latest (event_id)`
+
+#### 2. Index preparation
+
+For each missing index, outside a transaction:
+
+```sql
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+CREATE INDEX CONCURRENTLY idx_relay_role_memberships_source_event
+    ON relay_role_memberships (source_event_id);
+```
+
+Repeat for the other three names and tables. Watch `pg_stat_progress_create_index`. If a build is interrupted, the index remains invalid. Drop that name and build it again:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS idx_relay_role_memberships_source_event;
+```
+
+Do not start the transactional migration while any of the four indexes is missing, invalid, or defined differently. Drop the wrong one concurrently and recreate it. The migration will not repair an invalid index of the same name.
+
+#### 3. Migration execution
+
+Keep `MIGRATE_ON_BOOT=false` on API, worker, and ingestor so they do not open the migration transaction themselves.
+
+Run the new `cmd/migrate` once. With the indexes already valid, `000145` is an `ADD COLUMN` with a constant default (metadata only on PostgreSQL 11+), function replacement, and four no-op index statements. Set a short `lock_timeout` (for example 5 seconds) on that session so a blocked `ACCESS EXCLUSIVE` on `relay_config_heads` fails instead of queueing behind a long writer. `statement_timeout` of a couple of minutes is enough once the indexes exist. If `lock_timeout` fires, the transaction rolls back, `000145` is not recorded, and the concurrent indexes remain.
+
+#### 4. Worker and API rollout
+
+Stop the previous worker, then start the new one, after `000145` is in `schema_migrations_audit`. The new worker's projection writes `membership_count` and `membership_digest`. Starting it earlier fails those writes because the columns do not exist. The previous worker's inserts omit those columns, so Postgres stores `-1`. Leave that worker stopped once the new one is up. A head it inserted afterward would stay unknown until the next worker start, because a finished pass does not scan on every tick.
+
+The API can roll out with the worker. Its optimization limit is process-local and does not depend on the new columns. Leave the old API up until the migration commits; an old API does not reference the new columns.
+
+#### 5. Historical membership metadata
+
+On startup the worker clears the reconcile idle flag. Heads with `membership_count = -1` are also eligible while that cursor is idle, so a finished `relay_intel_backfill_cursor` does not skip them. Reconciliation parses the authoritative event with the existing Go parser and rewrites the bounded membership set. It does not trust whatever rows are already stored.
+
+A real empty or client-side-only list is stored as count 0. A truncated list keeps the bounded set and `truncated = true`. A deleted winner is not projected. An event that cannot be parsed is stored as `membership_count = -2` so it is not selected on every tick. `-2` is not a valid empty list.
+
+The pass is one batch per backfill interval (default 200 rows every 5 seconds). A restart continues from `relay_intel_work_cursor` where `work_name = 'projection_reconcile'`.
+
+#### 6. Post-upgrade checks
+
+```sql
+SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid)
+FROM pg_class c
+JOIN pg_index i ON i.indexrelid = c.oid
+WHERE c.relname IN (
+    'idx_relay_role_memberships_source_event',
+    'idx_relay_config_heads_event_id',
+    'idx_dm_relay_lists_latest_event_id',
+    'idx_nutzap_info_latest_event_id'
+);
+
+SELECT idle, cursor_tag, last_rows, last_completed_at
+FROM relay_intel_work_cursor
+WHERE work_name = 'projection_reconcile';
+
+SELECT count(*) AS still_unknown
+FROM replaceable_state rs
+LEFT JOIN relay_config_heads h
+  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
+WHERE rs.kind IN (3, 10002, 10006, 10007, 10012, 10013, 10050, 10051, 10063, 10102, 30002)
+  AND (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay OR h.membership_count = -1);
+```
+
+`still_unknown` reaches 0 and `cursor_tag` becomes `membership_v1`. `nostrmash_relay_intel_membership_integrity_pending` is the same backlog. A selective lookup such as `EXPLAIN SELECT 1 FROM relay_role_memberships WHERE source_event_id = '<one event id>'` uses `idx_relay_role_memberships_source_event`.
+
+#### 7. Monitoring
+
+- `pg_stat_progress_create_index` during the concurrent builds.
+- Replication lag and WAL volume while those builds run.
+- `nostrmash_relay_intel_membership_integrity_pending` until it stays 0.
+- `nostrmash_relay_intel_optimize_in_flight` and `nostrmash_relay_intel_optimize_admission_total`.
+- Replaceable purge duration. The indexed cascade no longer sequential-scans these four child tables as account counts grow.
+
+#### 8. Recovery and rollback
+
+A failed concurrent build leaves an invalid index. Drop that index concurrently and build it again before migrating. Do not drop an index the migration has already accepted unless you are deliberately returning to the slow cascade.
+
+If `cmd/migrate` rolls back, `000145` is not applied and the prebuilt indexes can stay. They match what the migration will create.
+
+After `000145` commits, do not delete the migration row or edit the file. The previous binary can still run: new columns have defaults, and the replaced functions keep their old signatures. Stop the new worker before running that older binary for long, or it will keep writing the new columns. Dropping the columns is a forward fix, not a down migration.
+
+Rolling back the API binary removes the optimization limit. It does not require a schema change.
 
 ## Contributor handoff checklist
 

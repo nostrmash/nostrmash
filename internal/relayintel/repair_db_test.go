@@ -1314,6 +1314,92 @@ type storedEvent struct {
 	tags       [][]string
 }
 
+func TestRepairDoesNotLockTheCanonicalRowBeforeTheCoordinate(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	owner := strings.Repeat("d", 64)
+	lower := strings.Repeat("a", 64)
+	higher := strings.Repeat("b", 64)
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: lower, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 10,
+		tags: [][]string{{"r", "wss://lower.example", "write"}},
+	})
+	insertStoredEvent(t, ctx, pool, storedEvent{
+		id: higher, pubkey: owner, kind: relayintel.KindPublicRelayList, created: 10,
+		tags: [][]string{{"r", "wss://higher.example", "write"}},
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO replaceable_state (pubkey, kind, d_tag, event_id, created_at, derivation_version)
+		VALUES ($1, 10002, '', $2, 10, 1)
+	`, owner, higher); err != nil {
+		t.Fatal(err)
+	}
+	resetRepairCursor(t, ctx, pool)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, 10002, '')`, owner); err != nil {
+		t.Fatal(err)
+	}
+	repairCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		var n int
+		done <- pool.QueryRow(repairCtx, `SELECT repair_replaceable_tie(10)`).Scan(&n)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_locks l
+			JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE l.locktype = 'advisory'
+			  AND NOT l.granted
+			  AND a.query ILIKE '%repair_replaceable_tie%'
+		`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("repair finished before waiting on the coordinate lock: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("repair did not wait on the coordinate lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		t.Fatal(err)
+	}
+	var held string
+	if err := tx.QueryRow(ctx, `
+		SELECT event_id FROM replaceable_state
+		WHERE pubkey = $1 AND kind = 10002
+		FOR UPDATE
+	`, owner).Scan(&held); err != nil {
+		t.Fatalf("repair held the canonical row while waiting for the coordinate lock: %v", err)
+	}
+	if held != higher {
+		t.Fatalf("canonical row = %s", held)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func repairPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
 	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "relay intel repair"), "relayrepair")

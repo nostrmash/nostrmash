@@ -384,10 +384,13 @@ func negativeAuthenticatedObserver(result accessResult) bool {
 	if authenticatedObserverHit(result) || result.Hit || result.SeenBeforeAuth || result.RetrievedUnauthenticated {
 		return false
 	}
-	if result.Status == "denied" || result.Status == "unauthorized" {
-		return true
+	// A rejected or unfinished AUTH event does not show what an authenticated
+	// observer would be allowed to read. The subscription itself has to
+	// complete, or be refused, after authentication succeeded.
+	if !result.Authenticated {
+		return false
 	}
-	return result.Authenticated && result.Status == "complete"
+	return result.Status == "complete" || result.Status == "denied"
 }
 
 func pathWrite(capability string, result accessResult) (observationWrite, bool) {
@@ -427,9 +430,12 @@ func pathWrite(capability string, result accessResult) (observationWrite, bool) 
 		write.Retrieved = boolPtr(true)
 		return write, true
 	}
-	if result.Status == "denied" || result.Status == "unauthorized" ||
-		(result.Status == "complete" && (!result.AuthAttempted || result.Authenticated)) ||
-		(result.Status == "auth_required" && !result.AuthAttempted) {
+	observer := capability == CapGiftWrapObserverExact || capability == CapGiftWrapObserverTag
+	negative := negativeUnauthenticated(result)
+	if observer {
+		negative = negativeAuthenticatedObserver(result)
+	}
+	if negative {
 		write.Status = StatusVerified
 		write.Confidence = 0.6
 		write.Retrieved = boolPtr(false)

@@ -2,9 +2,11 @@
 
 ## Final integrated run
 
-The account-scale run against the indexed retention implementation has not been executed.
+The account-scale run against the indexed retention implementation has not been executed. This branch now contains core commit `678254924cb49f9a34db19aa879563b48f8e7d91`, which contains `31df4c808129f633593d7bcd605cb178dad40727`. The ancestor check in `scripts/relay_intel_operational_bench.sh` passes. The indexed 10,000-account and 100,000-account fixtures were still not seeded, so there is still no indexed account-scale after number.
 
-On 26 November 2026 the capability tip was `caaef7b2ad005ca56c17ecf288c72d9f169f58b3` ("Keep incomplete gift-wrap checks unknown and identify completions by their result"). The reviewed core commit `31df4c808129f633593d7bcd605cb178dad40727` ("Keep a deleted projection from hiding the remaining canonical winner") is the tip of `origin/fix/relay-intelligence` and is not an ancestor of `origin/feat/relay-capability-probes`. That core commit adds `relay_config_heads.membership_count`, the membership digest, and the four event-id indexes. Its migration is numbered `000145_relay_intel_membership_and_retention.sql`. The capability branch already uses `000145` for `000145_relay_probe_evidence_fence.sql`, so the benchmark branch does not renumber or apply that migration itself.
+`PostRelayOptimize` admits at most `RELAY_INTEL_OPTIMIZE_CONCURRENCY` requests in one API process (default 4) and returns HTTP 503 `overloaded` after that. The overload scenario was not executed on this commit.
+
+On 26 November 2026 the capability tip was `caaef7b2ad005ca56c17ecf288c72d9f169f58b3` ("Keep incomplete gift-wrap checks unknown and identify completions by their result"). At that time the reviewed core commit `31df4c808129f633593d7bcd605cb178dad40727` ("Keep a deleted projection from hiding the remaining canonical winner") was not an ancestor of `origin/feat/relay-capability-probes`. That core commit adds `relay_config_heads.membership_count`, the membership digest, and the four event-id indexes. Its migration is numbered `000145_relay_intel_membership_and_retention.sql`. The capability branch had used `000145` for the probe evidence fence; that file is now `000146_relay_probe_evidence_fence.sql`, and this merge keeps both.
 
 Attempted check:
 
@@ -41,13 +43,13 @@ RELAY_INTEL_OPERATIONAL_COMPILE=1 scripts/relay_intel_operational_bench.sh
 
 That command printed `tagged compile ok` and exited 0.
 
-What stays unmeasured until the capability branch contains `31df4c8`:
+What stays unmeasured on this integrated tree:
 
 - Indexed purge latency, trigger time, buffers, WAL, and index use at 10,000 and 100,000 accounts.
 - Populated index-build duration, index size, WAL, and lock wait. The benchmark drops and recreates the four indexes on the disposable schema after seeding. That code path did not run.
-- Historical heads with `membership_count = -1`. The column is absent, so discovery and reconciliation throughput are not reported.
+- Historical heads with `membership_count = -1`. Discovery and reconciliation throughput for that backlog are not reported.
 - API, optimization, statistics refresh, burst derivation, and storage on the integrated schema.
-- Whether a four-request optimize limit exists. `PostRelayOptimize` in this tree has no concurrency limit. The overload scenario is implemented and was not executed.
+- The overload scenario. The four-request optimize limit is in this tree and was not executed.
 
 The previous unindexed account-scale artifacts are preserved at `benchmarks/relay-intelligence/operational/historical/3163b9d50d8a3acd432e069da25eda5e49606bf8/` and are still the files in `benchmarks/relay-intelligence/operational/results-*.json` and `plans-*.txt`. The sections from "Previous measurements (3163b9d)" through the 16d258a history describe that run.
 
@@ -98,7 +100,7 @@ A 500,000-account run was not executed.
 
 ## How to reproduce the 3163b9d run
 
-The current `scripts/relay_intel_operational_bench.sh` refuses this run until core commit `31df4c808129f633593d7bcd605cb178dad40727` is in HEAD. The command below is how the 3163b9d results were produced, at tooling commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
+`scripts/relay_intel_operational_bench.sh` now finds core commit `31df4c808129f633593d7bcd605cb178dad40727` in HEAD and runs the account-scale benchmark instead of refusing. The command below is how the 3163b9d results were produced, at tooling commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
 
 ```sh
 docker compose -p nostrmash up -d --no-deps postgres meilisearch

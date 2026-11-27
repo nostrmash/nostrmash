@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,6 +89,19 @@ func (h Handlers) GetProfileRelayRecommendations(w http.ResponseWriter, r *http.
 }
 
 func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	if err := h.optimizeGate.acquire(r.Context()); err != nil {
+		if errors.Is(err, errOptimizeOverloaded) {
+			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Cache-Control", "no-store")
+			writeError(r.Context(), w, http.StatusServiceUnavailable, "overloaded", "relay optimization is busy, retry shortly")
+			metrics.ObserveRelayIntelRequest("optimize", "rejected", time.Since(started).Seconds())
+			return
+		}
+		metrics.ObserveRelayIntelRequest("optimize", "cancelled", time.Since(started).Seconds())
+		return
+	}
+	defer h.optimizeGate.release()
 	h.serveRelayIntel(w, r, "optimize", func(svc *relayintel.Service) (any, error) {
 		var body relayOptimizeRequest
 		if err := decodeRelayIntelBody(w, r, &body); err != nil {
@@ -279,6 +293,10 @@ func (h Handlers) serveRelayIntel(w http.ResponseWriter, r *http.Request, endpoi
 	}
 	payload, err := fn(svc)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			metrics.ObserveRelayIntelRequest(endpoint, "cancelled", time.Since(started).Seconds())
+			return
+		}
 		h.writeRelayIntelError(w, r, err)
 		metrics.ObserveRelayIntelRequest(endpoint, "error", time.Since(started).Seconds())
 		return

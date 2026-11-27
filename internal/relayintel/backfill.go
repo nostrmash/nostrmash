@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,10 +22,39 @@ func BackfillKinds() []int {
 	}
 }
 
-// BackfillBatch projects one page of stored relay events for the next
-// unfinished kind, then reconciles relay heads that are missing, stale, or
-// explicitly marked for replay. It does not dial relays and it does not scan
-// unrelated replaceable kinds. Historical tie repair is RunCanonicalRepair.
+// membershipUnknown is the column default from migration 000145. It means
+// this head has not been checked against its authoritative event.
+// membershipUnreadable means that event could not establish a set. It is not
+// a valid empty configuration, and reconcile does not retry it every tick.
+const (
+	membershipUnknown            = -1
+	membershipUnreadable         = -2
+	membershipIntegrityCursorTag = "membership_v1"
+
+	reconcileEligiblePredicate  = `(h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay OR h.membership_count = -1)`
+	reconcileLiveEventPredicate = `NOT EXISTS (
+		      SELECT 1 FROM deletion_events de
+		      WHERE de.target_event_id = rs.event_id AND de.deleter_pubkey = rs.pubkey
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM deletion_addresses da
+		      WHERE da.pubkey = rs.pubkey
+		        AND da.kind = rs.kind
+		        AND da.created_at >= rs.created_at
+		        AND (
+		            (rs.kind >= 30000 AND rs.kind < 40000 AND da.d_tag = rs.d_tag)
+		            OR rs.kind < 30000
+		            OR rs.kind >= 40000
+		        )
+		  )
+		  AND EXISTS (SELECT 1 FROM events ev WHERE ev.id = rs.event_id)`
+)
+
+// BackfillBatch reconciles one page of relay heads that are missing, stale,
+// marked for replay, or still missing membership integrity metadata, then
+// projects one page of stored events for the next unfinished kind.
+// It does not dial relays and it does not scan unrelated replaceable kinds.
+// Historical tie repair is RunCanonicalRepair.
 func BackfillBatch(ctx context.Context, pool *pgxpool.Pool, batch int) error {
 	if pool == nil {
 		return ErrNotReady
@@ -280,22 +310,27 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		return wrapDB(err)
 	}
 	var cursorKind int
-	var cursorPubkey, cursorDTag string
+	var cursorPubkey, cursorDTag, cursorTag string
 	var idle bool
 	var nextRun time.Time
 	if err := conn.QueryRow(ctx, `
-		SELECT cursor_kind, cursor_pubkey, cursor_d_tag, idle, next_run_at
+		SELECT cursor_kind, cursor_pubkey, cursor_d_tag, cursor_tag, idle, next_run_at
 		FROM relay_intel_work_cursor
 		WHERE work_name = 'projection_reconcile'
-	`).Scan(&cursorKind, &cursorPubkey, &cursorDTag, &idle, &nextRun); err != nil {
+	`).Scan(&cursorKind, &cursorPubkey, &cursorDTag, &cursorTag, &idle, &nextRun); err != nil {
 		return wrapDB(err)
 	}
-	if idle && nextRun.After(time.Now()) {
+	kinds := backfillKindArgs()
+	if idle && nextRun.After(time.Now()) && cursorTag == membershipIntegrityCursorTag {
+		metrics.SetRelayIntelMembershipIntegrityPending(0)
 		return nil
 	}
-	kinds := make([]int32, len(BackfillKinds()))
-	for i, kind := range BackfillKinds() {
-		kinds[i] = int32(kind)
+	if idle && nextRun.After(time.Now()) {
+		// A finished historical backfill cursor must not hide heads whose
+		// membership metadata is still the pre-000145 default.
+		cursorKind = 0
+		cursorPubkey = ""
+		cursorDTag = ""
 	}
 	rows, err := conn.Query(ctx, `
 		SELECT rs.pubkey, rs.kind, rs.d_tag, rs.event_id, rs.created_at
@@ -304,22 +339,8 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
 		WHERE rs.kind = ANY($1::int[])
 		  AND (rs.kind, rs.pubkey, rs.d_tag) > ($2, $3, $4)
-		  AND (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay)
-		  AND NOT EXISTS (
-		      SELECT 1 FROM deletion_events de
-		      WHERE de.target_event_id = rs.event_id AND de.deleter_pubkey = rs.pubkey
-		  )
-		  AND NOT EXISTS (
-		      SELECT 1 FROM deletion_addresses da
-		      WHERE da.pubkey = rs.pubkey
-		        AND da.kind = rs.kind
-		        AND da.created_at >= rs.created_at
-		        AND (
-		            (rs.kind >= 30000 AND rs.kind < 40000 AND da.d_tag = rs.d_tag)
-		            OR rs.kind < 30000
-		            OR rs.kind >= 40000
-		        )
-		  )
+		  AND `+reconcileEligiblePredicate+`
+		  AND `+reconcileLiveEventPredicate+`
 		ORDER BY rs.kind, rs.pubkey, rs.d_tag
 		LIMIT $5
 	`, kinds, cursorKind, cursorPubkey, cursorDTag, batch)
@@ -357,13 +378,20 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		}
 	}
 	for _, row := range page {
+		runReconcileRowHook(row.pubkey, row.kind, row.id)
 		if !HandlesKind(row.kind) || row.raw == "" {
+			if err := stampUnreadableHead(ctx, conn, row.pubkey, row.dTag, row.id, row.kind, row.created); err != nil {
+				return err
+			}
 			continue
 		}
 		var payload struct {
 			Tags [][]string `json:"tags"`
 		}
 		if json.Unmarshal([]byte(row.raw), &payload) != nil {
+			if err := stampUnreadableHead(ctx, conn, row.pubkey, row.dTag, row.id, row.kind, row.created); err != nil {
+				return err
+			}
 			continue
 		}
 		tx, err := conn.Begin(ctx)
@@ -376,6 +404,9 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		if err != nil {
 			_ = tx.Rollback(ctx)
 			if SchemaMissing(err) || skippable(err) {
+				if err := stampUnreadableHead(ctx, conn, row.pubkey, row.dTag, row.id, row.kind, row.created); err != nil {
+					return err
+				}
 				continue
 			}
 			return err
@@ -385,18 +416,28 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		}
 	}
 	if len(page) < batch {
+		pending, pendingErr := countEligibleHeads(ctx, conn, kinds)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		metrics.SetRelayIntelMembershipIntegrityPending(float64(pending))
+		tag := ""
+		if pending == 0 {
+			tag = membershipIntegrityCursorTag
+		}
 		_, err = conn.Exec(ctx, `
 			UPDATE relay_intel_work_cursor
 			SET cursor_kind = 0,
 			    cursor_pubkey = '',
 			    cursor_d_tag = '',
+			    cursor_tag = $2,
 			    idle = true,
 			    next_run_at = now() + interval '15 minutes',
 			    last_completed_at = now(),
 			    last_rows = $1,
 			    updated_at = now()
 			WHERE work_name = 'projection_reconcile'
-		`, len(page))
+		`, len(page), tag)
 	} else {
 		last := page[len(page)-1]
 		_, err = conn.Exec(ctx, `
@@ -414,6 +455,144 @@ func reconcileAuthoritative(ctx context.Context, pool *pgxpool.Pool, batch int) 
 		return wrapDB(err)
 	}
 	return nil
+}
+
+func backfillKindArgs() []int32 {
+	kinds := make([]int32, len(BackfillKinds()))
+	for i, kind := range BackfillKinds() {
+		kinds[i] = int32(kind)
+	}
+	return kinds
+}
+
+// ProjectionReconcileStatus reports whether historical membership metadata
+// still needs a pass. UpgradeComplete is true when no live relay head is
+// missing, stale, marked for replay, or still at the unknown count.
+type ProjectionReconcileStatus struct {
+	PendingEligible   int
+	Idle              bool
+	IntegrityRecorded bool
+	UpgradeComplete   bool
+}
+
+func ReadProjectionReconcileStatus(ctx context.Context, pool *pgxpool.Pool) (ProjectionReconcileStatus, error) {
+	var status ProjectionReconcileStatus
+	if pool == nil {
+		return status, ErrNotReady
+	}
+	var tag string
+	err := pool.QueryRow(ctx, `
+		SELECT idle, cursor_tag
+		FROM relay_intel_work_cursor
+		WHERE work_name = 'projection_reconcile'
+	`).Scan(&status.Idle, &tag)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || SchemaMissing(err) {
+			return status, nil
+		}
+		return status, wrapDB(err)
+	}
+	status.IntegrityRecorded = tag == membershipIntegrityCursorTag
+	pending, err := countEligibleHeads(ctx, pool, backfillKindArgs())
+	if err != nil {
+		return status, err
+	}
+	status.PendingEligible = pending
+	status.UpgradeComplete = pending == 0
+	return status, nil
+}
+
+type headCounter interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func countEligibleHeads(ctx context.Context, q headCounter, kinds []int32) (int, error) {
+	var pending int
+	err := q.QueryRow(ctx, `
+		SELECT count(*)
+		FROM replaceable_state rs
+		LEFT JOIN relay_config_heads h
+		  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
+		WHERE rs.kind = ANY($1::int[])
+		  AND `+reconcileEligiblePredicate+`
+		  AND `+reconcileLiveEventPredicate+`
+	`, kinds).Scan(&pending)
+	if err != nil {
+		if SchemaMissing(err) {
+			return 0, nil
+		}
+		return 0, wrapDB(err)
+	}
+	return pending, nil
+}
+
+func stampUnreadableHead(ctx context.Context, conn *pgxpool.Conn, pubkey, dTag, eventID string, kind int, created int64) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO relay_config_heads (
+			pubkey, source_kind, d_tag, event_id, created_at, declaration_source,
+			needs_replay, membership_count, membership_digest
+		)
+		SELECT $1, $2, $3, $4, $5, 'modern', false, $6, ''
+		WHERE relay_intel_may_project($1, $2, $3, $4, $5, NULL::text, NULL::bigint)
+		ON CONFLICT (pubkey, source_kind, d_tag) DO UPDATE
+		SET event_id = EXCLUDED.event_id,
+		    created_at = EXCLUDED.created_at,
+		    needs_replay = false,
+		    membership_count = EXCLUDED.membership_count,
+		    membership_digest = '',
+		    updated_at = now()
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, EXCLUDED.source_kind, EXCLUDED.d_tag,
+		    EXCLUDED.event_id, EXCLUDED.created_at, NULL::text, NULL::bigint
+		)
+		  AND (
+		      relay_config_heads.membership_count = $7
+		      OR relay_config_heads.event_id IS DISTINCT FROM EXCLUDED.event_id
+		  )
+	`, pubkey, kind, dTag, eventID, created, membershipUnreadable, membershipUnknown)
+	if err != nil {
+		if SchemaMissing(err) || skippable(err) {
+			return nil
+		}
+		return wrapDB(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM relay_role_memberships
+		WHERE pubkey = $1 AND source_kind = $2 AND d_tag = $3
+	`, pubkey, kind, dTag); err != nil {
+		return wrapDB(err)
+	}
+	return tx.Commit(ctx)
+}
+
+var (
+	reconcileRowHookMu sync.Mutex
+	reconcileRowHook   func(pubkey string, kind int, eventID string)
+)
+
+// SetReconcileRowHook installs a test hook that runs after a reconcile
+// candidate is read and before it is written. Production leaves it unset.
+func SetReconcileRowHook(fn func(pubkey string, kind int, eventID string)) {
+	reconcileRowHookMu.Lock()
+	reconcileRowHook = fn
+	reconcileRowHookMu.Unlock()
+}
+
+func runReconcileRowHook(pubkey string, kind int, eventID string) {
+	reconcileRowHookMu.Lock()
+	fn := reconcileRowHook
+	reconcileRowHookMu.Unlock()
+	if fn != nil {
+		fn(pubkey, kind, eventID)
+	}
 }
 
 func undefinedFunction(err error) bool {

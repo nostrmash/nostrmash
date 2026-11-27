@@ -196,9 +196,10 @@ func TestStackedMigrationsAreUniqueAndRepeatable(t *testing.T) {
 	}
 	want := []string{
 		"migrations/000144_relay_intel_projection_invariants.sql",
-		"migrations/000145_relay_probe_evidence_fence.sql",
-		"migrations/000146_relay_probe_followup_lease.sql",
-		"migrations/000147_relay_probe_followup_ownership.sql",
+		"migrations/000145_relay_intel_membership_and_retention.sql",
+		"migrations/000146_relay_probe_evidence_fence.sql",
+		"migrations/000147_relay_probe_followup_lease.sql",
+		"migrations/000148_relay_probe_followup_ownership.sql",
 		"migrations/000150_relay_probe_privacy_ownership.sql",
 		"migrations/000151_relay_probe_completion_digest.sql",
 	}

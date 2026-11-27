@@ -20,6 +20,7 @@ type RelayIntelConfig struct {
 	BackfillEnabled     bool
 	BackfillBatch       int
 	BackfillInterval    time.Duration
+	OptimizeConcurrency int
 	ActiveProbes        bool
 	ProbeSecretKey      string
 	GiftwrapProbes      bool
@@ -58,6 +59,10 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 	if perHour > 60 {
 		return RelayIntelConfig{}, fmt.Errorf("RELAY_INTEL_PROBE_GLOBAL_PER_HOUR must be <= 60")
 	}
+	optimizeConcurrency, err := getEnvPositiveIntStrict("RELAY_INTEL_OPTIMIZE_CONCURRENCY", 4)
+	if err != nil {
+		return RelayIntelConfig{}, err
+	}
 	cfg := RelayIntelConfig{
 		Enabled:             getEnvBool("RELAY_INTEL_ENABLED", true),
 		ProjectionEnabled:   getEnvBool("RELAY_INTEL_PROJECTION_ENABLED", true),
@@ -67,6 +72,7 @@ func LoadRelayIntel(includeSecret bool) (RelayIntelConfig, error) {
 		BackfillEnabled:     getEnvBool("RELAY_INTEL_BACKFILL_ENABLED", true),
 		BackfillBatch:       batch,
 		BackfillInterval:    backfillInterval,
+		OptimizeConcurrency: optimizeConcurrency,
 		ActiveProbes:        getEnvBool("RELAY_INTEL_ACTIVE_PROBES", false),
 		GiftwrapProbes:      getEnvBool("RELAY_INTEL_GIFTWRAP_PROBES", false),
 		ProbeAllowlist:      splitProbeHosts(os.Getenv("RELAY_INTEL_PROBE_ALLOWLIST")),
