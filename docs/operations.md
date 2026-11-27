@@ -358,6 +358,17 @@ After `000145` commits, do not delete the migration row or edit the file. The pr
 
 Rolling back the API binary removes the optimization limit. It does not require a schema change.
 
+### Upgrade through migration 000152
+
+Canonical repair can delete a superseded profile projection. The search trigger then finds the latest remaining profile with the same normalized NIP-05 name. On an existing populated `profiles_latest`, prebuild migration `000152`'s lookup index outside a transaction.
+
+```sql
+CREATE INDEX CONCURRENTLY idx_profiles_latest_nip05_normalized
+    ON profiles_latest (lower(btrim(nip05)));
+```
+
+Check that the index is valid and ready on the application schema's `profiles_latest`. `pg_get_indexdef` should show a btree on `lower(btrim(nip05))`. The one-shot migration will record `000152` with the prebuilt index in place.
+
 ## Contributor handoff checklist
 
 Before merging/releasing behavior changes, contributors should provide operators with:
