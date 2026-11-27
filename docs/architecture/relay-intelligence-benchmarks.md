@@ -1,57 +1,163 @@
 # Relay intelligence measurements
 
-## Final integrated run
+## Final operational sign-off
 
-The account-scale run against the indexed retention implementation has not been executed. This branch now contains core commit `678254924cb49f9a34db19aa879563b48f8e7d91`, which contains `31df4c808129f633593d7bcd605cb178dad40727`. The ancestor check in `scripts/relay_intel_operational_bench.sh` passes. The indexed 10,000-account and 100,000-account fixtures were still not seeded, so there is still no indexed account-scale after number.
+Operational validation completed; no release-blocking regression identified.
 
-`PostRelayOptimize` admits at most `RELAY_INTEL_OPTIMIZE_CONCURRENCY` requests in one API process (default 4) and returns HTTP 503 `overloaded` after that. The overload scenario was not executed on this commit.
+The measured implementation is capability commit `1b144ea9b0a90e77788ba1b0752fd5674d8f3f21`. It contains frozen core `678254924cb49f9a34db19aa879563b48f8e7d91`. Commit `8a8a3b3ce7e0f470fcd99a3f225ff81bb38c7029` does not contain that core, so it is not the sign-off implementation. Full CI on `1b144ea` passed before this run: [ci](https://github.com/nostrmash/nostrmash/actions/runs/45959078723), [build](https://github.com/nostrmash/nostrmash/actions/runs/45959078807), [performance](https://github.com/nostrmash/nostrmash/actions/runs/45959078756).
 
-On 26 November 2026 the capability tip was `caaef7b2ad005ca56c17ecf288c72d9f169f58b3` ("Keep incomplete gift-wrap checks unknown and identify completions by their result"). At that time the reviewed core commit `31df4c808129f633593d7bcd605cb178dad40727` ("Keep a deleted projection from hiding the remaining canonical winner") was not an ancestor of `origin/feat/relay-capability-probes`. That core commit adds `relay_config_heads.membership_count`, the membership digest, and the four event-id indexes. Its migration is numbered `000145_relay_intel_membership_and_retention.sql`. The capability branch had used `000145` for the probe evidence fence; that file is now `000146_relay_probe_evidence_fence.sql`, and this merge keeps both.
-
-Attempted check:
-
-```sh
-git fetch origin feat/relay-capability-probes fix/relay-intelligence
-git merge-base --is-ancestor 31df4c808129f633593d7bcd605cb178dad40727 origin/feat/relay-capability-probes
-```
-
-The ancestor check failed. The account-scale command was then run and refused:
+Benchmark tooling that produced the JSON is `d2ab90b2498efc36d953b0bb6e291b7c64368b20`. Both result files record `final_signoff: true`. The 500,000-account fixture was not run.
 
 ```sh
 scripts/relay_intel_operational_bench.sh
 ```
 
-```text
-commit e08c441f8cbef2b299a3af4459813c79886a4609
-implementation caaef7b2ad005ca56c17ecf288c72d9f169f58b3
-core 31df4c808129f633593d7bcd605cb178dad40727
-core not incorporated 31df4c808129f633593d7bcd605cb178dad40727
-refusing the account-scale benchmark until that core commit is in HEAD
-```
+The script refuses the run unless HEAD contains `1b144ea9b0a90e77788ba1b0752fd5674d8f3f21` and that commit contains `678254924cb49f9a34db19aa879563b48f8e7d91`. `RELAY_INTEL_OPERATIONAL_ALLOW_PARTIAL=1` still runs and marks the output partial. Partial output is not sign-off. `RELAY_INTEL_OPERATIONAL_COMPILE=1` only compiles `-tags relayintelbench`.
 
-Exit status 1. No 10,000-account or 100,000-account fixture was seeded for this sign-off. The 870 ms and 7,995 ms purge figures remain the unindexed measurements from `3163b9d50d8a3acd432e069da25eda5e49606bf8`. There is no indexed account-scale after number.
+Raw results:
 
-Benchmark tooling commit: `e08c441f8cbef2b299a3af4459813c79886a4609`.
-Capability commit incorporated into that tooling: `caaef7b2ad005ca56c17ecf288c72d9f169f58b3`.
-Core commit required before the account-scale run: `31df4c808129f633593d7bcd605cb178dad40727`.
+- `benchmarks/relay-intelligence/operational/results-small.json`
+- `benchmarks/relay-intelligence/operational/results-medium.json`
+- `benchmarks/relay-intelligence/operational/plans-small.txt`
+- `benchmarks/relay-intelligence/operational/plans-medium.txt`
 
-Tagged compile, which ordinary CI does not perform:
+Earlier results stay under `benchmarks/relay-intelligence/operational/historical/`. The 870 ms and 7,995 ms purge figures below are those historical committed deletes, not this implementation.
 
-```sh
-RELAY_INTEL_OPERATIONAL_COMPILE=1 scripts/relay_intel_operational_bench.sh
-```
+### Environment
 
-That command printed `tagged compile ok` and exited 0.
+Apple M4 Pro, 14 cores, 24 GB, macOS 27.0.1. Go 1.26.11. PostgreSQL 18.6 in `postgres:18-alpine`, Docker 28.5.1, about 14 CPUs and 7.7 GB for the VM. `shared_buffers` 128MB, `work_mem` 4MB, `maintenance_work_mem` 64MB, `effective_cache_size` 4GB, `max_connections` 100, `synchronous_commit` on, `wal_compression` off, `max_wal_size` 1GB. The API pool uses 20 connections. Postgres and Meilisearch were the nostrmash containers. Redis was not started. The seed connection uses `work_mem` 64MB. API timings are warm in Postgres shared buffers.
 
-What stays unmeasured on this integrated tree:
+| Fixture | Accounts | Events | Heads | Memberships | Effective memberships | Seed |
+|---|---:|---:|---:|---:|---:|---:|
+| Small | 10,000 | 31,400 | 21,000 | 89,500 | 110,600 | 8.0 s |
+| Medium | 100,000 | 309,600 | 208,200 | 893,200 | 1,104,200 | 6 min 34 s |
 
-- Indexed purge latency, trigger time, buffers, WAL, and index use at 10,000 and 100,000 accounts.
-- Populated index-build duration, index size, WAL, and lock wait. The benchmark drops and recreates the four indexes on the disposable schema after seeding. That code path did not run.
-- Historical heads with `membership_count = -1`. Discovery and reconciliation throughput for that backlog are not reported.
-- API, optimization, statistics refresh, burst derivation, and storage on the integrated schema.
-- The overload scenario. The four-request optimize limit is in this tree and was not executed.
+Empty heads are 500 and 5,000. Truncated heads are 500 and 5,000. The purge queues hold 100 and 1,000 superseded events.
 
-The previous unindexed account-scale artifacts are preserved at `benchmarks/relay-intelligence/operational/historical/3163b9d50d8a3acd432e069da25eda5e49606bf8/` and are still the files in `benchmarks/relay-intelligence/operational/results-*.json` and `plans-*.txt`. The sections from "Previous measurements (3163b9d)" through the 16d258a history describe that run.
+### Indexed retention
+
+The same disposable schema drops the four event-id indexes, captures `EXPLAIN (ANALYZE, BUFFERS, WAL)`, rebuilds them, and then commits a purge of 100 superseded events. Winner, derivation-job, and repair protections stayed enabled. Those checks returned 0 rows. Candidate selection returned 100 rows.
+
+| Scale | Historical committed purge, no indexes | Same-run unindexed plan | Membership FK trigger, unindexed | Heads FK trigger, unindexed | Indexed plan | Membership FK trigger, indexed | Heads FK trigger, indexed | Committed indexed purge | Rows deleted | WAL |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 870 ms | 1,203 ms | 923 ms | 223 ms | 34 ms | 1.1 ms | 1.5 ms | 36 ms | 100 | 22,552 bytes |
+| 100,000 | 7,995 ms | 9,849 ms | 7,307 ms | 2,441 ms | 57 ms | 0.9 ms | 1.0 ms | 45 ms | 100 | 22,592 bytes |
+
+The historical column is the 26 November committed delete on `3163b9d`. The other columns are this run. Indexed plans read shared buffers only (`shared_read` 0): 102,643 hits at 10,000 accounts and 214,138 hits at 100,000. A batch of 100 is 45 ms committed on the larger fixture, so that batch size is a reasonable start. This run did not measure a larger batch.
+
+### Index build and historical reconciliation
+
+Indexes were created on the empty migrated schema and again after the seed, on the populated disposable schema. The populated build is the upgrade cost.
+
+| Scale | Blocking build | WAL | Index bytes | Concurrent membership rebuild | Writer wait during concurrent rebuild |
+|---|---:|---:|---:|---:|---:|
+| 10,000 | 291 ms | 4.2 MB | 4.6 MB | 148 ms | 6 ms |
+| 100,000 | 1,331 ms | 43.0 MB | 45.3 MB | 1,047 ms | 1 ms |
+
+On the 100,000-account fixture the blocking membership index build stalled one concurrent update for 968 ms. `CREATE INDEX CONCURRENTLY` did not. A populated upgrade should use the concurrent form. These statements were not run against production.
+
+Seeded heads omit `membership_count`, so they start at the migration default of -1. The benchmark then calls production `BackfillBatch` with batch 200 until the eligible backlog is zero. It marks 20 live heads deleted and one event unreadable (`{"tags":"not-an-array"}`, which is valid JSON and cannot be projected) before that walk.
+
+| Scale | Live backlog | Wall | Throughput | Batches | Eligible after | Steady-state batch | Canceled call |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 20,980 | 163 s | 129 heads/s | 104 | 0 | 88 ms | `context canceled`, then the walk finished |
+| 100,000 | 208,180 | 31 min 6 s | 112 heads/s | 1,040 | 0 | 889 ms | `context canceled`, then the walk finished |
+
+Both walks recorded the membership integrity cursor. Explicitly empty heads ended at count 0 (507 and 5,007, including seven heads that were already zero). All 500 and 5,000 truncated heads ended with a non-negative count. The 20 deleted heads stayed at -1 and none were rewritten. The unreadable event ended at -2, not 0. A sample of 400 reconciled heads matched `relay_intel_membership_digest` with zero mismatches. That sample is not a scan of every head.
+
+### Optimization admission
+
+`NewHandlersWithOptions` builds the production gate with `OptimizeConcurrency` 4. The benchmark refuses to run if that gate is missing. Completed means HTTP 200 with a plan. Overloaded means HTTP 503 and error code `overloaded`. No request returned 429 `rate_limited`. Rejected requests are not completed throughput. In-flight count was 0 after every level.
+
+Medium max-list requests, completed latency only:
+
+| Offered workers | Waves | Completed | Overloaded | Median | p95 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 4 | 0 | 157 ms | 157 ms |
+| 4 | 4 | 16 | 0 | 203 ms | 209 ms |
+| 8 | 4 | 16 | 16 | 190 ms | 239 ms |
+| 16 | 2 | 8 | 24 | 179 ms | 220 ms |
+
+The separate 16-worker overload wave matched that split: 8 completed and 24 overloaded. Rankings during it stayed HTTP 200 (median 0.88 ms). Configuration stayed HTTP 200 (median 0.07 ms). A request canceled after about 40 ms did not hold a slot, and the next optimize completed. An invalid pubkey returned 400 `invalid_request`, and the following valid request completed. The 10,000-account gate split was the same 4, 16, 16, and 8 completions.
+
+### Populated completion
+
+These calls ran on the seeded account and probe history. They are database commits, not network probe checks. Every row was accepted. The empty-schema digest table later in this file is the earlier `caaef7b` run, not this one.
+
+| Operation | 10,000 accounts | 100,000 accounts |
+|---|---:|---:|
+| Public-write completion | 8.5 ms | 12.4 ms |
+| Search completion | 3.4 ms | 2.5 ms |
+| Gift-wrap completion | 10.9 ms | 15.0 ms |
+| Retention scheduling | 4.0 ms | 3.6 ms |
+| Retention completion | 3.4 ms | 2.9 ms |
+| Identical replay | 1.6 ms, `already_completed` | 1.3 ms, `already_completed` |
+| Same-status conflict | 1.1 ms, rejected | 0.9 ms, rejected |
+| Expired lease | 1.0 ms, rejected | 0.8 ms, rejected |
+| Eight concurrent identical completions | 5.9 ms, 1 commit and 7 `already_completed` | 8.4 ms, 1 commit and 7 `already_completed` |
+| Structured privacy read | 1.6 ms, `recipient_only_verified` | 7.0 ms, `recipient_only_verified` |
+
+`resultDigest` was 1.2 µs and 1.5 µs per call. The stored digest is 64 hex characters. Evidence aggregation saw the new write success.
+
+### Sustained and burst workload
+
+Each paced pass offers 200 events across 30 seconds. Canonical repair stayed on. Deadlocks were 0. Pool empty acquires were 0. The forced refresh is a pass whose snapshot timestamp moved and whose `last_duration_ms` is positive.
+
+Idle statistics refresh: 1.9 s at 10,000 accounts and 35.2 s at 100,000 accounts (1.10 million effective memberships).
+
+Paced 100,000-account passes:
+
+| Scenario | Derive throughput | Ingest completed | Existing API median | Relay Intelligence API median | Forced refresh |
+|---|---:|---:|---:|---:|---|
+| Baseline, three passes | 6.7, 6.2, 6.7 /s | 200, 188, 200 | 0.41–0.50 ms | | |
+| Relay Intelligence, no forced refresh | 3.8, 6.7, 6.6 /s | 180, 200, 199 | 0.57–0.64 ms | 13.5–16.8 ms | |
+| Relay Intelligence, forced refresh | 4.2, 4.0, 4.3 /s | 196, 196, 200 | 0.61–0.65 ms during | 14.4–14.7 ms during | 44.9 s, 47.4 s, 44.3 s |
+
+The first Relay Intelligence pass completed 180 of 200 events and stretched to 48 s with zero recorded ingest errors. Later paced passes returned to about 6.6/s. Paced throughput is the offered rate, not capacity.
+
+Unpaced burst, 200 events, queue drained to zero, no ingest errors:
+
+| Mode | 10,000 derive | 100,000 derive | 100,000 drain |
+|---|---:|---:|---:|
+| Baseline | 27.6 and 28.0 /s | 25.5 and 26.9 /s | 7.6 s and 7.2 s |
+| Relay Intelligence on | 22.7 and 23.0 /s | 21.3 and 21.7 /s | 9.2 s and 9.0 s |
+
+Derivation throughput is about 16–19% lower with Relay Intelligence on. The queue recovers. Maximum pending jobs were 83. Lock-wait samples were zero on the burst passes.
+
+### Storage, WAL, and synthetic lookup
+
+After the 100,000-account population, membership storage is 627 MB, events 589 MB, and heads 148 MB. The four retention indexes add 45.3 MB, measured above. One indexed purge of 100 events wrote 23 KB of WAL. The idle statistics refresh wrote 1.3 MB. A paced baseline pass wrote 4–77 MB; the 77 MB first pass is the outlier.
+
+Synthetic lookup on the populated registry still costs one primary-key read. A cold or other-worker lookup used 2 queries. A positive cache hit used 0. One thousand repeated ordinary lookups used 1,000 queries and 177 ms, which is the epoch check rather than a scan. One thousand negative cache hits used 1,000 queries and 192 ms. Registering 2,000 identities took 18 ms. One Meilisearch sync of an ordinary author took 265 ms.
+
+### Starting settings
+
+These are starting points from this fixture, not a capacity guarantee.
+
+| Setting | Starting value | Why this run supports it |
+|---|---|---|
+| Projection | Enabled | Burst queue recovered and protections stayed on |
+| Statistics refresh | 10 minutes | A 45 s refresh is a small share of that interval |
+| Statistics investigation threshold | 60 seconds | Idle refresh was 35 s and the overlapping refresh was 45–47 s, so 45 s would alert on this fixture |
+| Backfill batch | 200 | 112 heads/s at batch 200, backlog reached zero |
+| Backfill interval | 5 seconds | Steady-state batch was under 1 s once the backlog was done |
+| Reconciliation idle interval | 15 minutes | The cursor recorded integrity and the next batch did not requeue completed heads |
+| Database pool | 20 connections | No empty-pool acquires and no deadlocks |
+| Optimization concurrency | 4 per API process | The gate admitted 4 and rejected the rest with 503 `overloaded` |
+| Retention batch | 100 | Indexed committed purge was 45 ms |
+| Active probes | Disabled | Not required for the measured read path |
+| Gift-wrap probes | Disabled | Completion was measured locally |
+| Global probe budget | 20/hour | Unchanged; no public relay traffic was sent |
+| Per-host budget | 4/hour | Unchanged |
+| Probe cooldown | 24 hours | Unchanged |
+
+### Remaining limitations
+
+The digest comparison checked 400 heads, not every reconciled head. The 500,000-account fixture was not run. Burst capacity is lower with projection enabled, by the margin above. One paced pass completed 180 of 200 offered events. Index builds on a populated database should be concurrent; a blocking build stalled a writer for about a second. An earlier attempt on this machine lost its medium burst when the host disk filled and Postgres restarted. That attempt is not these files. This run finished both scales. No production migration was applied.
+
+## Earlier empty-schema digest
+
+This section is the empty-schema run from tooling `e08c441`. It is not the populated sign-off above. On 26 November 2026 the capability tip was `caaef7b`, and core `31df4c8` was not yet an ancestor, so the account-scale command was refused. The migration numbering from that merge remains: membership and retention are `000145`, and the probe evidence fence is `000146`.
 
 ## Completion digest measurement
 
@@ -89,7 +195,7 @@ These measurements were executed on 26 November 2026 against implementation `316
 
 The earlier 10,000- and 100,000-account run, against `16d258aea7582cca13a1a1d2fa053af5ad6f4e61`, is preserved under `benchmarks/relay-intelligence/operational/historical/16d258aea7582cca13a1a1d2fa053af5ad6f4e61/` and in the historical sections below.
 
-Previous artifacts, still the files in the operational directory until the indexed run replaces them:
+The operational directory now holds the final run. These paths are the preserved 3163b9d copies:
 
 - `benchmarks/relay-intelligence/operational/results-small.json`
 - `benchmarks/relay-intelligence/operational/results-medium.json`
@@ -100,7 +206,7 @@ A 500,000-account run was not executed.
 
 ## How to reproduce the 3163b9d run
 
-`scripts/relay_intel_operational_bench.sh` now finds core commit `31df4c808129f633593d7bcd605cb178dad40727` in HEAD and runs the account-scale benchmark instead of refusing. The command below is how the 3163b9d results were produced, at tooling commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
+The command below is how the 3163b9d results were produced, at tooling commit `89b3add76abd1eaf0dd386fe2edb2bc445a111b9`. The current script requires the frozen commits named in the sign-off section and will not reproduce this older result from HEAD. The benchmark test is compiled only with `-tags relayintelbench` and is skipped unless `RELAY_INTEL_OPERATIONAL_BENCH=1`. It uses a disposable schema and does not migrate `public`.
 
 ```sh
 docker compose -p nostrmash up -d --no-deps postgres meilisearch
