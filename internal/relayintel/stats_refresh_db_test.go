@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
@@ -57,5 +59,43 @@ func TestStatsRefreshSkipsARecentSharedSnapshot(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("overlapping refresh blocked instead of skipping")
+	}
+}
+
+func TestStatsRefreshScopesTimeoutToItsTransaction(t *testing.T) {
+	ctx := context.Background()
+	pool := repairPool(t, ctx)
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION assert_relay_stats_timeout() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF (SELECT setting FROM pg_settings WHERE name = 'statement_timeout') <> '120000' THEN
+				RAISE EXCEPTION 'unexpected statement timeout for relay statistics';
+			END IF;
+			RETURN NULL;
+		END;
+		$$;
+		CREATE TRIGGER assert_relay_stats_timeout BEFORE INSERT ON relay_role_stats
+		FOR EACH STATEMENT EXECUTE FUNCTION assert_relay_stats_timeout();
+	`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	cfg.MinConns = 0
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "15s"
+	refreshPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refreshPool.Close()
+	if err := relayintel.RefreshStats(ctx, refreshPool, "", 0); err != nil {
+		t.Fatalf("refresh with the production timeout: %v", err)
+	}
+	var sessionTimeout string
+	if err := refreshPool.QueryRow(ctx, `SELECT setting FROM pg_settings WHERE name = 'statement_timeout'`).Scan(&sessionTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if sessionTimeout != "15000" {
+		t.Fatalf("timeout after refresh = %q, want 15000", sessionTimeout)
 	}
 }
