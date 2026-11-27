@@ -1,6 +1,9 @@
 package relayintel
 
-import "math"
+import (
+	"math"
+	"time"
+)
 
 // Weights are the scoring shares for one role. Diversity is intentionally
 // absent: it is applied once, to the selected set.
@@ -403,18 +406,261 @@ func reachComponent(in ScoreInput) (float64, float64) {
 	return clamp01(adoption), conf
 }
 
+func privacyAssessment(caps map[string]Capability) string {
+	return privacyAssessmentAt(caps, time.Now())
+}
+
+func privacyReport(caps map[string]Capability, now time.Time) PrivacyReport {
+	assessment := privacyAssessmentAt(caps, now)
+	public := caps[CapGiftWrapPublic]
+	private := caps[CapGiftWrapPrivate]
+	publicSeen := exposureSeen(public) || exposureSeen(caps[CapGiftWrapUnauthExposure]) || exposureSeen(caps[CapGiftWrapAuthExposure])
+	unresolved := assessment == "publicly_accessible" || assessment == "previous_exposure_unresolved" || assessment == "conflicting_evidence"
+	report := PrivacyReport{
+		Assessment:                    assessment,
+		RecipientRetrievalVerified:    retrievalTri(caps[CapGiftWrapRecipient]),
+		GiftWrapAccepted:              claimTri(caps[CapGiftWrapAccept]),
+		ExposureConfirmed:             publicSeen,
+		ExposureUnresolved:            unresolved,
+		PrivateObservedAt:             private.ObservedAt,
+		ExposureObservedAt:            public.ObservedAt,
+		RecipientAuthVerified:         claimTri(caps[CapAuthRecipient]),
+		PublicationAuthVerified:       claimTri(caps[CapAuthGiftWrap]),
+		Stale:                         assessment == "stale",
+		Confidence:                    private.Confidence,
+		Freshness:                     private.Freshness,
+		EvidenceVersion:               private.EvidenceVersion,
+		RecipientExactVerified:        retrievalTri(caps[CapGiftWrapRecipientExact]),
+		RecipientTagVerified:          retrievalTri(caps[CapGiftWrapRecipientTag]),
+		UnauthenticatedExposure:       exposureTri(caps[CapGiftWrapUnauthExposure]),
+		AuthenticatedObserverExposure: exposureTri(caps[CapGiftWrapAuthExposure]),
+		Comprehensive:                 comprehensivePrivate(private, now) && assessment == "recipient_only_verified",
+		AccessPaths:                   accessPaths(caps),
+	}
+	if report.ExposureObservedAt == nil {
+		report.ExposureObservedAt = latestTime(caps[CapGiftWrapUnauthExposure].ObservedAt, caps[CapGiftWrapAuthExposure].ObservedAt)
+	}
+	governing := governingCapability(assessment, caps, now)
+	report.Confidence = governing.Confidence
+	report.Freshness = governing.Freshness
+	if report.Freshness == "" {
+		report.Freshness = freshnessLabel(observedAt(governing), now)
+	}
+	report.EvidenceVersion = governing.EvidenceVersion
+	return report
+}
+
+func governingCapability(assessment string, caps map[string]Capability, now time.Time) Capability {
+	switch assessment {
+	case "recipient_only_verified", "stale":
+		return caps[CapGiftWrapPrivate]
+	case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
+		return newestExposureCapability(caps, now)
+	default:
+		if caps[CapGiftWrapAccept].Status == StatusVerified {
+			return caps[CapGiftWrapAccept]
+		}
+		return caps[CapGiftWrapPrivate]
+	}
+}
+
+func newestExposureCapability(caps map[string]Capability, now time.Time) Capability {
+	var chosen Capability
+	var at time.Time
+	for _, capability := range []string{CapGiftWrapPublic, CapGiftWrapUnauthExposure, CapGiftWrapAuthExposure} {
+		cap := caps[capability]
+		if !exposureSeen(cap) {
+			continue
+		}
+		seen := observedAt(cap)
+		if seen.IsZero() {
+			seen = now
+		}
+		if at.IsZero() || seen.After(at) {
+			at = seen
+			chosen = cap
+		}
+	}
+	return chosen
+}
+
+func privacyAssessmentAt(caps map[string]Capability, now time.Time) string {
+	private := caps[CapGiftWrapPrivate]
+	privateAt := observedAt(private)
+	publicAt, publicFresh := newestExposure(caps, now)
+	publicSeen := !publicAt.IsZero()
+	comprehensive := private.EvidenceVersion >= ComprehensivePrivacyVersion
+	privateFresh := private.Status == StatusVerified && comprehensive && !staleAt(privateAt, now)
+	privateStale := comprehensive && (private.Status == StatusStale || (private.Status == StatusVerified && staleAt(privateAt, now)))
+	switch {
+	case publicSeen && privateFresh && privateAt.After(publicAt):
+		return "recipient_only_verified"
+	case publicSeen && privateFresh && privateAt.Equal(publicAt):
+		return "conflicting_evidence"
+	case publicSeen && publicFresh:
+		return "publicly_accessible"
+	case publicSeen:
+		return "previous_exposure_unresolved"
+	case privateStale:
+		return "stale"
+	case privateFresh:
+		return "recipient_only_verified"
+	default:
+		return "privacy_unknown"
+	}
+}
+
+func newestExposure(caps map[string]Capability, now time.Time) (time.Time, bool) {
+	var at time.Time
+	fresh := false
+	for _, capability := range []string{CapGiftWrapPublic, CapGiftWrapUnauthExposure, CapGiftWrapAuthExposure} {
+		cap := caps[capability]
+		if !exposureSeen(cap) {
+			continue
+		}
+		seen := observedAt(cap)
+		if seen.IsZero() {
+			seen = now
+		}
+		if at.IsZero() || seen.After(at) {
+			at = seen
+			fresh = cap.Status == StatusVerified && !staleAt(seen, now)
+		}
+	}
+	return at, fresh
+}
+
+func comprehensivePrivate(cap Capability, now time.Time) bool {
+	return cap.EvidenceVersion >= ComprehensivePrivacyVersion && cap.Status == StatusVerified && !staleAt(observedAt(cap), now)
+}
+
+func exposureSeen(cap Capability) bool {
+	if cap.Source == "none" {
+		return false
+	}
+	if cap.Status != StatusVerified && cap.Status != StatusStale && cap.Status != StatusObserved {
+		return false
+	}
+	if cap.Retrieved != nil {
+		return *cap.Retrieved
+	}
+	return true
+}
+
+func claimTri(cap Capability) *bool {
+	switch cap.Status {
+	case StatusVerified:
+		return boolPtr(true)
+	case StatusUnsupported, StatusRestricted:
+		return boolPtr(false)
+	default:
+		return nil
+	}
+}
+
+func retrievalTri(cap Capability) *bool {
+	if cap.Status != StatusVerified {
+		if cap.Status == StatusUnsupported || cap.Status == StatusRestricted {
+			return boolPtr(false)
+		}
+		return nil
+	}
+	if cap.Retrieved != nil {
+		return cap.Retrieved
+	}
+	return boolPtr(true)
+}
+
+func exposureTri(cap Capability) *bool {
+	if cap.Retrieved != nil && (cap.Status == StatusVerified || cap.Status == StatusStale || cap.Status == StatusObserved) {
+		return cap.Retrieved
+	}
+	if exposureSeen(cap) {
+		return boolPtr(true)
+	}
+	if cap.Status == StatusUnsupported || cap.Status == StatusRestricted {
+		return boolPtr(false)
+	}
+	return nil
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func accessPaths(caps map[string]Capability) []AccessPath {
+	names := []struct{ name, capability string }{
+		{"recipient_exact", CapGiftWrapRecipientExact},
+		{"recipient_tag", CapGiftWrapRecipientTag},
+		{"observer_exact", CapGiftWrapObserverExact},
+		{"observer_tag", CapGiftWrapObserverTag},
+		{"anonymous_exact", CapGiftWrapAnonExact},
+		{"anonymous_tag", CapGiftWrapAnonTag},
+	}
+	var paths []AccessPath
+	for _, item := range names {
+		cap := caps[item.capability]
+		if cap.Status == "" || cap.Status == StatusUnknown || cap.Source == "none" || cap.Source == "" {
+			continue
+		}
+		paths = append(paths, AccessPath{
+			Name: item.name, Status: cap.Status, Retrieved: cap.Retrieved,
+			Unauthenticated: cap.Unauthenticated, Authenticated: cap.Authenticated,
+			ObservedAt: cap.ObservedAt, Confidence: cap.Confidence, Freshness: cap.Freshness,
+		})
+	}
+	return paths
+}
+
+func latestTime(values ...*time.Time) *time.Time {
+	var best *time.Time
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		if best == nil || value.After(*best) {
+			best = value
+		}
+	}
+	return best
+}
+
+func observedAt(cap Capability) time.Time {
+	if cap.ObservedAt == nil {
+		return time.Time{}
+	}
+	return *cap.ObservedAt
+}
+
+func staleAt(at, now time.Time) bool {
+	return !at.IsZero() && !now.IsZero() && now.Sub(at) > ProbeStaleFor
+}
+
 func privacyComponent(role string, caps map[string]Capability) (float64, float64, []Reason) {
 	if role != RoleDMInbox && role != RoleKeyPackage {
 		return 0.5, 0.3, nil
 	}
+	accept := caps[CapGiftWrapAccept]
 	wrap := caps[CapGiftWrap]
 	auth := caps[CapAuth]
-	switch wrap.Status {
-	case StatusVerified:
-		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "Gift-wrap behavior was checked with synthetic identities."}}
-	case StatusUnsupported:
+	switch privacyAssessment(caps) {
+	case "recipient_only_verified":
+		return 0.95, 0.85, []Reason{{Code: "giftwrap_verified", Text: "The newest complete gift-wrap check was recipient-only. This is not a delivery or anonymity guarantee."}}
+	case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
+		return 0.15, 0.8, []Reason{{Code: "giftwrap_public", Text: "Unauthorized gift-wrap retrieval was observed. Older recipient-only evidence does not override it, and age does not erase it."}}
+	case "stale":
+		return 0.35, 0.3, []Reason{{Code: "giftwrap_stale", Text: "The recipient-only observation is older than seven days and has not been confirmed again."}}
+	case "privacy_unknown":
+		if accept.Status == StatusVerified {
+			return 0.4, 0.45, []Reason{{Code: "giftwrap_accepted_only", Text: "The relay accepted a gift wrap. Recipient-only access was not established."}}
+		}
+	}
+	switch {
+	case accept.Status == StatusVerified:
+		return 0.4, 0.45, []Reason{{Code: "giftwrap_accepted_only", Text: "The relay accepted a gift wrap. Recipient-only access was not established."}}
+	case wrap.Status == StatusUnsupported || accept.Status == StatusUnsupported:
 		return 0, 0.8, []Reason{{Code: "giftwrap_unsupported", Text: "The relay rejected gift-wrapped events."}}
-	case StatusAdvertised:
+	case wrap.Status == StatusAdvertised:
 		score := 0.4
 		if auth.Status == StatusRestricted {
 			score = 0.55
@@ -447,8 +693,11 @@ func functionalityComponent(role string, caps map[string]Capability) (float64, f
 		if wrap.Status == StatusUnsupported {
 			return 0, 0.8, []Reason{{Code: "dm_unsupported", Text: "The relay does not accept the gift-wrap kinds used for DMs."}}, "dm_unsupported"
 		}
-		if wrap.Status == StatusVerified {
+		switch privacyAssessment(caps) {
+		case "recipient_only_verified":
 			return 0.9, 0.8, nil, ""
+		case "publicly_accessible", "previous_exposure_unresolved", "conflicting_evidence":
+			return 0.2, 0.75, []Reason{{Code: "dm_public_giftwrap", Text: "Gift wraps on this relay were readable by an observer. That is not suitable for private messages."}}, ""
 		}
 		read := caps[CapRead]
 		if read.Status == StatusObserved || read.Status == StatusVerified {

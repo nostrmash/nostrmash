@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 func (h *Handlers) ProjectAuthorRecentEvent(ctx context.Context, eventID string) error {
@@ -31,6 +33,13 @@ func (h *Handlers) projectAuthorRecentEventWithVersion(ctx context.Context, even
 		return fmt.Errorf("load event for author projection: %w", err)
 	}
 	if kind == 1059 {
+		return nil
+	}
+	synthetic, lookupErr := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+	if lookupErr != nil {
+		return fmt.Errorf("synthetic identity: %w", lookupErr)
+	}
+	if synthetic {
 		return nil
 	}
 

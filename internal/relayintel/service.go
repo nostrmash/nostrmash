@@ -73,8 +73,47 @@ type CapabilitiesResponse struct {
 	EndpointType   string                `json:"endpoint_type"`
 	AdmissionState string                `json:"admission_state,omitempty"`
 	Capabilities   map[string]Capability `json:"capabilities"`
+	Privacy        PrivacyReport         `json:"privacy"`
 	Propagation    Propagation           `json:"propagation"`
 	Note           string                `json:"note"`
+}
+
+// PrivacyReport is the effective gift-wrap assessment. Downstream clients use
+// these fields instead of parsing observation detail text. A nil boolean is
+// unknown. False is a completed check that did not establish the claim.
+type PrivacyReport struct {
+	Assessment                    string       `json:"assessment"`
+	RecipientRetrievalVerified    *bool        `json:"recipient_retrieval_verified"`
+	GiftWrapAccepted              *bool        `json:"gift_wrap_accepted"`
+	ExposureConfirmed             bool         `json:"exposure_confirmed"`
+	ExposureUnresolved            bool         `json:"exposure_unresolved"`
+	PrivateObservedAt             *time.Time   `json:"private_observed_at,omitempty"`
+	ExposureObservedAt            *time.Time   `json:"exposure_observed_at,omitempty"`
+	RecipientAuthVerified         *bool        `json:"recipient_auth_verified"`
+	PublicationAuthVerified       *bool        `json:"publication_auth_verified"`
+	Stale                         bool         `json:"stale"`
+	Confidence                    float64      `json:"confidence,omitempty"`
+	Freshness                     string       `json:"freshness,omitempty"`
+	EvidenceVersion               int          `json:"evidence_version,omitempty"`
+	RecipientExactVerified        *bool        `json:"recipient_exact_verified"`
+	RecipientTagVerified          *bool        `json:"recipient_tag_verified"`
+	UnauthenticatedExposure       *bool        `json:"unauthenticated_exposure"`
+	AuthenticatedObserverExposure *bool        `json:"authenticated_observer_exposure"`
+	Comprehensive                 bool         `json:"comprehensive"`
+	AccessPaths                   []AccessPath `json:"access_paths,omitempty"`
+}
+
+// AccessPath is one gift-wrap subscription outcome. It is stored as capability
+// evidence so clients do not parse diagnostic detail strings.
+type AccessPath struct {
+	Name            string     `json:"name"`
+	Status          string     `json:"status"`
+	Retrieved       *bool      `json:"retrieved,omitempty"`
+	Unauthenticated *bool      `json:"unauthenticated,omitempty"`
+	Authenticated   *bool      `json:"authenticated,omitempty"`
+	ObservedAt      *time.Time `json:"observed_at,omitempty"`
+	Confidence      float64    `json:"confidence,omitempty"`
+	Freshness       string     `json:"freshness,omitempty"`
 }
 
 // NewService binds the service to a pool. A nil pool reports the schema as not ready.
@@ -370,8 +409,9 @@ func (s *Service) capabilities(ctx context.Context, item preparedURL) (Capabilit
 			Observations: observations[item.Key], Propagation: propagation[item.URL],
 		}),
 		Propagation: propagation[item.URL],
-		Note:        "Advertised NIP support is not verification. EOSE on a read subscription is not write, search, or gift-wrap proof. No measurement here claims mobile push delivery.",
+		Note:        "Advertised NIP support is not verification. EOSE on a read subscription is not write, search, or gift-wrap proof. privacy is the structured assessment; detail strings are diagnostic. No measurement here claims mobile push delivery.",
 	}
+	resp.Privacy = privacyReport(resp.Capabilities, now)
 	computed, ready, err := loadSnapshotTime(ctx, s.pool)
 	if err != nil {
 		return CapabilitiesResponse{}, err

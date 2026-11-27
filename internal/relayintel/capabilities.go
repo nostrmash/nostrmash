@@ -7,17 +7,33 @@ import (
 )
 
 const (
-	CapConnect       = "connect"
-	CapRead          = "read_subscription"
-	CapWriteAccept   = "write_accept"
-	CapWriteRetrieve = "write_retrieve"
-	CapSearch        = "search"
-	CapAuth          = "auth"
-	CapPayment       = "payment"
-	CapGiftWrap      = "giftwrap"
-	CapKeyPackage    = "keypackage"
-	CapRetention     = "retention"
-	CapNIP11         = "nip11"
+	CapConnect                = "connect"
+	CapRead                   = "read_subscription"
+	CapWriteAccept            = "write_accept"
+	CapWriteRetrieve          = "write_retrieve"
+	CapSearch                 = "search"
+	CapAuth                   = "auth"
+	CapPayment                = "payment"
+	CapGiftWrap               = "giftwrap"
+	CapGiftWrapAccept         = "giftwrap_accept"
+	CapGiftWrapPrivate        = "giftwrap_private"
+	CapGiftWrapPublic         = "giftwrap_public"
+	CapAuthWrite              = "auth_write"
+	CapAuthSearch             = "auth_search"
+	CapAuthGiftWrap           = "auth_giftwrap"
+	CapAuthRecipient          = "auth_recipient"
+	CapGiftWrapRecipient      = "giftwrap_recipient_retrieval"
+	CapGiftWrapRecipientExact = "giftwrap_recipient_exact"
+	CapGiftWrapRecipientTag   = "giftwrap_recipient_tag"
+	CapGiftWrapObserverExact  = "giftwrap_observer_exact"
+	CapGiftWrapObserverTag    = "giftwrap_observer_tag"
+	CapGiftWrapAnonExact      = "giftwrap_anon_exact"
+	CapGiftWrapAnonTag        = "giftwrap_anon_tag"
+	CapGiftWrapUnauthExposure = "giftwrap_unauth_exposure"
+	CapGiftWrapAuthExposure   = "giftwrap_auth_exposure"
+	CapKeyPackage             = "keypackage"
+	CapRetention              = "retention"
+	CapNIP11                  = "nip11"
 
 	StatusAdvertised  = "advertised"
 	StatusVerified    = "verified"
@@ -26,29 +42,49 @@ const (
 	StatusUnknown     = "unknown"
 	StatusStale       = "stale"
 	StatusRestricted  = "restricted"
+
+	// ComprehensivePrivacyVersion marks a six-path recipient-only result.
+	// Observations stored before that contract do not carry this version.
+	ComprehensivePrivacyVersion = 2
 )
 
 // Capability is one claim about a relay, with the evidence class attached.
 type Capability struct {
-	Name        string     `json:"name"`
-	Status      string     `json:"status"`
-	Confidence  float64    `json:"confidence"`
-	Source      string     `json:"source"`
-	ObservedAt  *time.Time `json:"observed_at,omitempty"`
-	SampleCount int        `json:"sample_count,omitempty"`
-	Detail      string     `json:"detail,omitempty"`
+	Name               string     `json:"name"`
+	Status             string     `json:"status"`
+	Confidence         float64    `json:"confidence"`
+	Source             string     `json:"source"`
+	ObservedAt         *time.Time `json:"observed_at,omitempty"`
+	SampleCount        int        `json:"sample_count,omitempty"`
+	RecentFailures     int        `json:"recent_failures,omitempty"`
+	RecentSuccesses    int        `json:"recent_successes,omitempty"`
+	RecentInconclusive int        `json:"recent_inconclusive,omitempty"`
+	Detail             string     `json:"detail,omitempty"`
+	EvidenceVersion    int        `json:"evidence_version,omitempty"`
+	Freshness          string     `json:"freshness,omitempty"`
+	Retrieved          *bool      `json:"retrieved,omitempty"`
+	Unauthenticated    *bool      `json:"unauthenticated,omitempty"`
+	Authenticated      *bool      `json:"authenticated,omitempty"`
 }
 
 // Observation is a stored measurement. It is not a user declaration.
 type Observation struct {
-	URLKey      string
-	Capability  string
-	Status      string
-	Confidence  float64
-	Source      string
-	ObservedAt  time.Time
-	SampleCount int
-	Detail      string
+	URLKey             string
+	Capability         string
+	Status             string
+	Confidence         float64
+	Source             string
+	ObservedAt         time.Time
+	SampleCount        int
+	RecentFailures     int
+	RecentSuccesses    int
+	RecentInconclusive int
+	RecentWindow       int
+	Detail             string
+	EvidenceVersion    int
+	Retrieved          *bool
+	Unauthenticated    *bool
+	Authenticated      *bool
 }
 
 // ProbeSnapshot is the existing read-probe rollup. EOSE success is not write,
@@ -163,17 +199,33 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 		now = time.Now()
 	}
 	out := map[string]Capability{
-		CapConnect:       {Name: CapConnect, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapRead:          {Name: CapRead, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapWriteAccept:   {Name: CapWriteAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapWriteRetrieve: {Name: CapWriteRetrieve, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapSearch:        {Name: CapSearch, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapAuth:          {Name: CapAuth, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapPayment:       {Name: CapPayment, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
-		CapGiftWrap:      {Name: CapGiftWrap, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapKeyPackage:    {Name: CapKeyPackage, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapRetention:     {Name: CapRetention, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
-		CapNIP11:         {Name: CapNIP11, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapConnect:                {Name: CapConnect, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapRead:                   {Name: CapRead, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapWriteAccept:            {Name: CapWriteAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapWriteRetrieve:          {Name: CapWriteRetrieve, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapSearch:                 {Name: CapSearch, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapAuth:                   {Name: CapAuth, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapPayment:                {Name: CapPayment, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapGiftWrap:               {Name: CapGiftWrap, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapAccept:         {Name: CapGiftWrapAccept, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapPrivate:        {Name: CapGiftWrapPrivate, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapPublic:         {Name: CapGiftWrapPublic, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapAuthWrite:              {Name: CapAuthWrite, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapAuthSearch:             {Name: CapAuthSearch, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapAuthGiftWrap:           {Name: CapAuthGiftWrap, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapAuthRecipient:          {Name: CapAuthRecipient, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
+		CapGiftWrapRecipient:      {Name: CapGiftWrapRecipient, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapRecipientExact: {Name: CapGiftWrapRecipientExact, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapRecipientTag:   {Name: CapGiftWrapRecipientTag, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapObserverExact:  {Name: CapGiftWrapObserverExact, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapObserverTag:    {Name: CapGiftWrapObserverTag, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapAnonExact:      {Name: CapGiftWrapAnonExact, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapAnonTag:        {Name: CapGiftWrapAnonTag, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapUnauthExposure: {Name: CapGiftWrapUnauthExposure, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapGiftWrapAuthExposure:   {Name: CapGiftWrapAuthExposure, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapKeyPackage:             {Name: CapKeyPackage, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapRetention:              {Name: CapRetention, Status: StatusUnknown, Confidence: 0.15, Source: "none"},
+		CapNIP11:                  {Name: CapNIP11, Status: StatusUnknown, Confidence: 0.2, Source: "none"},
 	}
 	if ev.Probe.At != nil {
 		age := now.Sub(*ev.Probe.At)
@@ -320,17 +372,58 @@ func ResolveCapabilities(ev Evidence) map[string]Capability {
 			current.Confidence = round3(clamp01(obs.Confidence))
 			current.Source = obs.Source
 			current.SampleCount = obs.SampleCount
+			current.RecentFailures = obs.RecentFailures
+			current.RecentSuccesses = obs.RecentSuccesses
+			current.RecentInconclusive = obs.RecentInconclusive
+			current.EvidenceVersion = obs.EvidenceVersion
+			current.Retrieved = obs.Retrieved
+			current.Unauthenticated = obs.Unauthenticated
+			current.Authenticated = obs.Authenticated
+			current.Freshness = freshnessLabel(obs.ObservedAt, now)
+			window := obs.SampleCount
+			if obs.RecentWindow > 0 {
+				window = obs.RecentWindow
+			}
+			current.Status, current.Confidence = adjustForRecentFailures(current.Status, current.Confidence, obs.RecentFailures, window)
 			if obs.Detail != "" {
 				current.Detail = obs.Detail
 			}
 			if !obs.ObservedAt.IsZero() && now.Sub(obs.ObservedAt) > ProbeStaleFor {
 				current.Status = StatusStale
 				current.Confidence = min(current.Confidence, 0.35)
+				current.Freshness = "stale"
 			}
 			out[obs.Capability] = current
 		}
 	}
 	return out
+}
+
+// adjustForRecentFailures lowers confidence when recent attempts failed.
+// The conclusive status stays. A later timeout does not erase a verified result.
+func adjustForRecentFailures(status string, confidence float64, failures, samples int) (string, float64) {
+	if samples < 2 || failures <= 0 || status != StatusVerified {
+		return status, confidence
+	}
+	if failures*2 >= samples {
+		return status, min(confidence, 0.45)
+	}
+	return status, min(confidence, 0.6)
+}
+
+func freshnessLabel(at, now time.Time) string {
+	if at.IsZero() || now.IsZero() {
+		return "unknown"
+	}
+	age := now.Sub(at)
+	switch {
+	case age <= ProbeFreshFor:
+		return "fresh"
+	case age <= ProbeStaleFor:
+		return "aging"
+	default:
+		return "stale"
+	}
 }
 
 func outranks(next, current string) bool {
