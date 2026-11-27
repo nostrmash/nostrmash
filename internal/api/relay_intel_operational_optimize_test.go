@@ -31,16 +31,27 @@ func measureOptimizeConcurrency(t *testing.T, ctx context.Context, pool *pgxpool
 			},
 		},
 	}
-	out := map[string]any{}
+	limit := 0
+	if base.optimizeGate != nil {
+		limit = cap(base.optimizeGate.slots)
+	}
+	if limit != 4 {
+		t.Fatalf("optimize gate limit = %d, want 4 from NewHandlersWithOptions", limit)
+	}
+	out := map[string]any{"gate_limit": limit, "constructor": "NewHandlersWithOptions"}
 	for name, body := range scenarios {
 		levels := map[string]any{}
-		for _, workers := range []int{1, 4, 8} {
-			levels[strconv.Itoa(workers)] = runOptimizeLevel(t, pool, counter, base, body, workers, 4)
+		for _, workers := range []int{1, 4, 8, 16} {
+			waves := 4
+			if workers == 16 {
+				waves = 2
+			}
+			levels[strconv.Itoa(workers)] = runOptimizeLevel(t, pool, counter, base, body, workers, waves)
 		}
 		out[name] = levels
 	}
 	out["overload"] = measureOptimizeOverload(t, ctx, pool, counter, base, scenarios["max_lists"])
-	out["note"] = "Levels 1, 4, and 8 run four waves. A wave waits for every worker to finish one optimize request. Overload is 16 workers and two waves of the max-list request. Rejected responses are not counted as completed. Rankings and configuration are called during the overload."
+	out["note"] = "The handler gate allows 4 optimizations. Levels 1, 4, and 8 run four waves. Level 16 runs two waves. HTTP 503 with error code overloaded is deliberate rejection and is not completed throughput. HTTP 429 rate_limited is the ordinary client limiter. Rankings and configuration run during the 16-request overload."
 	return out
 }
 
@@ -54,14 +65,16 @@ func runOptimizeLevel(t *testing.T, pool *pgxpool.Pool, counter *queryCounter, b
 	samples := make([]time.Duration, 0, workers*waves)
 	statuses := map[string]int{}
 	var mu sync.Mutex
-	completed, rejected, unexpected := 0, 0, 0
+	completed, overloaded, rateLimited, nonmeaningful, unexpected := 0, 0, 0, 0, 0
 	started := time.Now()
 	for wave := 0; wave < waves; wave++ {
 		var wg sync.WaitGroup
+		start := make(chan struct{})
 		for worker := 0; worker < workers; worker++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				<-start
 				one := time.Now()
 				got := callPOST(base.PostRelayOptimize, body)
 				elapsed := time.Since(one)
@@ -72,30 +85,37 @@ func runOptimizeLevel(t *testing.T, pool *pgxpool.Pool, counter *queryCounter, b
 				case "completed":
 					samples = append(samples, elapsed)
 					completed++
-				case "rejected":
-					rejected++
+				case "overloaded":
+					overloaded++
+				case "rate_limited":
+					rateLimited++
+				case "nonmeaningful":
+					nonmeaningful++
 				default:
 					unexpected++
 				}
 				mu.Unlock()
 			}()
 		}
+		close(start)
 		wg.Wait()
 	}
 	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
 	stat1 := pool.Stat()
-	summary := summarizeLatency("optimize concurrency", "not cached", pgCacheNote, samples, unexpected, completed, nil, time.Since(started), 0, cpuNow()-cpu0, "", nil)
+	summary := summarizeLatency("optimize concurrency", "not cached", pgCacheNote, samples, unexpected+nonmeaningful, completed, nil, time.Since(started), 0, cpuNow()-cpu0, "", nil)
 	alloc := uint64(0)
 	if completed > 0 && after.TotalAlloc > before.TotalAlloc {
 		alloc = (after.TotalAlloc - before.TotalAlloc) / uint64(completed)
 	}
 	return map[string]any{
 		"workers": workers, "waves": waves,
-		"completed": completed, "rejected_overload": rejected, "unexpected_errors": unexpected,
-		"status_codes": statuses,
-		"wall_ms":      time.Since(started).Milliseconds(),
-		"median_ms":    summary.MedianMS, "p95_ms": summary.P95MS, "p99_ms": summary.P99MS, "max_ms": summary.MaxMS,
+		"completed": completed, "overloaded": overloaded, "rate_limited": rateLimited,
+		"nonmeaningful": nonmeaningful, "unexpected_errors": unexpected,
+		"in_flight_after": base.optimizeGate.inFlight.Load(),
+		"status_codes":    statuses,
+		"wall_ms":         time.Since(started).Milliseconds(),
+		"median_ms":       summary.MedianMS, "p95_ms": summary.P95MS, "p99_ms": summary.P99MS, "max_ms": summary.MaxMS,
 		"alloc_bytes_per_request": alloc,
 		"cpu_ms":                  (cpuNow() - cpu0).Milliseconds(),
 		"queries":                 counter.snapshot() - q0,
@@ -106,13 +126,36 @@ func runOptimizeLevel(t *testing.T, pool *pgxpool.Pool, counter *queryCounter, b
 }
 
 func classifyOptimize(got httpResult) string {
-	if got.Status == http.StatusTooManyRequests || got.Status == http.StatusServiceUnavailable {
-		return "rejected"
-	}
-	if got.Status == http.StatusOK && planMeaningful(got.Body, true) {
+	code := optimizeErrorCode(got.Body)
+	switch {
+	case got.Status == http.StatusServiceUnavailable && code == "overloaded":
+		return "overloaded"
+	case got.Status == http.StatusTooManyRequests && code == "rate_limited":
+		return "rate_limited"
+	case got.Status == http.StatusOK && planMeaningful(got.Body, true):
 		return "completed"
+	case got.Status == http.StatusOK:
+		return "nonmeaningful"
+	default:
+		return "unexpected"
 	}
-	return "unexpected"
+}
+
+func classifyCanceledOptimize(got httpResult, ctxErr error) string {
+	class := classifyOptimize(got)
+	if ctxErr != nil && class != "completed" && class != "overloaded" && class != "rate_limited" {
+		return "canceled"
+	}
+	return class
+}
+
+func optimizeErrorCode(body map[string]any) string {
+	if body == nil {
+		return ""
+	}
+	errBody, _ := body["error"].(map[string]any)
+	code, _ := errBody["code"].(string)
+	return code
 }
 
 func measureOptimizeOverload(t *testing.T, ctx context.Context, pool *pgxpool.Pool, counter *queryCounter, base Handlers, body map[string]any) map[string]any {
@@ -171,10 +214,12 @@ func measureOptimizeOverload(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	cancel()
 	follow := callPOST(base.PostRelayOptimize, body)
 	rankingAfter := callGET(base.GetRelayRankings, "/api/v1/relays/rankings?role=public_inbox&limit=20", "")
-	rejected, _ := level["rejected_overload"].(int)
-	note := "No optimize request was rejected. This handler does not apply an optimize concurrency limit, so waiting and intentional overload rejection were not observed. Completed requests are the 200 responses with a plan."
-	if rejected > 0 {
-		note = "Rejected overload responses are reported separately and are not completed throughput."
+	invalid := callPOST(base.PostRelayOptimize, map[string]any{"pubkey": "not-a-pubkey", "preset": "balanced"})
+	afterInvalid := callPOST(base.PostRelayOptimize, body)
+	overloaded, _ := level["overloaded"].(int)
+	note := "Completed requests are HTTP 200 responses with a plan. HTTP 503 overloaded is deliberate gate rejection. HTTP 429 rate_limited is a different limiter."
+	if overloaded == 0 {
+		note = "No HTTP 503 overloaded response was observed at 16 concurrent requests."
 	}
 	return map[string]any{
 		"workers": 16, "waves": 2, "scenario": "max_lists",
@@ -187,15 +232,22 @@ func measureOptimizeOverload(t *testing.T, ctx context.Context, pool *pgxpool.Po
 			"median_ms": config.MedianMS, "p95_ms": config.P95MS,
 		},
 		"canceled_request": map[string]any{
-			"status": canceled.Status, "wall_ms": cancelWall.Milliseconds(),
-			"class": classifyOptimize(canceled),
-			"note":  "The request context is canceled after 30 ms. wall_ms near 30 means the handler returned on cancellation. A full optimize latency means the handler finished the request.",
+			"status": canceled.Status, "error_code": optimizeErrorCode(canceled.Body),
+			"wall_ms": cancelWall.Milliseconds(),
+			"class":   classifyCanceledOptimize(canceled, cancelCtx.Err()),
+			"note":    "The request context is canceled after 30 ms. A completed plan means the handler finished despite cancellation. overloaded means the gate rejected it.",
 		},
 		"after_cancel": map[string]any{
 			"optimize_status": follow.Status, "optimize_class": classifyOptimize(follow),
 			"rankings_status":             rankingAfter.Status,
 			"pool_acquired_before_cancel": acquiredBefore,
 			"pool_acquired_after":         pool.Stat().AcquiredConns(),
+			"in_flight_after":             base.optimizeGate.inFlight.Load(),
+		},
+		"after_invalid": map[string]any{
+			"invalid_status": invalid.Status, "invalid_code": optimizeErrorCode(invalid.Body),
+			"following_class": classifyOptimize(afterInvalid),
+			"in_flight_after": base.optimizeGate.inFlight.Load(),
 		},
 		"note": note,
 	}
