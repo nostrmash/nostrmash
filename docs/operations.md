@@ -367,7 +367,7 @@ CREATE INDEX CONCURRENTLY idx_profiles_latest_nip05_normalized
     ON profiles_latest (lower(btrim(nip05)));
 ```
 
-Check that the index is valid and ready on the application schema's `profiles_latest`. `pg_get_indexdef` should show a btree on `lower(btrim(nip05))`. The one-shot migration will record `000152` with the prebuilt index in place.
+Check that the index is valid and ready on the application schema's `profiles_latest`. `pg_get_indexdef` should show a btree on `lower(btrim(nip05))`. Run `ANALYZE profiles_latest` to collect statistics for the index expression. Verify with `EXPLAIN` that the normalized-identity lookup can use the index. The one-shot migration will record `000152` with the prebuilt index in place.
 
 ## Contributor handoff checklist
 
