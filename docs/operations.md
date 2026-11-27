@@ -215,7 +215,7 @@ Role-aware recommendations are on by default after migration `000133_relay_role_
 - The worker rebuilds `relay_role_stats` about every 10 minutes and backfills stored events at 200 per 5 seconds. That backfill does not crawl relays.
 - Active write probes are off. Turning `RELAY_INTEL_ACTIVE_PROBES` on requires `RELAY_INTEL_PROBE_SECRET_KEY` on the worker only. The API never loads that key. Gift-wrap probes are not implemented.
 - `RELAY_INTEL_ALLOW_PRIVATE_NETWORK` is for a self-hosted deployment that must verify loopback or RFC1918 relays. Link-local and metadata hosts stay blocked. Leave it false on the public deployment.
-- Rankings can be empty with `stats_not_ready` until the first successful aggregate refresh. That is not an outage of the popular-relays API.
+- Rankings can be empty with `stats_not_ready` until the first successful aggregate refresh. That is not an outage of the popular-relays API. The statistics transaction has a two-minute per-statement timeout. Investigate refreshes above 60 seconds.
 - Optimize and verify do not publish events. A single relay read-back is not global propagation. One API process runs at most `RELAY_INTEL_OPTIMIZE_CONCURRENCY` optimizations at once (default 4). The next request is HTTP 503 `overloaded` with `Retry-After: 1`. It is not queued, and it is not the per-client 429 `rate_limited` response. Configuration, diagnostics, recommendations, and cached rankings do not take that slot. `nostrmash_relay_intel_optimize_admission_total{result="rejected"}` counts those refusals. Benchmarks must not record them as completed optimizations.
 
 ### Upgrade through migration 000145

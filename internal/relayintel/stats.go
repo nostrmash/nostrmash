@@ -48,6 +48,11 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string,
 			return err
 		}
 	}
+	// Give the aggregate time to finish under the production query limit.
+	// SET LOCAL restores the caller's timeout when this transaction ends.
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = '2min'`); err != nil {
+		return fmt.Errorf("set relay statistics statement timeout: %w", err)
+	}
 	started := time.Now()
 
 	if _, err := tx.Exec(ctx, `DELETE FROM relay_role_stats`); err != nil {
