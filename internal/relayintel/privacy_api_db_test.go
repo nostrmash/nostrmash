@@ -202,6 +202,7 @@ func TestStackedMigrationsAreUniqueAndRepeatable(t *testing.T) {
 		"migrations/000148_relay_probe_followup_ownership.sql",
 		"migrations/000150_relay_probe_privacy_ownership.sql",
 		"migrations/000151_relay_probe_completion_digest.sql",
+		"migrations/000152_profiles_latest_nip05_normalized.sql",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("migration sequence = %v", got)

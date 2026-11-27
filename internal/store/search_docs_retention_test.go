@@ -92,3 +92,45 @@ func TestGroomSearchDocuments(t *testing.T) {
 		t.Fatal("expected note_orphan pruned")
 	}
 }
+
+func TestDeleteProfileSearchDocumentKeepsLatestNormalizedIdentity(t *testing.T) {
+	ctx := context.Background()
+	pool := setupSchemaPool(t, ctx, testDatabaseURL(t))
+	mustMigrateAndSeedDerivations(t, ctx, pool, "test-v1")
+
+	for _, profile := range []struct {
+		pubkey, nip05, displayName string
+		created                    int64
+	}{
+		{"older", "shared@example.invalid", "Older profile", 10},
+		{"remaining", "  Shared@example.invalid  ", "Latest remaining profile", 20},
+		{"deleted", "SHARED@EXAMPLE.INVALID", "Deleted profile", 30},
+	} {
+		eventID := "meta_" + profile.pubkey
+		insertEventRow(t, ctx, pool, eventID, 0, profile.created)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles_latest (pubkey, metadata_event_id, metadata_created_at, derivation_version, nip05, display_name)
+			VALUES ($1, $2, $3, 1, $4, $5)
+		`, profile.pubkey, eventID, profile.created, profile.nip05, profile.displayName); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM profiles_latest WHERE pubkey = 'deleted'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := searchDocBody(t, ctx, pool, "profile", "deleted"); ok {
+		t.Fatal("deleted profile still has a search document")
+	}
+	body, ok := searchDocBody(t, ctx, pool, "identity", "shared@example.invalid")
+	if !ok || !strings.Contains(body, "Latest remaining profile") {
+		t.Fatalf("identity document did not move to the latest remaining profile: %q", body)
+	}
+	var indexReady bool
+	if err := pool.QueryRow(ctx, `
+		SELECT indisvalid AND indisready AND pg_get_expr(indexprs, indrelid) = 'lower(btrim(nip05))'
+		FROM pg_index WHERE indexrelid = 'idx_profiles_latest_nip05_normalized'::regclass
+		AND indrelid = 'profiles_latest'::regclass
+	`).Scan(&indexReady); err != nil || !indexReady {
+		t.Fatalf("normalized NIP-05 index is missing or unusable: %v", err)
+	}
+}
