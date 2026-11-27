@@ -668,7 +668,7 @@ func measureMembershipMetadata(t *testing.T, ctx context.Context, pool *pgxpool.
 	}
 	unreadableTag, err := pool.Exec(ctx, `
 		UPDATE events
-		SET raw_json = 'not-json'
+		SET raw_json = '{"tags":"not-an-array"}'
 		WHERE id = (
 			SELECT h.event_id
 			FROM relay_config_heads h
