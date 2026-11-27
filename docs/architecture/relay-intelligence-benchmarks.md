@@ -101,7 +101,7 @@ These calls ran on the seeded account and probe history. They are database commi
 
 ### Sustained and burst workload
 
-Each paced pass offers 200 events across 30 seconds. Canonical repair stayed on. Deadlocks were 0. Pool empty acquires were 0. The forced refresh is a pass whose snapshot timestamp moved and whose `last_duration_ms` is positive.
+Each paced pass was scheduled to submit 200 events over 30 seconds. Canonical repair stayed on. Deadlocks and pool empty acquires were zero. A forced refresh was confirmed when the snapshot timestamp advanced and `last_duration_ms` was positive.
 
 Idle statistics refresh: 1.9 s at 10,000 accounts and 35.2 s at 100,000 accounts (1.10 million effective memberships).
 
@@ -113,7 +113,11 @@ Paced 100,000-account passes:
 | Relay Intelligence, no forced refresh | 3.8, 6.7, 6.6 /s | 180, 200, 199 | 0.57–0.64 ms | 13.5–16.8 ms | |
 | Relay Intelligence, forced refresh | 4.2, 4.0, 4.3 /s | 196, 196, 200 | 0.61–0.65 ms during | 14.4–14.7 ms during | 44.9 s, 47.4 s, 44.3 s |
 
-The first Relay Intelligence pass completed 180 of 200 events and stretched to 48 s with zero recorded ingest errors. Later paced passes returned to about 6.6/s. Paced throughput is the offered rate, not capacity.
+The original JSON reports `events_attempted: 200` for the intended workload in every paced pass. All final passes recorded zero ingest errors. For the medium baseline passes, 200, 188 and 200 events were submitted and ingested, leaving 0, 12 and 0 unsubmitted by the deadline. With Relay Intelligence and no forced refresh, 180, 200 and 199 were submitted and ingested, leaving 20, 0 and 1 unsubmitted. During forced refresh, 196, 196 and 200 were submitted and ingested, leaving 4, 4 and 0 unsubmitted. The first Relay Intelligence pass took 48 s. These are benchmark submission shortfalls. Paced derivation throughput reflects the workload delivered to the system.
+
+All three medium forced-refresh passes recorded zero post-refresh samples for both API groups, so post-refresh latency at that scale is unavailable in the original run. The small passes did capture post-refresh samples. The original final and historical JSON files retain their original values for provenance. Any `heap_alloc_bytes` value above `9223372036854775807` is invalid due to unsigned underflow. Other `heap_alloc_bytes` values are changes in live heap size.
+
+The corrected harness records intended, submitted and deadline-unsubmitted counts separately from successful ingests, failed ingests and fixture preparation errors. It reports `total_allocated_bytes` from the runtime's cumulative allocation counter. Requests are grouped by their start time, and API sampling continues for at least two seconds after a confirmed refresh, even when the paced workload has ended. Resource totals cover the observation window. Derivation throughput excludes any additional time spent waiting for post-refresh samples.
 
 Unpaced burst, 200 events, queue drained to zero, no ingest errors:
 
