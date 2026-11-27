@@ -666,16 +666,36 @@ func measureMembershipMetadata(t *testing.T, ctx context.Context, pool *pgxpool.
 	if err != nil {
 		return map[string]any{"measured": false, "error": err.Error()}
 	}
+	unreadableTag, err := pool.Exec(ctx, `
+		UPDATE events
+		SET raw_json = 'not-json'
+		WHERE id = (
+			SELECT h.event_id
+			FROM relay_config_heads h
+			WHERE h.membership_count = -1
+			  AND NOT EXISTS (
+			      SELECT 1 FROM deletion_events de
+			      WHERE de.target_event_id = h.event_id AND de.deleter_pubkey = h.pubkey
+			  )
+			ORDER BY h.pubkey DESC, h.source_kind DESC, h.d_tag DESC
+			LIMIT 1
+		)
+	`)
+	if err != nil {
+		return map[string]any{"measured": false, "error": err.Error()}
+	}
 	before := membershipCensus(ctx, pool)
 	beforeStatus, statusErr := relayintel.ReadProjectionReconcileStatus(ctx, pool)
 	out := map[string]any{
-		"measured":             true,
-		"path":                 "BackfillBatch",
-		"deleted_heads_marked": deletedTag.RowsAffected(),
-		"before":               before,
-		"pending_before":       beforeStatus.PendingEligible,
-		"status_error":         errorText(statusErr),
-		"note":                 "Seeded heads omit membership_count, so they keep the migration default of -1. BackfillBatch reconciles those heads from the authoritative event. Deleted events stay out of the eligible backlog.",
+		"measured":                true,
+		"path":                    "BackfillBatch",
+		"deleted_heads_marked":    deletedTag.RowsAffected(),
+		"unreadable_event_marked": unreadableTag.RowsAffected(),
+		"before":                  before,
+		"backlog_before":          before["unknown_live"],
+		"pending_before":          beforeStatus.PendingEligible,
+		"status_error":            errorText(statusErr),
+		"note":                    "Seeded heads omit membership_count, so they keep the migration default of -1. BackfillBatch reconciles those heads from the authoritative event. pending_before is 0 until the reconcile cursor exists; backlog_before is the live unknown count. Twenty deleted heads and one unreadable event are marked inside this measurement. Deleted heads stay out of the eligible backlog. The unreadable event must become membership_count -2, which is not an empty configuration.",
 	}
 	if err := relayintel.ResetProjectionReconcile(ctx, pool); err != nil {
 		out["reset_error"] = err.Error()
@@ -746,9 +766,10 @@ func measureMembershipMetadata(t *testing.T, ctx context.Context, pool *pgxpool.
 	out["integrity_recorded"] = afterStatus.IntegrityRecorded
 	out["steady_state_wall_ms"] = time.Since(steadyStart).Milliseconds()
 	out["steady_state_error"] = errorText(steadyErr)
-	mismatches, checked := membershipDigestMismatches(ctx, pool)
+	mismatches, checked, digestErr := membershipDigestMismatches(ctx, pool)
 	out["digest_mismatches"] = mismatches
 	out["digest_heads_checked"] = checked
+	out["digest_error"] = digestErr
 	out["deleted_configs_rewritten"] = deletedConfigsRewritten(ctx, pool)
 	if processed > 0 && elapsed > 0 {
 		out["heads_per_second"] = float64(processed) / elapsed.Seconds()
@@ -756,9 +777,10 @@ func measureMembershipMetadata(t *testing.T, ctx context.Context, pool *pgxpool.
 	if failure != "" {
 		out["failure"] = failure
 	}
-	out["accepted"] = failure == "" && afterStatus.UpgradeComplete && afterStatus.PendingEligible == 0 &&
+	out["accepted"] = failure == "" && digestErr == "" && afterStatus.UpgradeComplete && afterStatus.PendingEligible == 0 &&
 		mismatches == 0 && deletedConfigsRewritten(ctx, pool) == 0 &&
-		after["unknown_live"] == 0 && after["empty_nonzero"] == 0 && after["truncated_unknown"] == 0
+		after["unknown_live"] == 0 && after["empty_nonzero"] == 0 && after["truncated_unknown"] == 0 &&
+		after["unreadable"] >= 1
 	return out
 }
 
@@ -796,10 +818,10 @@ func membershipCensus(ctx context.Context, pool *pgxpool.Pool) map[string]int64 
 	return out
 }
 
-func membershipDigestMismatches(ctx context.Context, pool *pgxpool.Pool) (int64, int64) {
+func membershipDigestMismatches(ctx context.Context, pool *pgxpool.Pool) (int64, int64, string) {
 	var eligible int64
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_config_heads WHERE membership_count >= 0`).Scan(&eligible); err != nil {
-		return -1, 0
+		return -1, 0, err.Error()
 	}
 	checked := eligible
 	if checked > 400 {
@@ -815,14 +837,13 @@ func membershipDigestMismatches(ctx context.Context, pool *pgxpool.Pool) (int64,
 			ORDER BY pubkey, source_kind, d_tag
 			LIMIT $1
 		) h
-		WHERE (h.membership_count, h.membership_digest) IS DISTINCT FROM (
-			SELECT d.membership_count, d.membership_digest
-			FROM relay_intel_membership_digest(h.pubkey, h.source_kind, h.d_tag) d
-		)`, checked).Scan(&n)
+		CROSS JOIN LATERAL relay_intel_membership_digest(h.pubkey, h.source_kind, h.d_tag) d
+		WHERE h.membership_count IS DISTINCT FROM d.membership_count
+		   OR h.membership_digest IS DISTINCT FROM d.membership_digest`, checked).Scan(&n)
 	if err != nil {
-		return -1, checked
+		return -1, checked, err.Error()
 	}
-	return n, checked
+	return n, checked, ""
 }
 
 func deletedConfigsRewritten(ctx context.Context, pool *pgxpool.Pool) int64 {
