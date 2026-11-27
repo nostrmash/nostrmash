@@ -390,7 +390,7 @@ func (s *Read) fillProfilesFromLatestMetadata(ctx context.Context, ids []string,
 		FROM events
 		WHERE kind = 0
 		  AND pubkey = ANY($1::text[])
-		ORDER BY pubkey, created_at DESC, id DESC
+		ORDER BY pubkey, created_at DESC, id ASC
 	`, topZapLookupIDs(missing))
 	if err != nil {
 		return fmt.Errorf("top zap profile events: %w", err)

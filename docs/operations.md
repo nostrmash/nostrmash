@@ -29,6 +29,7 @@ What it does not try to be:
 - [Alert response playbook](#alert-response-playbook)
 - [Debug and build identity](#debug-and-build-identity)
 - [Trust-bounded ingest rollout](#trust-bounded-ingest-rollout)
+- [Relay intelligence](#relay-intelligence)
 - [Contributor handoff checklist](#contributor-handoff-checklist)
 
 ## Operator checklist
@@ -204,6 +205,158 @@ Purges raw deletion events (kind `5`) after their derivation completes. The dist
 ### Deprecated
 
 - `TRUST_CANONICAL_INGEST_MODE` — deprecated, not wired. Use `INGESTOR_TRUST_GATE_MODE`.
+
+## Relay intelligence
+
+Role-aware recommendations are on by default after migration `000133_relay_role_intelligence.sql`. The design, including what is not verified, is [architecture/relay-intelligence.md](architecture/relay-intelligence.md).
+
+- Apply `000133` before expecting role rows. Until then, new event projection no-ops and the API returns 503 `schema_not_ready`. `GET /api/v1/relays/popular` does not read the new tables.
+- `RELAY_INTEL_ENABLED=false` returns 404 from the new routes and stops the worker loop. Existing rows stay.
+- The worker rebuilds `relay_role_stats` about every 10 minutes and backfills stored events at 200 per 5 seconds. That backfill does not crawl relays.
+- Active write probes are off. Turning `RELAY_INTEL_ACTIVE_PROBES` on requires `RELAY_INTEL_PROBE_SECRET_KEY` on the worker only. The API never loads that key. Gift-wrap probes are not implemented.
+- `RELAY_INTEL_ALLOW_PRIVATE_NETWORK` is for a self-hosted deployment that must verify loopback or RFC1918 relays. Link-local and metadata hosts stay blocked. Leave it false on the public deployment.
+- Rankings can be empty with `stats_not_ready` until the first successful aggregate refresh. That is not an outage of the popular-relays API.
+- Optimize and verify do not publish events. A single relay read-back is not global propagation. One API process runs at most `RELAY_INTEL_OPTIMIZE_CONCURRENCY` optimizations at once (default 4). The next request is HTTP 503 `overloaded` with `Retry-After: 1`. It is not queued, and it is not the per-client 429 `rate_limited` response. Configuration, diagnostics, recommendations, and cached rankings do not take that slot. `nostrmash_relay_intel_optimize_admission_total{result="rejected"}` counts those refusals. Benchmarks must not record them as completed optimizations.
+
+### Upgrade through migration 000145
+
+`000145_relay_intel_membership_and_retention.sql` adds membership integrity columns and four foreign-key indexes. If `000141_relay_intel_repair_lifecycle.sql` is pending, it also adds a lookup index on `replaceable_state`. `cmd/migrate` and boot-time migration apply every pending file inside one transaction. Build the indexes on existing populated tables concurrently before that transaction so the migration only checks the catalog. The migration sequence builds indexes on tables that it creates.
+
+Do not edit `000144` or `000145` after either file has been applied. A checksum mismatch stops migration. Do not renumber them.
+
+`IF NOT EXISTS` does not prove an index is valid or has the right definition. An invalid index left by a failed concurrent build occupies the name, is not used for cascades, and makes the migration skip the build.
+
+#### 1. Pre-upgrade checks
+
+Run these on the primary, in the application schema:
+
+```sql
+SELECT migration_id, checksum
+FROM schema_migrations_audit
+WHERE migration_id >= 'migrations/000133_'
+  AND migration_id < 'migrations/000152_'
+ORDER BY migration_id;
+
+SELECT c.relname AS index_name, n.nspname AS table_schema, t.relname AS table_name,
+       i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS index_def
+FROM pg_class c
+JOIN pg_index i ON i.indexrelid = c.oid
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+WHERE n.nspname = current_schema() AND c.relname IN (
+    'idx_replaceable_state_kind_pubkey',
+    'idx_relay_role_memberships_source_event',
+    'idx_relay_config_heads_event_id',
+    'idx_dm_relay_lists_latest_event_id',
+    'idx_nutzap_info_latest_event_id'
+);
+
+SELECT c.relname, pg_size_pretty(pg_total_relation_size(c.oid)) AS total
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = current_schema() AND c.relname IN (
+    'replaceable_state',
+    'relay_role_memberships',
+    'relay_config_heads',
+    'dm_relay_lists_latest',
+    'nutzap_info_latest',
+    'events'
+);
+```
+
+Confirm enough free disk and WAL space to build the indexes on all applicable tables. A concurrent index build writes the index and its WAL. Finish or roll back `idle in transaction` sessions before building; a concurrent build waits for snapshots those sessions still hold.
+
+Expected definitions, all btree and with no predicate:
+
+- `idx_replaceable_state_kind_pubkey` on `replaceable_state (kind, pubkey, d_tag)` when `000141` is pending
+- `idx_relay_role_memberships_source_event` on `relay_role_memberships (source_event_id)`
+- `idx_relay_config_heads_event_id` on `relay_config_heads (event_id)`
+- `idx_dm_relay_lists_latest_event_id` on `dm_relay_lists_latest (event_id)`
+- `idx_nutzap_info_latest_event_id` on `nutzap_info_latest (event_id)`
+
+#### 2. Index preparation
+
+For each missing index on an existing populated table, use the matching table and columns outside a transaction. For example:
+
+```sql
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+CREATE INDEX CONCURRENTLY idx_relay_role_memberships_source_event
+    ON relay_role_memberships (source_event_id);
+```
+
+Repeat for each applicable name and table. If upgrading from before `000133`, let the migrations create `relay_config_heads` and `relay_role_memberships` with their indexes. Watch `pg_stat_progress_create_index`. If a build is interrupted, the index remains invalid. Drop that name and build it again:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS idx_relay_role_memberships_source_event;
+```
+
+Verify each applicable prebuilt index is valid, ready, and exactly matches its expected definition before starting the transactional migration. Correct an invalid or mismatched prebuilt index concurrently before proceeding.
+
+#### 3. Migration execution
+
+Keep `MIGRATE_ON_BOOT=false` on API, worker, and ingestor so they do not open the migration transaction themselves.
+
+Run the new `cmd/migrate` once. In Coolify, the one-shot `migrate` service runs it during deployment. Set `MIGRATE_PGOPTIONS` on that service through Compose interpolation, for example `-c lock_timeout=5s -c statement_timeout=120s` after the index preparation and rehearsal. Check any `options` in `DATABASE_URL`, which takes precedence over `PGOPTIONS`. The short lock timeout bounds how long DDL waits behind a writer. If a timeout fires, the migration transaction rolls back and the prebuilt indexes remain.
+
+#### 4. Worker and API rollout
+
+Stop the previous worker, then start the new one, after `000145` is in `schema_migrations_audit`. The new worker's projection writes `membership_count` and `membership_digest`. Starting it earlier fails those writes because the columns do not exist. The previous worker's inserts omit those columns, so Postgres stores `-1`. Leave that worker stopped once the new one is up. A head it inserted afterward would stay unknown until the next worker start, because a finished pass does not scan on every tick.
+
+The API can roll out with the worker. Its optimization limit is process-local and does not depend on the new columns. Leave the old API up until the migration commits; an old API does not reference the new columns.
+
+#### 5. Historical membership metadata
+
+On startup the worker clears the reconcile idle flag. Heads with `membership_count = -1` are also eligible while that cursor is idle, so a finished `relay_intel_backfill_cursor` does not skip them. Reconciliation parses the authoritative event with the existing Go parser and rewrites the bounded membership set. It does not trust whatever rows are already stored.
+
+A real empty or client-side-only list is stored as count 0. A truncated list keeps the bounded set and `truncated = true`. A deleted winner is not projected. An event that cannot be parsed is stored as `membership_count = -2` so it is not selected on every tick. `-2` is not a valid empty list.
+
+The pass is one batch per backfill interval (default 200 rows every 5 seconds). A restart continues from `relay_intel_work_cursor` where `work_name = 'projection_reconcile'`.
+
+#### 6. Post-upgrade checks
+
+```sql
+SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid)
+FROM pg_class c
+JOIN pg_index i ON i.indexrelid = c.oid
+WHERE c.relname IN (
+    'idx_relay_role_memberships_source_event',
+    'idx_relay_config_heads_event_id',
+    'idx_dm_relay_lists_latest_event_id',
+    'idx_nutzap_info_latest_event_id'
+);
+
+SELECT idle, cursor_tag, last_rows, last_completed_at
+FROM relay_intel_work_cursor
+WHERE work_name = 'projection_reconcile';
+
+SELECT count(*) AS still_unknown
+FROM replaceable_state rs
+LEFT JOIN relay_config_heads h
+  ON h.pubkey = rs.pubkey AND h.source_kind = rs.kind AND h.d_tag = rs.d_tag
+WHERE rs.kind IN (3, 10002, 10006, 10007, 10012, 10013, 10050, 10051, 10063, 10102, 30002)
+  AND (h.event_id IS NULL OR h.event_id <> rs.event_id OR h.needs_replay OR h.membership_count = -1);
+```
+
+`still_unknown` reaches 0 and `cursor_tag` becomes `membership_v1`. `nostrmash_relay_intel_membership_integrity_pending` is the same backlog. A selective lookup such as `EXPLAIN SELECT 1 FROM relay_role_memberships WHERE source_event_id = '<one event id>'` uses `idx_relay_role_memberships_source_event`.
+
+#### 7. Monitoring
+
+- `pg_stat_progress_create_index` during the concurrent builds.
+- Replication lag and WAL volume while those builds run.
+- `nostrmash_relay_intel_membership_integrity_pending` until it stays 0.
+- `nostrmash_relay_intel_optimize_in_flight` and `nostrmash_relay_intel_optimize_admission_total`.
+- Replaceable purge duration. The indexed cascade no longer sequential-scans these four child tables as account counts grow.
+
+#### 8. Recovery and rollback
+
+A failed concurrent build leaves an invalid index. Drop that index concurrently and build it again before migrating. Do not drop an index the migration has already accepted unless you are deliberately returning to the slow cascade.
+
+If `cmd/migrate` rolls back, `000145` is not applied and the prebuilt indexes can stay. They match what the migration will create.
+
+After `000145` commits, do not delete the migration row or edit the file. The previous binary can still run: new columns have defaults, and the replaced functions keep their old signatures. Stop the new worker before running that older binary for long, or it will keep writing the new columns. Dropping the columns is a forward fix, not a down migration.
+
+Rolling back the API binary removes the optimization limit. It does not require a schema change.
 
 ## Contributor handoff checklist
 
@@ -791,6 +944,12 @@ Alert rules are defined in `observability/alerts/core_workflow_alerts.yml`. Use 
 - `NostrMashMeilisearchSweeperStalled`
   - Meaning: no Meilisearch sweeper batch (success or error) has completed in 15m while the queue is non-empty — every sweeper goroutine is hung, not just slow. Seen in production as `pending_meilisearch_syncs` growing for hours with the sweeper's processed counter completely flat.
   - Check next: restart the `worker` container to clear stuck goroutines (queue should start draining within seconds); `WORKER_MEILISEARCH_SWEEPER_BATCH_TIMEOUT` bounds each goroutine so a recurrence should self-heal within that timeout instead of hanging indefinitely. If it recurs, check Meilisearch CPU/health for the underlying cause.
+- `NostrMashRelayIntelStatsStale`
+  - Meaning: the worker's role-stat snapshot is older than 30 minutes. Rankings keep serving the previous snapshot. `GET /api/v1/relays/popular` is a different query and can still be fresh.
+  - Check next: worker logs for relay-intel stats errors, database load, and whether `RELAY_INTEL_STATS_ENABLED` is true. A missing `000133` migration leaves this gauge untouched.
+- `NostrMashRelayIntelProbeErrors`
+  - Meaning: active probes are failing. Probes are off unless `RELAY_INTEL_ACTIVE_PROBES=true`, so this stays quiet on the default deployment.
+  - Check next: worker logs and the probe budget. Do not raise the hourly budget to push through errors. Gift-wrap probes are unimplemented and do not count as this alert.
 
 ## Debug and build identity
 

@@ -14,7 +14,7 @@ func (h *Handlers) ProjectContactListsLatest(ctx context.Context, eventID string
 }
 
 func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		3,
@@ -49,18 +49,18 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 				INSERT INTO contact_lists_latest (
 					pubkey, event_id, created_at, contacts_json, derivation_version
 				)
-				VALUES ($1, $2, $3, $4, $5)
+				SELECT $1, $2, $3, $4, $5
+				WHERE relay_intel_may_project($1, 3, '', $2, $3, NULL::text, NULL::bigint)
 				ON CONFLICT (pubkey) DO UPDATE
 				SET event_id = EXCLUDED.event_id,
 				    created_at = EXCLUDED.created_at,
 				    contacts_json = EXCLUDED.contacts_json,
 				    derivation_version = EXCLUDED.derivation_version,
 				    updated_at = now()
-				WHERE EXCLUDED.created_at > contact_lists_latest.created_at
-				   OR (
-				       EXCLUDED.created_at = contact_lists_latest.created_at
-				       AND EXCLUDED.event_id >= contact_lists_latest.event_id
-				   )
+				WHERE relay_intel_may_project(
+				    EXCLUDED.pubkey, 3, '', EXCLUDED.event_id, EXCLUDED.created_at,
+				    contact_lists_latest.event_id, contact_lists_latest.created_at
+				)
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert contact_lists_latest: %w", err)
@@ -174,7 +174,10 @@ func (h *Handlers) projectContactListsLatestWithVersion(ctx context.Context, eve
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) error {
@@ -182,7 +185,7 @@ func (h *Handlers) ProjectRelayListsLatest(ctx context.Context, eventID string) 
 }
 
 func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, eventID string, versionOverride *int) error {
-	return h.projectReplaceableListLatest(
+	if err := h.projectReplaceableListLatest(
 		ctx,
 		eventID,
 		10002,
@@ -217,25 +220,30 @@ func (h *Handlers) projectRelayListsLatestWithVersion(ctx context.Context, event
 				INSERT INTO relay_lists_latest (
 					pubkey, event_id, created_at, relays_json, derivation_version
 				)
-				VALUES ($1, $2, $3, $4, $5)
+				SELECT $1, $2, $3, $4, $5
+				WHERE relay_intel_may_project($1, 10002, '', $2, $3, NULL::text, NULL::bigint)
 				ON CONFLICT (pubkey) DO UPDATE
 				SET event_id = EXCLUDED.event_id,
 				    created_at = EXCLUDED.created_at,
 				    relays_json = EXCLUDED.relays_json,
 				    derivation_version = EXCLUDED.derivation_version,
 				    updated_at = now()
-				WHERE EXCLUDED.created_at > relay_lists_latest.created_at
-				   OR (
-				       EXCLUDED.created_at = relay_lists_latest.created_at
-				       AND EXCLUDED.event_id >= relay_lists_latest.event_id
-				   )
+				WHERE relay_intel_may_project(
+				    EXCLUDED.pubkey, 10002, '', EXCLUDED.event_id, EXCLUDED.created_at,
+				    relay_lists_latest.event_id, relay_lists_latest.created_at
+				)
 			`, pubkey, winnerID, winnerCreatedAt, payload, writeVersion)
 			if err != nil {
 				return fmt.Errorf("upsert relay_lists_latest: %w", err)
 			}
 			return nil
 		},
-	)
+	); err != nil {
+		return err
+	}
+	// Markers are stored in relay_role_memberships. relays_json stays a URL
+	// array so existing discovery and API readers keep their contract.
+	return h.projectRelayIntelEvent(ctx, eventID)
 }
 
 type replaceableListPayloadBuilder func(tags [][]string) json.RawMessage
@@ -308,6 +316,9 @@ func (h *Handlers) projectReplaceableListLatest(
 	)
 	if err != nil {
 		return err
+	}
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, $2, '')`, pubkey, requiredKind); err != nil {
+		return fmt.Errorf("lock replaceable list coordinate: %w", err)
 	}
 	if err := upsert(tx, pubkey, winnerID, winnerCreatedAt, payload, writeVersion); err != nil {
 		return err

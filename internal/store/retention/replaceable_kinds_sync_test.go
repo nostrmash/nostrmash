@@ -10,7 +10,7 @@ import (
 )
 
 func TestSupersededReplaceableKindsMatchMigration(t *testing.T) {
-	data, err := os.ReadFile("../../../migrations/000120_group_and_list_surfaces.sql")
+	data, err := os.ReadFile("../../../migrations/000133_relay_role_intelligence.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

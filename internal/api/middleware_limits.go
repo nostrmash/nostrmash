@@ -229,8 +229,15 @@ func classifyPublicEndpoint(path string) publicEndpointClass {
 		path == "/api/v1/hashtags/emerging",
 		strings.HasSuffix(path, "/history") && strings.HasPrefix(path, "/api/v1/hashtags/"),
 		strings.HasSuffix(path, "/moderation") && strings.HasPrefix(path, "/api/v1/profiles/"),
-		strings.HasSuffix(path, "/health/history") && strings.HasPrefix(path, "/api/v1/relays/"):
+		strings.HasSuffix(path, "/health/history") && strings.HasPrefix(path, "/api/v1/relays/"),
+		path == "/api/v1/relays/roles",
+		path == "/api/v1/relays/rankings",
+		path == "/api/v1/relays/capabilities":
 		return publicEndpointClassPublicStats
+	case path == "/api/v1/relays/optimize",
+		path == "/api/v1/relays/verify",
+		strings.HasPrefix(path, "/api/v1/profiles/") && (strings.HasSuffix(path, "/relay-config") || strings.HasSuffix(path, "/relay-diagnostics") || strings.HasSuffix(path, "/relay-recommendations")):
+		return publicEndpointClassPersonalized
 	case strings.HasPrefix(path, "/api/v1/discovery/"):
 		return publicEndpointClassDiscovery
 	default:

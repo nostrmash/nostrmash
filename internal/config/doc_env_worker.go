@@ -567,7 +567,7 @@ func configEnvDocsWorker() []EnvVarDoc {
 			Runtimes:     []string{"worker"},
 			Required:     false,
 			DefaultValue: "true",
-			Description:  "Enable retention purge of author-gated raw events (kinds 1/4/5/8/9/11/20/21/22/1063/1068/1984/1985/9041/9802/10000/10001/10003/10006/10007/10009/10012/10015/10019/10030/10050/10063/30000/30002/30004/30005/30008/30009/30015/30023/30311/30315/34235/34236; kind-1 replies already in thread_edges are kept; kinds 16, 1111, 1018, and 1311 stay bounded by their target rule) plus their derived event_urls/event_hashtags rows, all whose author is outside trust_graph_snapshot. Fail-safe: deletes nothing while the trust graph snapshot is empty.",
+			Description:  "Enable retention purge of author-gated raw events (kinds 1/4/5/8/9/11/20/21/22/1063/1068/1984/1985/9041/9802/10000/10001/10003/10006/10007/10009/10012/10013/10015/10019/10030/10050/10051/10063/10102/30000/30002/30004/30005/30008/30009/30015/30023/30311/30315/34235/34236; kind-1 replies already in thread_edges are kept; kinds 16, 1111, 1018, and 1311 stay bounded by their target rule) plus their derived event_urls/event_hashtags rows, all whose author is outside trust_graph_snapshot. Fail-safe: deletes nothing while the trust graph snapshot is empty.",
 		},
 		{
 			Name:         "WORKER_RETENTION_UNTRUSTED_AUTHOR_MAX_AGE",

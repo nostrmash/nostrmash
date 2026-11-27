@@ -382,6 +382,14 @@ type CustomEmojiDaily struct {
 	Count     int64
 }
 
+type DeletionAddress struct {
+	EventID   string
+	Pubkey    string
+	Kind      int32
+	DTag      string
+	CreatedAt int64
+}
+
 type DeletionDaily struct {
 	Day           pgtype.Date
 	Kind          int32
@@ -1313,6 +1321,49 @@ type RelayActivityRollupState struct {
 	RolledUpUntil pgtype.Timestamptz
 }
 
+type RelayCapabilityObservation struct {
+	UrlKey      string
+	Capability  string
+	Status      string
+	Confidence  float64
+	Source      string
+	Detail      []byte
+	SampleCount int32
+	ObservedAt  pgtype.Timestamptz
+}
+
+type RelayCapabilitySample struct {
+	ID         int64
+	UrlKey     string
+	Capability string
+	Status     string
+	Confidence float64
+	Source     string
+	Detail     string
+	ObservedAt pgtype.Timestamptz
+	AttemptID  pgtype.Int8
+}
+
+type RelayConfigHead struct {
+	Pubkey               string
+	SourceKind           int32
+	DTag                 string
+	EventID              string
+	CreatedAt            int64
+	ExplicitlyEmpty      bool
+	ClientSideOnly       bool
+	DeclarationSource    string
+	InvalidEndpointCount int32
+	Truncated            bool
+	Title                string
+	UpdatedAt            pgtype.Timestamptz
+	NeedsReplay          bool
+	// Number of bounded memberships written for this head. -1 means the projection has not recorded the set.
+	MembershipCount int32
+	// Canonical text of that membership set. Empty is a real empty set only when membership_count is 0.
+	MembershipDigest string
+}
+
 type RelayCoverageChange struct {
 	ID         int64
 	OccurredAt pgtype.Timestamptz
@@ -1331,6 +1382,33 @@ type RelayDesiredSet struct {
 	Notes         pgtype.Text
 }
 
+type RelayEffectiveKnown struct {
+	Pubkey string
+	Role   string
+}
+
+type RelayEffectiveMembership struct {
+	UrlKey            string
+	Role              string
+	EndpointUrl       string
+	EndpointType      string
+	Pubkey            string
+	DeclarationSource string
+	PublicSafe        bool
+	SourceKind        int32
+	DTag              string
+	SourceEventID     string
+	CreatedAt         int64
+}
+
+type RelayEndpointAdoption struct {
+	UrlKey        string
+	EndpointUrl   string
+	EndpointType  string
+	DistinctUsers int64
+	ComputedAt    pgtype.Timestamptz
+}
+
 type RelayHealthDaily struct {
 	Day          pgtype.Date
 	UrlKey       string
@@ -1345,6 +1423,57 @@ type RelayHintDaily struct {
 	Day       pgtype.Date
 	RelayUrl  string
 	HintCount int64
+}
+
+type RelayIntelBackfillCursor struct {
+	SourceKind    int32
+	LastCreatedAt int64
+	LastEventID   string
+	Done          bool
+	Processed     int64
+	UpdatedAt     pgtype.Timestamptz
+}
+
+type RelayIntelRepair struct {
+	WinnerEventID string
+	LoserEventID  string
+	Pubkey        string
+	Kind          int32
+	DTag          string
+	Status        string
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+	JobID         pgtype.Int8
+	Attempts      int32
+	LastError     pgtype.Text
+	FinishedAt    pgtype.Timestamptz
+}
+
+type RelayIntelSnapshot struct {
+	ID             bool
+	ComputedAt     pgtype.Timestamptz
+	KindCounts     []byte
+	RoleDeclarers  []byte
+	LastDurationMs pgtype.Int8
+	LastError      pgtype.Text
+	LastFailureAt  pgtype.Timestamptz
+}
+
+type RelayIntelWorkCursor struct {
+	WorkName        string
+	CursorPubkey    string
+	CursorKind      int32
+	CursorDTag      string
+	CursorCreatedAt int64
+	CursorEventID   string
+	CursorTag       string
+	Idle            bool
+	NextRunAt       pgtype.Timestamptz
+	LastCompletedAt pgtype.Timestamptz
+	LastDurationMs  pgtype.Int8
+	LastError       pgtype.Text
+	LastRows        int64
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type RelayListStatsDaily struct {
@@ -1377,6 +1506,59 @@ type RelayPreferenceListsLatest struct {
 	Kind      int32
 	Relays    []byte
 	UpdatedAt pgtype.Timestamptz
+}
+
+type RelayProbeAttempt struct {
+	ID           int64
+	UrlKey       string
+	Capability   string
+	Host         string
+	WorkerID     string
+	LeaseToken   string
+	StartedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
+	Status       string
+	ResultDigest string
+}
+
+type RelayProbeFollowup struct {
+	ID             int64
+	UrlKey         string
+	EndpointUrl    string
+	EventID        string
+	Capability     string
+	CheckAfter     pgtype.Timestamptz
+	FinishedAt     pgtype.Timestamptz
+	Result         string
+	Status         string
+	LeaseToken     string
+	PublishedAt    pgtype.Timestamptz
+	VerifiedAt     pgtype.Timestamptz
+	ElapsedSeconds pgtype.Int4
+	Attempts       int32
+	ClaimedAt      pgtype.Timestamptz
+	Deferrals      int32
+}
+
+type RelayProbeIdentity struct {
+	Pubkey    string
+	CreatedAt pgtype.Timestamptz
+	ExpiresAt pgtype.Timestamptz
+}
+
+type RelayProbeIdentityEpoch struct {
+	ID    bool
+	Epoch int64
+}
+
+type RelayProbeLease struct {
+	UrlKey     string
+	Capability string
+	Host       string
+	WorkerID   string
+	LeaseToken string
+	StartedAt  pgtype.Timestamptz
+	ExpiresAt  pgtype.Timestamptz
 }
 
 type RelayProbeObservation struct {
@@ -1440,6 +1622,43 @@ type RelayRegistry struct {
 	BlockedRefCount       int64
 	FavoriteRefCount      int64
 	DmRefCount            int64
+}
+
+type RelayRoleAdoptionDaily struct {
+	Day           pgtype.Date
+	UrlKey        string
+	Role          string
+	DistinctUsers int64
+}
+
+type RelayRoleMembership struct {
+	Pubkey            string
+	Role              string
+	UrlKey            string
+	SourceKind        int32
+	DTag              string
+	EndpointUrl       string
+	EndpointType      string
+	SourceEventID     string
+	CreatedAt         int64
+	DeclarationSource string
+	Marker            string
+	PublicSafe        bool
+	UpdatedAt         pgtype.Timestamptz
+}
+
+type RelayRoleStat struct {
+	UrlKey         string
+	Role           string
+	EndpointUrl    string
+	EndpointType   string
+	DistinctUsers  int64
+	TrustWeighted  float64
+	ActiveUsers    int64
+	ModernUsers    int64
+	LegacyUsers    int64
+	NetUserDelta7d int64
+	ComputedAt     pgtype.Timestamptz
 }
 
 // Generic homepage-window snapshot store keyed by snapshot_label. Despite the historical name, hosts snapshots for relay summary, note volume / active authors, top languages, and top hashtags. Refreshed every few minutes by derivation.RefreshRelayWindowSnapshots — see internal/derivation/projection_relay_window_snapshots.go.

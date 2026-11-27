@@ -1,0 +1,347 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/nostrmash/nostrmash/internal/metrics"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
+)
+
+func (h Handlers) GetRelayRoles(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	svc, ok := h.relayIntelService(w, r)
+	if !ok {
+		metrics.ObserveRelayIntelRequest("roles", "disabled", time.Since(started).Seconds())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"algorithm": relayintel.AlgorithmVersion,
+		"tie_break": relayintel.TieBreak,
+		"roles":     svc.Roles(),
+	})
+	metrics.ObserveRelayIntelRequest("roles", "ok", time.Since(started).Seconds())
+}
+
+func (h Handlers) GetRelayRankings(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "rankings", func(svc *relayintel.Service) (any, error) {
+		role := strings.TrimSpace(r.URL.Query().Get("role"))
+		if role == "" {
+			return nil, input("role is required")
+		}
+		limit := 20
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 50 {
+				return nil, input("limit must be from 1 to 50")
+			}
+			limit = parsed
+		}
+		return svc.Rankings(r.Context(), role, limit)
+	})
+}
+
+func (h Handlers) GetRelayCapabilities(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "capabilities", func(svc *relayintel.Service) (any, error) {
+		relayURL := strings.TrimSpace(r.URL.Query().Get("relay_url"))
+		if relayURL == "" {
+			return nil, input("relay_url is required")
+		}
+		return svc.Capabilities(r.Context(), relayURL)
+	})
+}
+
+func (h Handlers) GetProfileRelayConfig(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "config", func(svc *relayintel.Service) (any, error) {
+		pubkey, ok := normalizePubkeyParam(r.PathValue("pubkey"))
+		if !ok {
+			return nil, input("pubkey must be 64 hex characters or an npub")
+		}
+		return svc.Config(r.Context(), pubkey)
+	})
+}
+
+func (h Handlers) GetProfileRelayDiagnostics(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "diagnostics", func(svc *relayintel.Service) (any, error) {
+		pubkey, ok := normalizePubkeyParam(r.PathValue("pubkey"))
+		if !ok {
+			return nil, input("pubkey must be 64 hex characters or an npub")
+		}
+		return svc.Diagnostics(r.Context(), pubkey)
+	})
+}
+
+func (h Handlers) GetProfileRelayRecommendations(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "recommendations", func(svc *relayintel.Service) (any, error) {
+		pubkey, ok := normalizePubkeyParam(r.PathValue("pubkey"))
+		if !ok {
+			return nil, input("pubkey must be 64 hex characters or an npub")
+		}
+		return svc.Recommendations(r.Context(), pubkey, strings.TrimSpace(r.URL.Query().Get("role")), strings.TrimSpace(r.URL.Query().Get("preset")))
+	})
+}
+
+func (h Handlers) PostRelayOptimize(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	if err := h.optimizeGate.acquire(r.Context()); err != nil {
+		if errors.Is(err, errOptimizeOverloaded) {
+			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Cache-Control", "no-store")
+			writeError(r.Context(), w, http.StatusServiceUnavailable, "overloaded", "relay optimization is busy, retry shortly")
+			metrics.ObserveRelayIntelRequest("optimize", "rejected", time.Since(started).Seconds())
+			return
+		}
+		metrics.ObserveRelayIntelRequest("optimize", "cancelled", time.Since(started).Seconds())
+		return
+	}
+	defer h.optimizeGate.release()
+	h.serveRelayIntel(w, r, "optimize", func(svc *relayintel.Service) (any, error) {
+		var body relayOptimizeRequest
+		if err := decodeRelayIntelBody(w, r, &body); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(body.Pubkey) == "" {
+			return nil, input("pubkey is required")
+		}
+		pubkey, ok := normalizePubkeyParam(body.Pubkey)
+		if !ok {
+			return nil, input("pubkey must be 64 hex characters or an npub")
+		}
+		req := relayintel.PlanRequest{
+			Pubkey:        pubkey,
+			Preset:        body.Preset,
+			Roles:         body.Roles,
+			Supplied:      make([]relayintel.SuppliedRelay, 0, len(body.Supplied)),
+			SourceEvents:  body.SourceEvents,
+			AllowCreate:   body.AllowCreate,
+			AllowRecreate: body.AllowRecreate,
+		}
+		if body.Constraints != nil {
+			req.Constraints = constraintFromRequest(*body.Constraints)
+		}
+		for _, item := range body.Supplied {
+			req.Supplied = append(req.Supplied, relayintel.SuppliedRelay{Role: item.Role, URL: item.URL})
+		}
+		return svc.Optimize(r.Context(), req)
+	})
+}
+
+func (h Handlers) PostRelayVerify(w http.ResponseWriter, r *http.Request) {
+	h.serveRelayIntel(w, r, "verify", func(svc *relayintel.Service) (any, error) {
+		var body struct {
+			Event  json.RawMessage `json:"event"`
+			Relays []string        `json:"relays"`
+		}
+		if err := decodeRelayIntelBody(w, r, &body); err != nil {
+			return nil, err
+		}
+		if len(body.Event) == 0 {
+			return nil, input("event is required")
+		}
+		return svc.Verify(r.Context(), body.Event, body.Relays)
+	})
+}
+
+type relayOptimizeRequest struct {
+	Pubkey        string                  `json:"pubkey"`
+	Preset        string                  `json:"preset"`
+	Roles         []string                `json:"roles"`
+	Constraints   *relayConstraintRequest `json:"constraints"`
+	Supplied      []relaySuppliedRequest  `json:"supplied_relays"`
+	SourceEvents  []json.RawMessage       `json:"source_events"`
+	AllowCreate   bool                    `json:"allow_create"`
+	AllowRecreate bool                    `json:"allow_recreate"`
+}
+
+type relayConstraintRequest struct {
+	Max                     map[string]int                 `json:"max"`
+	Min                     map[string]int                 `json:"min"`
+	Pinned                  []string                       `json:"pinned"`
+	Excluded                []string                       `json:"excluded"`
+	Preferred               []string                       `json:"preferred"`
+	Custom                  []string                       `json:"custom"`
+	PaidAccess              []string                       `json:"paid_access"`
+	FreeOnly                bool                           `json:"free_only"`
+	AuthRead                string                         `json:"auth_read"`
+	AuthWrite               string                         `json:"auth_write"`
+	MinReliability          float64                        `json:"min_reliability"`
+	MinCapabilityConfidence float64                        `json:"min_capability_confidence"`
+	Diversity               *float64                       `json:"diversity"`
+	RequireDiversity        bool                           `json:"require_operator_diversity"`
+	RequireVerifiedPrivacy  bool                           `json:"require_verified_privacy"`
+	RetainExisting          *bool                          `json:"retain_existing"`
+	Weights                 *relayintel.Weights            `json:"weights"`
+	Global                  *relayConstraintRequest        `json:"global"`
+	ByRole                  map[string]relayRoleConstraint `json:"by_role"`
+}
+
+type relayRoleConstraint struct {
+	Max                     *int                `json:"max"`
+	Min                     *int                `json:"min"`
+	Pinned                  *[]string           `json:"pinned"`
+	Excluded                *[]string           `json:"excluded"`
+	Preferred               *[]string           `json:"preferred"`
+	Custom                  *[]string           `json:"custom"`
+	PaidAccess              *[]string           `json:"paid_access"`
+	FreeOnly                *bool               `json:"free_only"`
+	AuthRead                string              `json:"auth_read"`
+	AuthWrite               string              `json:"auth_write"`
+	MinReliability          *float64            `json:"min_reliability"`
+	MinCapabilityConfidence *float64            `json:"min_capability_confidence"`
+	Diversity               *float64            `json:"diversity"`
+	RequireDiversity        *bool               `json:"require_operator_diversity"`
+	RequireVerifiedPrivacy  *bool               `json:"require_verified_privacy"`
+	RetainExisting          *bool               `json:"retain_existing"`
+	Weights                 *relayintel.Weights `json:"weights"`
+}
+
+func constraintFromRequest(body relayConstraintRequest) relayintel.Constraints {
+	if body.Global != nil {
+		merged := *body.Global
+		if merged.Max == nil {
+			merged.Max = body.Max
+		}
+		if merged.Min == nil {
+			merged.Min = body.Min
+		}
+		if merged.Pinned == nil {
+			merged.Pinned = body.Pinned
+		}
+		if merged.Excluded == nil {
+			merged.Excluded = body.Excluded
+		}
+		if merged.Preferred == nil {
+			merged.Preferred = body.Preferred
+		}
+		if merged.Custom == nil {
+			merged.Custom = body.Custom
+		}
+		if merged.PaidAccess == nil {
+			merged.PaidAccess = body.PaidAccess
+		}
+		if body.FreeOnly {
+			merged.FreeOnly = true
+		}
+		if merged.AuthRead == "" {
+			merged.AuthRead = body.AuthRead
+		}
+		if merged.AuthWrite == "" {
+			merged.AuthWrite = body.AuthWrite
+		}
+		merged.ByRole = body.ByRole
+		body = merged
+	}
+	out := relayintel.Constraints{
+		Max:                     body.Max,
+		Min:                     body.Min,
+		Pinned:                  body.Pinned,
+		Excluded:                body.Excluded,
+		Preferred:               body.Preferred,
+		Custom:                  body.Custom,
+		PaidAccess:              body.PaidAccess,
+		FreeOnly:                body.FreeOnly,
+		AuthRead:                body.AuthRead,
+		AuthWrite:               body.AuthWrite,
+		MinReliability:          body.MinReliability,
+		MinCapabilityConfidence: body.MinCapabilityConfidence,
+		Diversity:               body.Diversity,
+		RequireDiversity:        body.RequireDiversity,
+		RequireVerifiedPrivacy:  body.RequireVerifiedPrivacy,
+		RetainExisting:          body.RetainExisting,
+	}
+	if body.Weights != nil {
+		out.Weights = *body.Weights
+		out.HasWeights = true
+	}
+	if len(body.ByRole) > 0 {
+		out.ByRole = map[string]relayintel.RoleConstraints{}
+		for role, item := range body.ByRole {
+			out.ByRole[role] = relayintel.RoleConstraints{
+				Max: item.Max, Min: item.Min, Pinned: item.Pinned, Excluded: item.Excluded,
+				Preferred: item.Preferred, Custom: item.Custom, PaidAccess: item.PaidAccess,
+				FreeOnly: item.FreeOnly, AuthRead: item.AuthRead, AuthWrite: item.AuthWrite,
+				MinReliability: item.MinReliability, MinCapabilityConfidence: item.MinCapabilityConfidence,
+				Diversity: item.Diversity, RequireDiversity: item.RequireDiversity, RequireVerifiedPrivacy: item.RequireVerifiedPrivacy, RetainExisting: item.RetainExisting, Weights: item.Weights,
+			}
+		}
+	}
+	return out
+}
+
+type relaySuppliedRequest struct {
+	Role string `json:"role"`
+	URL  string `json:"url"`
+}
+
+func (h Handlers) serveRelayIntel(w http.ResponseWriter, r *http.Request, endpoint string, fn func(*relayintel.Service) (any, error)) {
+	if endpoint == "optimize" || endpoint == "verify" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("CDN-Cache-Control", "no-store")
+	}
+	started := time.Now()
+	svc, ok := h.relayIntelService(w, r)
+	if !ok {
+		metrics.ObserveRelayIntelRequest(endpoint, "disabled", time.Since(started).Seconds())
+		return
+	}
+	payload, err := fn(svc)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			metrics.ObserveRelayIntelRequest(endpoint, "cancelled", time.Since(started).Seconds())
+			return
+		}
+		h.writeRelayIntelError(w, r, err)
+		metrics.ObserveRelayIntelRequest(endpoint, "error", time.Since(started).Seconds())
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+	metrics.ObserveRelayIntelRequest(endpoint, "ok", time.Since(started).Seconds())
+}
+
+func (h Handlers) relayIntelService(w http.ResponseWriter, r *http.Request) (*relayintel.Service, bool) {
+	if h.relayIntel == nil {
+		writeError(r.Context(), w, http.StatusNotFound, "feature_disabled", "relay intelligence is disabled")
+		return nil, false
+	}
+	return h.relayIntel, true
+}
+
+func (h Handlers) writeRelayIntelError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, relayintel.ErrNotReady):
+		writeError(r.Context(), w, http.StatusServiceUnavailable, "schema_not_ready", "relay intelligence tables are not migrated")
+	case errors.Is(err, relayintel.ErrInvalidInput), errors.Is(err, errRelayIntelInput):
+		message := strings.TrimPrefix(err.Error(), relayintel.ErrInvalidInput.Error()+": ")
+		message = strings.TrimPrefix(message, errRelayIntelInput.Error()+": ")
+		writeError(r.Context(), w, http.StatusBadRequest, "invalid_request", message)
+	default:
+		writeInternalError(r.Context(), w, err)
+	}
+}
+
+var errRelayIntelInput = errors.New("invalid relay intelligence input")
+
+func input(message string) error {
+	return fmt.Errorf("%w: %s", errRelayIntelInput, message)
+}
+
+func decodeRelayIntelBody(w http.ResponseWriter, r *http.Request, dest any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dest); err != nil {
+		return input("request body is invalid or larger than 64KB")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return input("request body must be one JSON object")
+	}
+	return nil
+}

@@ -222,7 +222,7 @@ func TestEvaluateGate_AuthorGatedProductKinds(t *testing.T) {
 	trusted := &fakeTrustedAuthors{loaded: true, members: map[string]struct{}{"alice": {}}}
 	enforce := newGateProcessor(t, TrustGateModeTrustedOnly, trusted, &fakeTargetChecker{})
 
-	for _, kind := range []int{4, 5, 20, 21, 22, 1984, 9802, 10000, 10001, 10003, 10019, 10050, 30000, 30023, 30311, 34235, 34236} {
+	for _, kind := range []int{4, 5, 20, 21, 22, 1984, 9802, 10000, 10001, 10003, 10013, 10019, 10050, 10051, 10102, 30000, 30023, 30311, 34235, 34236} {
 		if d := enforce.evaluateGate(context.Background(), kind, "alice", nil, ""); !d.accept || d.decision != gateDecisionAccept {
 			t.Fatalf("kind %d trusted author: expected accept, got %+v", kind, d)
 		}

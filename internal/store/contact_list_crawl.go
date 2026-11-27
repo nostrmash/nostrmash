@@ -487,7 +487,7 @@ func (s *PostgresStore) latestAuthorKindRaw(ctx context.Context, pubkey string, 
 		SELECT raw_json::text
 		FROM events
 		WHERE pubkey = $1 AND kind = $2
-		ORDER BY created_at DESC, id DESC
+		ORDER BY created_at DESC, id ASC
 		LIMIT 1
 	`, pubkey, kind).Scan(&raw)
 	if err != nil {

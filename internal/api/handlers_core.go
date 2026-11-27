@@ -14,6 +14,7 @@ import (
 	"github.com/nostrmash/nostrmash/internal/logging"
 	"github.com/nostrmash/nostrmash/internal/metrics"
 	"github.com/nostrmash/nostrmash/internal/query"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 	"github.com/nostrmash/nostrmash/internal/store/failure"
 	"github.com/nostrmash/nostrmash/internal/traceutil"
 	"github.com/nostrmash/nostrmash/internal/transport/httpx"
@@ -57,6 +58,8 @@ type Handlers struct {
 	hydration             config.HydrationConfig
 	hydrationLimiter      *minuteRateLimiter
 	relayCatalogFreshness time.Duration
+	relayIntel            *relayintel.Service
+	optimizeGate          *optimizeGate
 }
 
 var apiErrLog = logging.New("api")
@@ -69,6 +72,7 @@ type HandlersOptions struct {
 	CacheLookupObserver   cacheLookupObserver
 	Hydration             config.HydrationConfig
 	RelayCatalogFreshness time.Duration
+	RelayIntel            config.RelayIntelConfig
 }
 
 func NewHandlers(reader EventReader, maxBatchSize int) (Handlers, error) {
@@ -110,6 +114,14 @@ func NewHandlersWithOptions(reader EventReader, options HandlersOptions) (Handle
 	if catalogFreshness <= 0 {
 		catalogFreshness = time.Hour
 	}
+	var relayIntelService *relayintel.Service
+	var optimizeGate *optimizeGate
+	if options.RelayIntel.Enabled && options.Pool != nil {
+		relayIntelService = relayintel.NewService(options.Pool, relayintel.Options{
+			AllowPrivateNetwork: options.RelayIntel.AllowPrivateNetwork,
+		})
+		optimizeGate = newOptimizeGate(options.RelayIntel.OptimizeConcurrency)
+	}
 	return Handlers{
 		service:               service,
 		pool:                  options.Pool,
@@ -122,6 +134,8 @@ func NewHandlersWithOptions(reader EventReader, options HandlersOptions) (Handle
 		hydration:             options.Hydration,
 		hydrationLimiter:      hydrationLimiter,
 		relayCatalogFreshness: catalogFreshness,
+		relayIntel:            relayIntelService,
+		optimizeGate:          optimizeGate,
 	}, nil
 }
 

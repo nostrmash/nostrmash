@@ -13,6 +13,7 @@ This is the docs hub for NostrMash. Use the top-level [`README.md`](../README.md
 | Integrating with the API | [api.md](api.md) | [openapi.yaml](openapi.yaml) |
 | Changing compatibility behavior | [primal_compatibility_matrix.md](primal_compatibility_matrix.md) | [compatibility_rollout.md](compatibility_rollout.md) |
 | Planning trust and ranking work | [architecture/trust-subsystem.md](architecture/trust-subsystem.md) | [architecture/trust-bounded-ingest.md](architecture/trust-bounded-ingest.md) |
+| Relay roles and recommendations | [architecture/relay-intelligence.md](architecture/relay-intelligence.md) | [openapi.yaml](openapi.yaml) |
 | Bounding storage / post-wipe setup | [architecture/trust-bounded-ingest.md](architecture/trust-bounded-ingest.md) | [operations.md#trust-bounded-ingest-rollout](operations.md#trust-bounded-ingest-rollout) |
 | Extending trust policy safely | [architecture/trust-policy-boundaries.md](architecture/trust-policy-boundaries.md) | [hotspot-watchlist.md](hotspot-watchlist.md) |
 | Contributing safely | [../CONTRIBUTING.md](../CONTRIBUTING.md) | [testing.md](testing.md) |
@@ -75,6 +76,7 @@ Each topic has one canonical home:
 | Maintainability hotspot watchlist | [hotspot-watchlist.md](hotspot-watchlist.md) |
 | Trust subsystem design | [architecture/trust-subsystem.md](architecture/trust-subsystem.md) |
 | Trust-bounded ingest and engagement retention | [architecture/trust-bounded-ingest.md](architecture/trust-bounded-ingest.md) |
+| Relay intelligence and recommendations | [architecture/relay-intelligence.md](architecture/relay-intelligence.md) |
 | Trust policy boundaries and review guardrails | [architecture/trust-policy-boundaries.md](architecture/trust-policy-boundaries.md) |
 
 ## Notes

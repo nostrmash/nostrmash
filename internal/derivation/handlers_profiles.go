@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// The profile write below is conditional on the captured winner still being
+// canonical. A slower worker must not publish the snapshot it read after a
+// newer winner has been projected.
+
 func (h *Handlers) ProjectProfilesLatest(ctx context.Context, eventID string) error {
 	return h.projectProfilesLatestWithVersion(ctx, eventID, nil)
 }
@@ -34,32 +38,23 @@ func (h *Handlers) projectProfilesLatestWithVersion(ctx context.Context, eventID
 		return nil
 	}
 
-	type metadataWinner struct {
-		EventID   string
-		CreatedAt int64
-		Content   string
-	}
-	var winner metadataWinner
-	err = h.pool.QueryRow(ctx, `
-		SELECT id, created_at, content
-		FROM events
-		WHERE pubkey = $1
-		  AND kind = 0
-		ORDER BY created_at DESC, id DESC
-		LIMIT 1
-	`, pubkey).Scan(&winner.EventID, &winner.CreatedAt, &winner.Content)
+	winnerID, winnerCreatedAt, winnerContent, found, err := loadAuthoritativeReplaceable(ctx, h.pool, pubkey, 0, "")
 	if err != nil {
 		return fmt.Errorf("load latest metadata event: %w", err)
 	}
+	if !found {
+		return nil
+	}
+	runProjectionReadBarrier(winnerID)
 
 	profileJSON := json.RawMessage(`{}`)
 	var profileName string
 	var profileDisplayName string
 	var profileAbout string
 	var profileNIP05 string
-	if strings.TrimSpace(winner.Content) != "" {
+	if strings.TrimSpace(winnerContent) != "" {
 		var profile map[string]any
-		if err := json.Unmarshal([]byte(winner.Content), &profile); err == nil {
+		if err := json.Unmarshal([]byte(winnerContent), &profile); err == nil {
 			encoded, marshalErr := json.Marshal(profile)
 			if marshalErr == nil {
 				profileJSON = encoded
@@ -89,12 +84,16 @@ func (h *Handlers) projectProfilesLatestWithVersion(ctx context.Context, eventID
 		return err
 	}
 
+	if _, err = tx.Exec(ctx, `SELECT relay_intel_lock_coordinate($1, 0, '')`, pubkey); err != nil {
+		return fmt.Errorf("lock profile coordinate: %w", err)
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO profiles_latest (
 			pubkey, metadata_event_id, metadata_created_at, profile_json,
 			name, display_name, about, nip05, derivation_version
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+		WHERE relay_intel_may_project($1, 0, '', $2, $3, NULL::text, NULL::bigint)
 		ON CONFLICT (pubkey) DO UPDATE
 		SET metadata_event_id = EXCLUDED.metadata_event_id,
 		    metadata_created_at = EXCLUDED.metadata_created_at,
@@ -105,10 +104,14 @@ func (h *Handlers) projectProfilesLatestWithVersion(ctx context.Context, eventID
 		    nip05 = EXCLUDED.nip05,
 		    derivation_version = EXCLUDED.derivation_version,
 		    updated_at = now()
+		WHERE relay_intel_may_project(
+		    EXCLUDED.pubkey, 0, '', EXCLUDED.metadata_event_id, EXCLUDED.metadata_created_at,
+		    profiles_latest.metadata_event_id, profiles_latest.metadata_created_at
+		)
 	`,
 		pubkey,
-		winner.EventID,
-		winner.CreatedAt,
+		winnerID,
+		winnerCreatedAt,
 		profileJSON,
 		profileName,
 		profileDisplayName,

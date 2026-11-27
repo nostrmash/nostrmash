@@ -601,7 +601,15 @@ func (q *Queries) PurgeStaleTrustedProfileDiscoveryCandidates(ctx context.Contex
 }
 
 const purgeSupersededReplaceableEvents = `-- name: PurgeSupersededReplaceableEvents :execrows
-WITH gone AS (
+WITH unqueue_winners AS (
+    DELETE FROM replaceable_event_purge p
+    WHERE EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+    )
+    RETURNING p.event_id
+),
+gone AS (
     SELECT p.event_id
     FROM replaceable_event_purge p
     WHERE NOT EXISTS (
@@ -621,12 +629,63 @@ candidates AS (
     WHERE e.kind = ANY($2::int[])
       AND e.first_seen_at < $3
       AND NOT EXISTS (
+        SELECT 1 FROM replaceable_state rs
+        WHERE rs.event_id = p.event_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM unqueue_winners uw
+        WHERE uw.event_id = p.event_id
+      )
+      AND NOT EXISTS (
         SELECT 1
         FROM jobs j
         WHERE j.idempotency_key = 'derive_event_bundle:' || e.id
           AND (
             j.status IN ('pending', 'running')
             OR (j.status = 'dead' AND j.updated_at > $4)
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM replaceable_state rs
+        WHERE rs.pubkey = e.pubkey
+          AND rs.kind = e.kind
+          AND rs.d_tag = CASE
+                WHEN e.kind >= 30000 AND e.kind < 40000 THEN COALESCE((
+                    SELECT et.value
+                    FROM event_tags et
+                    WHERE et.event_id = e.id
+                      AND et.tag_name = 'd'
+                      AND et.value_index = 0
+                    ORDER BY et.tag_index ASC
+                    LIMIT 1
+                ), '')
+                ELSE ''
+              END
+          AND rs.created_at = e.created_at
+          AND rs.event_id > e.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM relay_intel_repairs repair
+        WHERE repair.winner_event_id = e.id
+          AND repair.status IN ('pending', 'queued', 'running')
+          AND (
+            EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+                  AND rs.event_id IN (repair.winner_event_id, repair.loser_event_id)
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM replaceable_state rs
+                WHERE rs.pubkey = repair.pubkey
+                  AND rs.kind = repair.kind
+                  AND rs.d_tag = repair.d_tag
+            )
           )
       )
     ORDER BY p.created_at ASC, p.event_id ASC
@@ -653,7 +712,8 @@ type PurgeSupersededReplaceableEventsParams struct {
 // displaces the current winner, and when a losing version is derived. Cost follows the queued
 // backlog, not the size of events. The queue has no foreign key, so this
 // statement removes both the event and its queue row. gone drops ids whose
-// event was deleted by something else.
+// event was deleted by something else. A queued id that is the current
+// replaceable_state winner is removed from the queue and is not deleted.
 func (q *Queries) PurgeSupersededReplaceableEvents(ctx context.Context, arg PurgeSupersededReplaceableEventsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, purgeSupersededReplaceableEvents,
 		arg.RowLimit,

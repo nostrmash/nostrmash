@@ -49,6 +49,7 @@ services:
     command: ["/app/migrate"]
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      PGOPTIONS: ${MIGRATE_PGOPTIONS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ENVIRONMENT: ${ENVIRONMENT:-production}
   meilisearch:

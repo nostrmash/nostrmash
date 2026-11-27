@@ -9,6 +9,7 @@ import (
 	"github.com/nostrmash/nostrmash/internal/config"
 	"github.com/nostrmash/nostrmash/internal/jobs"
 	"github.com/nostrmash/nostrmash/internal/relaycontrol"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 	"github.com/nostrmash/nostrmash/internal/relayregistry"
 	"github.com/nostrmash/nostrmash/internal/runtimebootstrap"
 )
@@ -293,6 +294,31 @@ func RunLifecycle(ctx context.Context, log Logger, cfg config.WorkerConfig, boot
 		registryStore := relayregistry.NewStore(bootstrap.Pool)
 		registryController := relaycontrol.NewController(slogLogger, registryStore, bootstrap.Pool, cfg.RelayRegistry)
 		spawn(registryController.RunRefreshLoop)
+	}
+	if bootstrap.Pool != nil {
+		repairBatch := cfg.RelayIntel.BackfillBatch
+		spawn(func(c context.Context) {
+			relayintel.RunCanonicalRepair(c, log, bootstrap.Pool, repairBatch)
+		})
+	}
+	if cfg.RelayIntel.Enabled && (cfg.RelayIntel.StatsEnabled || cfg.RelayIntel.BackfillEnabled || cfg.RelayIntel.ActiveProbes) {
+		intelCfg := cfg.RelayIntel
+		spawn(func(c context.Context) {
+			relayintel.RunMaintenance(c, log, bootstrap.Pool, relayintel.MaintenanceConfig{
+				StatsEnabled:        intelCfg.StatsEnabled,
+				StatsInterval:       intelCfg.StatsInterval,
+				BackfillEnabled:     intelCfg.BackfillEnabled,
+				BackfillBatch:       intelCfg.BackfillBatch,
+				BackfillInterval:    intelCfg.BackfillInterval,
+				ActiveProbes:        intelCfg.ActiveProbes,
+				ProbeSecretKey:      intelCfg.ProbeSecretKey,
+				AllowPrivateNetwork: intelCfg.AllowPrivateNetwork,
+				GiftwrapProbes:      intelCfg.GiftwrapProbes,
+				ProbeAllowlist:      intelCfg.ProbeAllowlist,
+				ProbeGlobalPerHour:  intelCfg.ProbeGlobalPerHour,
+				ProbeMinInterval:    intelCfg.ProbeMinInterval,
+			})
+		})
 	}
 	const (
 		pollInterval = 1 * time.Second

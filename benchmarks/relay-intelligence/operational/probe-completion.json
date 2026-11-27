@@ -1,0 +1,179 @@
+{
+  "commit": "e08c441f8cbef2b299a3af4459813c79886a4609",
+  "completion_digest": {
+    "algorithm": "sha256 of the canonical completion JSON, including observation order after sorting",
+    "giftwrap_sample_row_bytes": 1064,
+    "hash_is_64_hex": true,
+    "hash_iterations": 1000,
+    "hash_per_call": "1.344µs",
+    "hash_wall_ms": 1.344,
+    "note": "hash_wall_ms times resultDigest only, with no SQL. stored_hex_bytes is the digest commitProbeResult wrote for the public-write completion. Identical replay carries that digest. A same-status submission with a different observation does not.",
+    "stored_column_bytes": 65,
+    "stored_hex_bytes": 64,
+    "stored_nonempty": true
+  },
+  "completion_path_note": "public_write and search use publishProbe, which stamps the observation time and then calls commitProbeResult. Gift-wrap, retention, replay, same-status conflict, expiry, and concurrent completion call commitProbeResult directly. Neither path dials a relay. result_digest is the sha256 stored by that commit.",
+  "concurrent_completion": {
+    "accepted": true,
+    "already_completed": 7,
+    "committed": 1,
+    "errors": [],
+    "latencies_ms": [
+      6.619,
+      9.072,
+      9.974,
+      11.362,
+      10.033,
+      10.956,
+      11.348,
+      9.11
+    ],
+    "note": "All eight submissions use one observation time and the same writes. One commit is authoritative. The other seven must match that digest.",
+    "outcomes": [
+      "committed",
+      "already_completed",
+      "already_completed",
+      "already_completed",
+      "already_completed",
+      "already_completed",
+      "already_completed",
+      "already_completed"
+    ],
+    "path": "commitProbeResult",
+    "sample_rows": 1,
+    "wall_ms": 12.183,
+    "workers": 8
+  },
+  "conflicting_completion": {
+    "accepted": true,
+    "error": "conflicting probe result for 7462feab-4cd3-4025-a0d2-39c9210f56cc: stored finished",
+    "outcome": "error",
+    "path": "commitProbeResult",
+    "wall_ms": 0.767
+  },
+  "core_commit": "31df4c808129f633593d7bcd605cb178dad40727",
+  "core_incorporated": false,
+  "evidence_history": {
+    "aggregated": true,
+    "capability": "write_accept",
+    "recent_successes": 1,
+    "recent_window": 1,
+    "url_key": "wss://write-finish.bench.example"
+  },
+  "expired_lease_completion": {
+    "accepted": true,
+    "error": "probe lease 763c274b-f98f-4f4a-9f88-e7ecdc70de04 cannot publish evidence",
+    "outcome": "error",
+    "path": "commitProbeResult",
+    "sample_rows": 0,
+    "wall_ms": 0.873
+  },
+  "generated_at": "2026-11-26T21:21:59Z",
+  "giftwrap_completion": {
+    "accepted": true,
+    "error": "",
+    "outcome": "committed",
+    "path": "commitProbeResult",
+    "private_evidence_version": 2,
+    "sample_rows": 7,
+    "wall_ms": 11.861
+  },
+  "identical_completion_replay": {
+    "accepted": true,
+    "error": "",
+    "first_error": "",
+    "first_outcome": "committed",
+    "outcome": "already_completed",
+    "path": "commitProbeResult",
+    "sample_rows": 1,
+    "wall_ms": 1.503
+  },
+  "implementation_commit": "caaef7b2ad005ca56c17ecf288c72d9f169f58b3",
+  "public_write_completion": {
+    "accepted": true,
+    "attempt_status": "finished",
+    "digest_bytes": 64,
+    "digest_nonempty": true,
+    "error": "",
+    "finished": true,
+    "lease_rows": 0,
+    "path": "publishProbe",
+    "wall_ms": 9.985
+  },
+  "retention_followup_claim": {
+    "obtained": true,
+    "url": "wss://schedule.bench.example",
+    "wall_ms": 4.626
+  },
+  "retention_followup_completion": {
+    "accepted": true,
+    "error": "",
+    "finished": true,
+    "outcome": "committed",
+    "path": "commitProbeResult",
+    "status": "completed",
+    "wall_ms": 3.177
+  },
+  "retention_followup_scheduling": {
+    "accepted": true,
+    "error": "",
+    "outcome": "committed",
+    "path": "commitProbeResult",
+    "pending_rows": 1,
+    "wall_ms": 3.657
+  },
+  "same_status_conflicting_completion": {
+    "accepted": true,
+    "error": "conflicting probe result for 06275e46-6eb9-4fbb-a1f2-948efc79cbff: stored finished",
+    "first_error": "",
+    "first_outcome": "committed",
+    "outcome": "error",
+    "path": "commitProbeResult",
+    "sample_rows": 1,
+    "wall_ms": 0.928
+  },
+  "schema": "bench_ri_1795728118484762000",
+  "scope": "Atomic completion on an empty disposable schema. This is not the account-scale benchmark.",
+  "search_completion": {
+    "accepted": true,
+    "error": "",
+    "path": "publishProbe",
+    "sample_rows": 1,
+    "wall_ms": 2.651
+  },
+  "structured_privacy_read": {
+    "access_paths": [
+      {
+        "authenticated": true,
+        "confidence": 0.7,
+        "freshness": "fresh",
+        "name": "recipient_exact",
+        "observed_at": "2026-11-26T23:21:59.091175+02:00",
+        "retrieved": true,
+        "status": "verified"
+      }
+    ],
+    "assessment": "recipient_only_verified",
+    "assessment_is_recipient_only": true,
+    "authenticated_observer_exposure": false,
+    "comprehensive": true,
+    "confidence": 0.8,
+    "error": "",
+    "evidence_version": 2,
+    "exposure_confirmed": false,
+    "exposure_observed_at": "2026-11-26T23:21:59.091175+02:00",
+    "exposure_unresolved": false,
+    "freshness": "fresh",
+    "gift_wrap_accepted": true,
+    "private_observed_at": "2026-11-26T23:21:59.091175+02:00",
+    "publication_auth_verified": null,
+    "read_error": "",
+    "read_wall_ms": 3.773,
+    "recipient_auth_verified": null,
+    "recipient_exact_verified": true,
+    "recipient_retrieval_verified": true,
+    "recipient_tag_verified": null,
+    "stale": false,
+    "unauthenticated_exposure": false
+  }
+}

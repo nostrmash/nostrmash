@@ -334,6 +334,25 @@ Primal compatibility gateway:
 - `nostrmash_primal_ws_requests_total{dialect,funcall,request_kind,outcome}`
 - `nostrmash_primal_ws_request_duration_seconds{request_kind}`
 
+Relay intelligence:
+
+- `nostrmash_relay_intel_requests_total{endpoint,outcome}`
+- `nostrmash_relay_intel_request_duration_seconds{endpoint}`
+- `nostrmash_relay_intel_cache_lookups_total{result}`
+- `nostrmash_relay_intel_projection_events_total{kind,outcome}`
+- `nostrmash_relay_intel_declarers{role}`
+- `nostrmash_relay_intel_stats_age_seconds`
+- `nostrmash_relay_intel_backfill_events_total{outcome}`
+- `nostrmash_relay_intel_backfill_done{kind}`
+- `nostrmash_relay_intel_capability_observations_total{capability,status}`
+- `nostrmash_relay_intel_probe_total{class,outcome}`
+- `nostrmash_relay_intel_fallbacks_total{reason}`
+- `nostrmash_relay_intel_membership_integrity_pending`
+- `nostrmash_relay_intel_optimize_admission_total{result}`
+- `nostrmash_relay_intel_optimize_in_flight`
+
+`endpoint`, `role`, `kind`, `capability`, `class`, and `outcome` are fixed vocabularies. Pubkeys and relay URLs are not labels. See [architecture/relay-intelligence.md](architecture/relay-intelligence.md).
+
 Cardinality policy:
 
 - Route labels use path templates (not raw URLs).
