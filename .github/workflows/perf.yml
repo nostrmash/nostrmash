@@ -584,6 +584,27 @@ jobs:
             -warmup "${LOADTEST_WARMUP}" -duration "${LOADTEST_DURATION}" \
             -out loadtest/results/ws-api-summary.json
 
+      - name: Smoke test Relay Intelligence routes
+        run: |
+          api=http://localhost:8080
+          fixture=$(jq -cs 'map(.payload) | first' "$LOADTEST_FIXTURE_SOURCE")
+          pubkey=$(jq -r .pubkey <<< "$fixture")
+          curl -fsS "$api/ready" | jq -e '.status == "ready"'
+          curl -fsS "$api/api/v1/relays/roles" | jq -e '.roles | length > 0'
+          curl -fsS "$api/api/v1/relays/rankings?role=public_inbox" | jq -e '.role == "public_inbox"'
+          curl -fsS -G "$api/api/v1/relays/capabilities" --data-urlencode 'relay_url=wss://smoke-relay.example' \
+            | jq -e '.privacy.assessment == "privacy_unknown"'
+          curl -fsS "$api/api/v1/profiles/$pubkey/relay-config" | jq -e --arg pubkey "$pubkey" '.account.pubkey == $pubkey'
+          curl -fsS "$api/api/v1/profiles/$pubkey/relay-diagnostics" | jq -e --arg pubkey "$pubkey" '.pubkey == $pubkey'
+          curl -fsS "$api/api/v1/profiles/$pubkey/relay-recommendations?role=public_inbox" \
+            | jq -e '.roles | length == 1'
+          optimize=$(jq -nc --arg pubkey "$pubkey" '{pubkey: $pubkey, roles: ["public_inbox", "public_outbox"]}')
+          curl -fsS "$api/api/v1/relays/optimize" -H 'Content-Type: application/json' --data "$optimize" \
+            | jq -e '(.roles | length == 2) and (.proposal | has("ready_to_sign"))'
+          verify=$(jq -nc --argjson event "$fixture" '{event: $event, relays: ["wss://smoke-relay.example"]}')
+          curl -fsS "$api/api/v1/relays/verify" -H 'Content-Type: application/json' --data "$verify" \
+            | jq -e '.signature_valid and (.reason == "unsupported_kind") and (.relays[0].outcome == "not_queried")'
+
       - name: Stop API server
         if: always()
         run: bash ./scripts/loadtest_ci_seed.sh stop-api

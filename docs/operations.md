@@ -220,7 +220,7 @@ Role-aware recommendations are on by default after migration `000133_relay_role_
 
 ### Upgrade through migration 000145
 
-`000145_relay_intel_membership_and_retention.sql` adds membership integrity columns and four foreign-key indexes. `cmd/migrate` and boot-time migration apply every pending file inside one transaction. `CREATE INDEX CONCURRENTLY` cannot run there. On a populated database, build the indexes before that transaction so the migration's `CREATE INDEX IF NOT EXISTS` only checks the catalog.
+`000145_relay_intel_membership_and_retention.sql` adds membership integrity columns and four foreign-key indexes. If `000141_relay_intel_repair_lifecycle.sql` is pending, it also adds a lookup index on `replaceable_state`. `cmd/migrate` and boot-time migration apply every pending file inside one transaction. Build the indexes on existing populated tables concurrently before that transaction so the migration only checks the catalog. The migration sequence builds indexes on tables that it creates.
 
 Do not edit `000144` or `000145` after either file has been applied. A checksum mismatch stops migration. Do not renumber them.
 
@@ -233,21 +233,29 @@ Run these on the primary, in the application schema:
 ```sql
 SELECT migration_id, checksum
 FROM schema_migrations_audit
-WHERE migration_id LIKE '%000144%' OR migration_id LIKE '%000145%';
+WHERE migration_id >= 'migrations/000133_'
+  AND migration_id < 'migrations/000152_'
+ORDER BY migration_id;
 
-SELECT c.relname AS index_name, i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS index_def
+SELECT c.relname AS index_name, n.nspname AS table_schema, t.relname AS table_name,
+       i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS index_def
 FROM pg_class c
 JOIN pg_index i ON i.indexrelid = c.oid
-WHERE c.relname IN (
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+WHERE n.nspname = current_schema() AND c.relname IN (
+    'idx_replaceable_state_kind_pubkey',
     'idx_relay_role_memberships_source_event',
     'idx_relay_config_heads_event_id',
     'idx_dm_relay_lists_latest_event_id',
     'idx_nutzap_info_latest_event_id'
 );
 
-SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) AS total
-FROM pg_class
-WHERE relname IN (
+SELECT c.relname, pg_size_pretty(pg_total_relation_size(c.oid)) AS total
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = current_schema() AND c.relname IN (
+    'replaceable_state',
     'relay_role_memberships',
     'relay_config_heads',
     'dm_relay_lists_latest',
@@ -256,10 +264,11 @@ WHERE relname IN (
 );
 ```
 
-Confirm free disk and free WAL space are comfortably larger than the relay-intelligence child tables. A concurrent index build writes the index and its WAL. Finish or roll back `idle in transaction` sessions before building; a concurrent build waits for snapshots those sessions still hold.
+Confirm enough free disk and WAL space to build the indexes on all applicable tables. A concurrent index build writes the index and its WAL. Finish or roll back `idle in transaction` sessions before building; a concurrent build waits for snapshots those sessions still hold.
 
 Expected definitions, all btree and with no predicate:
 
+- `idx_replaceable_state_kind_pubkey` on `replaceable_state (kind, pubkey, d_tag)` when `000141` is pending
 - `idx_relay_role_memberships_source_event` on `relay_role_memberships (source_event_id)`
 - `idx_relay_config_heads_event_id` on `relay_config_heads (event_id)`
 - `idx_dm_relay_lists_latest_event_id` on `dm_relay_lists_latest (event_id)`
@@ -267,7 +276,7 @@ Expected definitions, all btree and with no predicate:
 
 #### 2. Index preparation
 
-For each missing index, outside a transaction:
+For each missing index on an existing populated table, use the matching table and columns outside a transaction. For example:
 
 ```sql
 SET statement_timeout = 0;
@@ -276,19 +285,19 @@ CREATE INDEX CONCURRENTLY idx_relay_role_memberships_source_event
     ON relay_role_memberships (source_event_id);
 ```
 
-Repeat for the other three names and tables. Watch `pg_stat_progress_create_index`. If a build is interrupted, the index remains invalid. Drop that name and build it again:
+Repeat for each applicable name and table. If upgrading from before `000133`, let the migrations create `relay_config_heads` and `relay_role_memberships` with their indexes. Watch `pg_stat_progress_create_index`. If a build is interrupted, the index remains invalid. Drop that name and build it again:
 
 ```sql
 DROP INDEX CONCURRENTLY IF EXISTS idx_relay_role_memberships_source_event;
 ```
 
-Do not start the transactional migration while any of the four indexes is missing, invalid, or defined differently. Drop the wrong one concurrently and recreate it. The migration will not repair an invalid index of the same name.
+Verify each applicable prebuilt index is valid, ready, and exactly matches its expected definition before starting the transactional migration. Correct an invalid or mismatched prebuilt index concurrently before proceeding.
 
 #### 3. Migration execution
 
 Keep `MIGRATE_ON_BOOT=false` on API, worker, and ingestor so they do not open the migration transaction themselves.
 
-Run the new `cmd/migrate` once. With the indexes already valid, `000145` is an `ADD COLUMN` with a constant default (metadata only on PostgreSQL 11+), function replacement, and four no-op index statements. Set a short `lock_timeout` (for example 5 seconds) on that session so a blocked `ACCESS EXCLUSIVE` on `relay_config_heads` fails instead of queueing behind a long writer. `statement_timeout` of a couple of minutes is enough once the indexes exist. If `lock_timeout` fires, the transaction rolls back, `000145` is not recorded, and the concurrent indexes remain.
+Run the new `cmd/migrate` once. In Coolify, the one-shot `migrate` service runs it during deployment. Set `MIGRATE_PGOPTIONS` on that service through Compose interpolation, for example `-c lock_timeout=5s -c statement_timeout=120s` after the index preparation and rehearsal. Check any `options` in `DATABASE_URL`, which takes precedence over `PGOPTIONS`. The short lock timeout bounds how long DDL waits behind a writer. If a timeout fires, the migration transaction rolls back and the prebuilt indexes remain.
 
 #### 4. Worker and API rollout
 

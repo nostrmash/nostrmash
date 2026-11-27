@@ -444,6 +444,9 @@ func dialRelay(ctx context.Context, relayURL string, allowPrivate bool, timeout 
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
+	if conn != nil {
+		conn.SetReadLimit(64 * 1024)
+	}
 	return conn, err
 }
 
@@ -506,6 +509,9 @@ func eventMatchesFilter(event *nostr.Event, filter map[string]any) bool {
 		return false
 	}
 	if tags := stringList(filter["#d"]); len(tags) > 0 && !listHas(tags, firstD(event.Tags)) {
+		return false
+	}
+	if tags := stringList(filter["#p"]); len(tags) > 0 && !hasTagValue(event.Tags, "p", tags) {
 		return false
 	}
 	return true

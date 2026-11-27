@@ -40,6 +40,14 @@ const MigrationAdvisoryLockID int64 = 428871060619501584
 
 // Migrate applies embedded SQL migrations in lexical order and records audit rows.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, appVersion string) error {
+	return MigrateMatching(ctx, pool, appVersion, nil)
+}
+
+// MigrateMatching applies the embedded migrations for which include returns
+// true, in lexical order. A nil include applies every file. Files left out
+// stay pending, so a later Migrate can apply them without rewriting the audit
+// rows of the files that already ran.
+func MigrateMatching(ctx context.Context, pool *pgxpool.Pool, appVersion string, include func(name string) bool) error {
 	entries, err := fs.ReadDir(migrations.Files, ".")
 	if err != nil {
 		return fmt.Errorf("read migrations fs: %w", err)
@@ -82,6 +90,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, appVersion string) error {
 	}
 
 	for _, name := range names {
+		if include != nil && !include(name) {
+			continue
+		}
 		fullID := path.Join("migrations", name)
 		data, err := migrations.Files.ReadFile(name)
 		if err != nil {

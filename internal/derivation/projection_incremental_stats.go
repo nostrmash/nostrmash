@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/nostrmash/nostrmash/internal/relayintel"
 )
 
 // Ledger projection names for applied_stat_deltas. Each event may claim at
@@ -64,6 +65,13 @@ func (h *Handlers) ApplyIncrementalAuthorStats(ctx context.Context, eventID stri
 	// activity rows for that key creates one stats row per wrap and
 	// does not describe a person.
 	if kind == 1059 {
+		return nil
+	}
+	synthetic, err := relayintel.LookupSynthetic(ctx, h.pool, pubkey)
+	if err != nil {
+		return fmt.Errorf("synthetic identity: %w", err)
+	}
+	if synthetic {
 		return nil
 	}
 

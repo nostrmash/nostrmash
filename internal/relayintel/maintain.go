@@ -27,6 +27,7 @@ type MaintenanceConfig struct {
 	ProbeSecretKey      string
 	AllowPrivateNetwork bool
 	GiftwrapProbes      bool
+	ProbeAllowlist      []string
 	ProbeGlobalPerHour  int
 	ProbeMinInterval    time.Duration
 }
@@ -45,17 +46,28 @@ func RunMaintenance(ctx context.Context, log Logger, pool *pgxpool.Pool, cfg Mai
 	var probes *probeState
 	exclude := ""
 	if cfg.ActiveProbes {
-		state, pubkey, err := newProbeState(cfg.ProbeSecretKey, cfg.AllowPrivateNetwork, cfg.ProbeGlobalPerHour, cfg.ProbeMinInterval, cfg.GiftwrapProbes)
+		state, pubkey, err := newProbeState(cfg.ProbeSecretKey, cfg.AllowPrivateNetwork, cfg.ProbeGlobalPerHour, cfg.ProbeMinInterval, cfg.GiftwrapProbes, cfg.ProbeAllowlist)
 		if err != nil {
 			log.Error("relay_intel_probe_disabled", "error", err.Error())
 		} else {
 			probes = state
 			exclude = pubkey
-			log.Info("relay_intel_probe_identity_ready")
+			RememberSynthetic(pubkey)
+			registered := true
+			for _, pub := range []string{pubkey, state.recipientPub, state.observerPub} {
+				if err := registerSyntheticIdentity(ctx, pool, pub); err != nil {
+					log.Error("relay_intel_probe_identity", "error", err.Error())
+					registered = false
+				}
+			}
+			if !registered {
+				probes = nil
+				exclude = ""
+				log.Error("relay_intel_probe_disabled", "error", "synthetic identity registry unavailable")
+			} else {
+				log.Info("relay_intel_probe_identity_ready")
+			}
 		}
-	}
-	if cfg.GiftwrapProbes {
-		log.Error("relay_intel_giftwrap_probes_unimplemented", "error", "NIP-44 gift wrap is not implemented; relays are not marked privacy-verified")
 	}
 	if cfg.BackfillEnabled {
 		if err := ResetProjectionReconcile(ctx, pool); err != nil && !errors.Is(err, ErrNotReady) {
