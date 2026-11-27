@@ -1,0 +1,356 @@
+
+## effective membership one account
+Subquery Scan on "*SELECT* 1"  (cost=0.99..120.88 rows=1 width=22) (actual time=0.028..0.037 rows=3.00 loops=1)
+  Buffers: shared hit=20
+  ->  Nested Loop Anti Join  (cost=0.99..120.87 rows=1 width=259) (actual time=0.028..0.036 rows=3.00 loops=1)
+        Join Filter: (de.target_event_id = h.event_id)
+        Buffers: shared hit=20
+        ->  Nested Loop Anti Join  (cost=0.99..118.35 rows=1 width=152) (actual time=0.023..0.027 rows=3.00 loops=1)
+              Buffers: shared hit=14
+              ->  Nested Loop  (cost=0.84..113.17 rows=1 width=165) (actual time=0.018..0.021 rows=3.00 loops=1)
+                    Join Filter: ((h.source_kind = m.source_kind) AND (h.d_tag = m.d_tag) AND (h.event_id = m.source_event_id))
+                    Rows Removed by Join Filter: 15
+                    Buffers: shared hit=8
+                    ->  Index Scan using relay_config_heads_pkey on relay_config_heads h  (cost=0.42..20.49 rows=4 width=143) (actual time=0.005..0.006 rows=6.00 loops=1)
+                          Index Cond: (pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text)
+                          Filter: (NOT client_side_only)
+                          Index Searches: 1
+                          Buffers: shared hit=4
+                    ->  Materialize  (cost=0.42..92.06 rows=8 width=157) (actual time=0.002..0.002 rows=3.00 loops=6)
+                          Storage: Memory  Maximum Storage: 17kB
+                          Buffers: shared hit=4
+                          ->  Index Scan using idx_relay_role_memberships_pubkey_role on relay_role_memberships m  (cost=0.42..92.02 rows=8 width=157) (actual time=0.006..0.007 rows=3.00 loops=1)
+                                Index Cond: ((pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text) AND (role = 'public_inbox'::text))
+                                Filter: (public_safe AND ((source_kind <> 10051) OR (NOT EXISTS(SubPlan 3))) AND ((source_kind <> 3) OR (role <> ALL ('{public_inbox,public_outbox}'::text[])) OR (NOT EXISTS(SubPlan 1))))
+                                Index Searches: 1
+                                Buffers: shared hit=4
+                                SubPlan 3
+                                  ->  Index Only Scan using relay_config_heads_pkey on relay_config_heads modern_1  (cost=0.42..4.44 rows=1 width=0) (never executed)
+                                        Index Cond: ((pubkey = m.pubkey) AND (source_kind = 10002) AND (d_tag = ''::text))
+                                        Heap Fetches: 0
+                                        Index Searches: 0
+                                SubPlan 1
+                                  ->  Index Only Scan using relay_config_heads_pkey on relay_config_heads modern  (cost=0.42..4.44 rows=1 width=0) (never executed)
+                                        Index Cond: ((pubkey = m.pubkey) AND (source_kind = 10002) AND (d_tag = ''::text))
+                                        Heap Fetches: 0
+                                        Index Searches: 0
+              ->  Index Only Scan using idx_deletion_addresses_coord on deletion_addresses d  (cost=0.15..5.17 rows=1 width=76) (actual time=0.002..0.002 rows=0.00 loops=3)
+                    Index Cond: ((pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text) AND (kind = h.source_kind) AND (d_tag = h.d_tag) AND (created_at >= h.created_at))
+                    Heap Fetches: 0
+                    Index Searches: 3
+                    Buffers: shared hit=6
+        ->  Seq Scan on deletion_events de  (cost=0.00..2.50 rows=1 width=130) (actual time=0.002..0.002 rows=0.00 loops=3)
+              Filter: (deleter_pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text)
+              Rows Removed by Filter: 40
+              Buffers: shared hit=6
+Planning:
+  Buffers: shared hit=34
+Planning Time: 0.717 ms
+Execution Time: 0.075 ms
+
+## canonical head
+Index Scan using relay_config_heads_pkey on relay_config_heads  (cost=0.42..8.44 rows=1 width=67) (actual time=0.005..0.005 rows=1.00 loops=1)
+  Index Cond: ((pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text) AND (source_kind = 10002) AND (d_tag = ''::text))
+  Index Searches: 1
+  Buffers: shared hit=4
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.030 ms
+Execution Time: 0.009 ms
+
+## candidate shortlist
+Limit  (cost=15.39..15.40 rows=4 width=80) (actual time=0.087..0.092 rows=80.00 loops=1)
+  Buffers: shared hit=26
+  ->  Sort  (cost=15.39..15.40 rows=4 width=80) (actual time=0.086..0.088 rows=80.00 loops=1)
+        Sort Key: trust_weighted DESC, distinct_users DESC, url_key
+        Sort Method: top-N heapsort  Memory: 43kB
+        Buffers: shared hit=26
+        ->  Bitmap Heap Scan on relay_role_stats  (cost=4.31..15.35 rows=4 width=80) (actual time=0.016..0.055 rows=241.00 loops=1)
+              Recheck Cond: (role = 'public_inbox'::text)
+              Heap Blocks: exact=23
+              Buffers: shared hit=26
+              ->  Bitmap Index Scan on idx_relay_role_stats_role_users  (cost=0.00..4.31 rows=4 width=0) (actual time=0.012..0.012 rows=241.00 loops=1)
+                    Index Cond: (role = 'public_inbox'::text)
+                    Index Searches: 1
+                    Buffers: shared hit=3
+Planning Time: 0.024 ms
+Execution Time: 0.106 ms
+
+## cohort follows
+Limit  (cost=0.41..8.43 rows=1 width=65) (actual time=0.011..0.146 rows=400.00 loops=1)
+  Buffers: shared hit=659
+  ->  Index Only Scan using idx_follower_edges_follower_followed on follower_edges  (cost=0.41..8.43 rows=1 width=65) (actual time=0.011..0.131 rows=400.00 loops=1)
+        Index Cond: (follower_pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text)
+        Heap Fetches: 718
+        Index Searches: 1
+        Buffers: shared hit=659
+Planning Time: 0.031 ms
+Execution Time: 0.160 ms
+
+## reconcile candidates
+Limit  (cost=0.84..166.50 rows=200 width=70) (actual time=590.477..590.478 rows=0.00 loops=1)
+  Buffers: shared hit=1032278 read=11801 written=183
+  ->  Nested Loop Left Join  (cost=0.84..171766.29 rows=207377 width=70) (actual time=590.477..590.477 rows=0.00 loops=1)
+        Filter: ((h.event_id IS NULL) OR (h.event_id <> rs.event_id) OR h.needs_replay)
+        Rows Removed by Filter: 208226
+        Buffers: shared hit=1032278 read=11801 written=183
+        ->  Index Scan using idx_replaceable_state_kind_pubkey on replaceable_state rs  (cost=0.42..40153.30 rows=207378 width=135) (actual time=0.040..131.010 rows=208226.00 loops=1)
+              Index Cond: (kind = ANY ('{3,10002,10006,10007,10012,10013,10050,10051,10063,10102,30002}'::integer[]))
+              Index Searches: 1
+              Buffers: shared hit=202904 read=8271 written=182
+        ->  Index Scan using relay_config_heads_pkey on relay_config_heads h  (cost=0.42..0.62 rows=1 width=136) (actual time=0.002..0.002 rows=1.00 loops=208226)
+              Index Cond: ((pubkey = rs.pubkey) AND (source_kind = rs.kind) AND (d_tag = rs.d_tag))
+              Index Searches: 208226
+              Buffers: shared hit=829374 read=3530 written=1
+Planning:
+  Buffers: shared hit=38 read=5 dirtied=1
+Planning Time: 0.236 ms
+Execution Time: 590.497 ms
+
+## synthetic identity lookup
+Index Only Scan using relay_probe_identities_pkey on relay_probe_identities  (cost=0.15..8.17 rows=1 width=4) (actual time=0.004..0.004 rows=0.00 loops=1)
+  Index Cond: (pubkey = 'cb42350948df325853a9a6adc7af0727d5279470baba60d09add5681a5733d6e'::text)
+  Heap Fetches: 0
+  Index Searches: 1
+  Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=54 read=9
+Planning Time: 0.182 ms
+Execution Time: 0.011 ms
+
+## synthetic identity epoch
+Index Scan using relay_probe_identity_epoch_pkey on relay_probe_identity_epoch  (cost=0.15..8.17 rows=1100 width=8) (actual time=0.022..0.023 rows=1.00 loops=1)
+  Index Cond: (id = true)
+  Index Searches: 1
+  Buffers: shared read=2
+Planning:
+  Buffers: shared hit=23 read=1
+Planning Time: 0.076 ms
+Execution Time: 0.026 ms
+
+## due retention followups
+Limit  (cost=0.15..2.91 rows=20 width=16) (actual time=0.015..0.018 rows=20.00 loops=1)
+  Buffers: shared read=2
+  ->  Index Scan using relay_probe_followups_due_idx on relay_probe_followups  (cost=0.15..25.00 rows=180 width=16) (actual time=0.015..0.016 rows=20.00 loops=1)
+        Index Cond: (check_after <= now())
+        Filter: (status = ANY ('{pending,retryable}'::text[]))
+        Index Searches: 1
+        Buffers: shared read=2
+Planning:
+  Buffers: shared hit=108 read=9
+Planning Time: 0.253 ms
+Execution Time: 0.023 ms
+
+## replaceable retention purge
+Rolled back. This is EXPLAIN (ANALYZE, BUFFERS, WAL) of the production purge statement.
+Delete on replaceable_event_purge p  (cost=14531.13..14539.18 rows=0 width=0) (actual time=15.927..15.932 rows=0.00 loops=1)
+  Buffers: shared hit=24452 dirtied=13
+  WAL: records=1081 fpi=13 bytes=166051
+  CTE unqueue_winners
+    ->  Delete on replaceable_event_purge p_1  (cost=0.42..9383.30 rows=1214 width=12) (actual time=2.605..2.606 rows=0.00 loops=1)
+          Buffers: shared hit=3620
+          ->  Nested Loop  (cost=0.42..9383.30 rows=1214 width=12) (actual time=2.605..2.605 rows=0.00 loops=1)
+                Buffers: shared hit=3620
+                ->  Seq Scan on replaceable_event_purge p_1  (cost=0.00..29.14 rows=1214 width=71) (actual time=0.002..0.058 rows=1201.00 loops=1)
+                      Buffers: shared hit=17
+                ->  Index Scan using idx_replaceable_state_event_id on replaceable_state rs  (cost=0.42..7.71 rows=1 width=71) (actual time=0.002..0.002 rows=0.00 loops=1201)
+                      Index Cond: (event_id = p_1.event_id)
+                      Index Searches: 1201
+                      Buffers: shared hit=3603
+  CTE removed_gone
+    ->  Delete on replaceable_event_purge p_2  (cost=0.42..4963.77 rows=0 width=0) (actual time=2.349..2.349 rows=0.00 loops=1)
+          Buffers: shared hit=4919
+          ->  Nested Loop  (cost=0.42..4963.77 rows=1 width=95) (actual time=2.348..2.348 rows=0.00 loops=1)
+                Join Filter: (p_2.event_id = g.event_id)
+                Buffers: shared hit=4919
+                ->  Subquery Scan on g  (cost=0.42..4919.45 rows=1 width=154) (actual time=2.348..2.348 rows=0.00 loops=1)
+                      Buffers: shared hit=4919
+                      ->  Limit  (cost=0.42..4919.44 rows=1 width=65) (actual time=2.348..2.348 rows=0.00 loops=1)
+                            Buffers: shared hit=4919
+                            ->  Nested Loop Anti Join  (cost=0.42..4919.44 rows=1 width=65) (actual time=2.347..2.347 rows=0.00 loops=1)
+                                  Buffers: shared hit=4919
+                                  ->  Seq Scan on replaceable_event_purge p_3  (cost=0.00..29.14 rows=1214 width=65) (actual time=0.006..0.056 rows=1201.00 loops=1)
+                                        Buffers: shared hit=17
+                                  ->  Index Only Scan using events_pkey on events e  (cost=0.42..4.02 rows=1 width=65) (actual time=0.002..0.002 rows=1.00 loops=1201)
+                                        Index Cond: (id = p_3.event_id)
+                                        Heap Fetches: 1298
+                                        Index Searches: 1201
+                                        Buffers: shared hit=4902
+                ->  Seq Scan on replaceable_event_purge p_2  (cost=0.00..29.14 rows=1214 width=71) (never executed)
+  CTE candidates
+    ->  Limit  (cost=175.32..175.33 rows=1 width=73) (actual time=15.739..15.748 rows=100.00 loops=1)
+          Buffers: shared hit=24052
+          WAL: records=981 bytes=54974
+          ->  Sort  (cost=175.32..175.33 rows=1 width=73) (actual time=15.738..15.743 rows=100.00 loops=1)
+                Sort Key: p_4.created_at, p_4.event_id
+                Sort Method: top-N heapsort  Memory: 47kB
+                Buffers: shared hit=24052
+                WAL: records=981 bytes=54974
+                ->  Nested Loop Anti Join  (cost=41.36..175.31 rows=1 width=73) (actual time=2.657..15.261 rows=1201.00 loops=1)
+                      Buffers: shared hit=24052
+                      WAL: records=981 bytes=54974
+                      ->  Nested Loop Anti Join  (cost=41.08..125.21 rows=1 width=138) (actual time=2.651..14.156 rows=1201.00 loops=1)
+                            Buffers: shared hit=21650
+                            WAL: records=981 bytes=54974
+                            ->  Nested Loop Anti Join  (cost=40.66..108.22 rows=1 width=215) (actual time=2.642..10.659 rows=1201.00 loops=1)
+                                  Buffers: shared hit=16846
+                                  WAL: records=981 bytes=54974
+                                  ->  Nested Loop Anti Join  (cost=40.39..92.72 rows=1 width=215) (actual time=2.635..9.593 rows=1201.00 loops=1)
+                                        Buffers: shared hit=14443
+                                        WAL: records=981 bytes=54974
+                                        ->  Nested Loop  (cost=39.96..88.70 rows=1 width=215) (actual time=2.628..7.311 rows=1201.00 loops=1)
+                                              Buffers: shared hit=10840
+                                              WAL: records=981 bytes=54974
+                                              ->  Hash Anti Join  (cost=39.46..73.15 rows=1 width=73) (actual time=2.615..2.823 rows=1201.00 loops=1)
+                                                    Hash Cond: (p_4.event_id = uw.event_id)
+                                                    Buffers: shared hit=3637
+                                                    ->  Seq Scan on replaceable_event_purge p_4  (cost=0.00..29.14 rows=1214 width=73) (actual time=0.003..0.058 rows=1201.00 loops=1)
+                                                          Buffers: shared hit=17
+                                                    ->  Hash  (cost=24.28..24.28 rows=1214 width=32) (actual time=2.605..2.606 rows=0.00 loops=1)
+                                                          Buckets: 2048  Batches: 1  Memory Usage: 16kB
+                                                          Buffers: shared hit=3620
+                                                          ->  CTE Scan on unqueue_winners uw  (cost=0.00..24.28 rows=1214 width=32) (actual time=2.605..2.605 rows=0.00 loops=1)
+                                                                Storage: Memory  Maximum Storage: 17kB
+                                                                Buffers: shared hit=3620
+                                              ->  Index Scan using events_pkey on events e_1  (cost=0.51..8.03 rows=1 width=142) (actual time=0.004..0.004 rows=1.00 loops=1201)
+                                                    Index Cond: (id = p_4.event_id)
+                                                    Filter: ((first_seen_at < '2026-11-26 17:56:14.670406+00'::timestamp with time zone) AND (kind = ANY ('{0,3,10000,10001,10002,10003,10006,10007,10009,10012,10013,10015,10019,10030,10050,10051,10063,10102,30000,30002,30004,30005,30008,30009,30015,30023,30311,30315,34235,34236,39000,39001,39002,39003}'::integer[])))
+                                                    Index Searches: 1201
+                                                    Buffers: shared hit=6004
+                                                    WAL: records=981 bytes=54974
+                                        ->  Index Only Scan using idx_replaceable_state_event_id on replaceable_state rs_3  (cost=0.42..4.01 rows=1 width=65) (actual time=0.002..0.002 rows=0.00 loops=1201)
+                                              Index Cond: (event_id = p_4.event_id)
+                                              Heap Fetches: 0
+                                              Index Searches: 1201
+                                              Buffers: shared hit=3603
+                                  ->  Index Scan using idx_jobs_idempotency_key on jobs j  (cost=0.27..8.30 rows=1 width=85) (actual time=0.001..0.001 rows=0.00 loops=1201)
+                                        Index Cond: (idempotency_key = ('derive_event_bundle:'::text || e_1.id))
+                                        Filter: ((status = ANY ('{pending,running}'::text[])) OR ((status = 'dead'::text) AND (updated_at > '2026-11-26 17:56:14.670406+00'::timestamp with time zone)))
+                                        Rows Removed by Filter: 0
+                                        Index Searches: 1201
+                                        Buffers: shared hit=2403
+                            ->  Index Scan using idx_replaceable_state_kind_pubkey on replaceable_state rs_4  (cost=0.42..16.97 rows=1 width=143) (actual time=0.003..0.003 rows=0.00 loops=1201)
+                                  Index Cond: ((kind = e_1.kind) AND (pubkey = e_1.pubkey))
+                                  Filter: ((event_id > e_1.id) AND (created_at = e_1.created_at) AND (((e_1.kind >= 30000) AND (e_1.kind < 40000) AND (d_tag = COALESCE((SubPlan 3), ''::text))) OR (e_1.kind < 30000) OR (e_1.kind >= 40000)))
+                                  Rows Removed by Filter: 1
+                                  Index Searches: 1201
+                                  Buffers: shared hit=4804
+                                  SubPlan 3
+                                    ->  Limit  (cost=8.51..8.52 rows=1 width=75) (never executed)
+                                          ->  Sort  (cost=8.51..8.52 rows=1 width=75) (never executed)
+                                                Sort Key: et.tag_index
+                                                ->  Seq Scan on event_tags et  (cost=0.00..8.50 rows=1 width=75) (never executed)
+                                                      Filter: ((event_id = e_1.id) AND (tag_name = 'd'::text) AND (value_index = 0))
+                      ->  Index Scan using relay_intel_repairs_pkey on relay_intel_repairs repair  (cost=0.28..25.19 rows=1 width=32) (actual time=0.001..0.001 rows=0.00 loops=1201)
+                            Index Cond: (winner_event_id = e_1.id)
+                            Filter: ((status = ANY ('{pending,queued,running}'::text[])) AND (EXISTS(SubPlan 4) OR (NOT EXISTS(SubPlan 5))))
+                            Index Searches: 1201
+                            Buffers: shared hit=2402
+                            SubPlan 4
+                              ->  Index Scan using idx_replaceable_state_kind_pubkey on replaceable_state rs_1  (cost=0.42..8.45 rows=1 width=0) (never executed)
+                                    Index Cond: ((kind = repair.kind) AND (pubkey = repair.pubkey) AND (d_tag = repair.d_tag))
+                                    Filter: (event_id = ANY (ARRAY[repair.winner_event_id, repair.loser_event_id]))
+                                    Index Searches: 0
+                            SubPlan 5
+                              ->  Index Only Scan using idx_replaceable_state_kind_pubkey on replaceable_state rs_2  (cost=0.42..8.44 rows=1 width=0) (never executed)
+                                    Index Cond: ((kind = repair.kind) AND (pubkey = repair.pubkey) AND (d_tag = repair.d_tag))
+                                    Heap Fetches: 0
+                                    Index Searches: 0
+  CTE deleted_events
+    ->  Delete on events e_2  (cost=0.42..8.46 rows=0 width=0) (actual time=0.398..0.398 rows=0.00 loops=1)
+          Buffers: shared hit=600
+          WAL: records=100 bytes=5400
+          ->  Nested Loop  (cost=0.42..8.46 rows=1 width=62) (actual time=0.008..0.245 rows=100.00 loops=1)
+                Buffers: shared hit=400
+                ->  CTE Scan on candidates c_1  (cost=0.00..0.02 rows=1 width=88) (actual time=0.001..0.010 rows=100.00 loops=1)
+                      Storage: Memory  Maximum Storage: 27kB
+                ->  Index Scan using events_pkey on events e_2  (cost=0.42..8.44 rows=1 width=71) (actual time=0.002..0.002 rows=1.00 loops=100)
+                      Index Cond: (id = c_1.event_id)
+                      Index Searches: 100
+                      Buffers: shared hit=400
+  ->  Nested Loop  (cost=0.28..8.33 rows=1 width=62) (actual time=15.778..15.894 rows=100.00 loops=1)
+        Buffers: shared hit=24352
+        WAL: records=981 bytes=54974
+        ->  CTE Scan on candidates c  (cost=0.00..0.02 rows=1 width=88) (actual time=15.765..15.786 rows=100.00 loops=1)
+              Storage: Memory  Maximum Storage: 27kB
+              Buffers: shared hit=24052
+              WAL: records=981 bytes=54974
+        ->  Index Scan using replaceable_event_purge_pkey on replaceable_event_purge p  (cost=0.28..8.29 rows=1 width=71) (actual time=0.001..0.001 rows=1.00 loops=100)
+              Index Cond: (event_id = c.event_id)
+              Index Searches: 100
+              Buffers: shared hit=300
+Planning:
+  Buffers: shared hit=113
+Planning Time: 1.550 ms
+Trigger for constraint event_relays_event_id_fkey on events: time=6.960 calls=100
+Trigger for constraint event_tags_event_id_fkey on events: time=2.237 calls=100
+Trigger for constraint event_references_source_event_id_fkey on events: time=1.297 calls=100
+Trigger for constraint replaceable_state_event_id_fkey on events: time=1.384 calls=100
+Trigger for constraint profiles_latest_metadata_event_id_fkey on events: time=1.272 calls=100
+Trigger for constraint author_recent_events_event_id_fkey on events: time=1.100 calls=100
+Trigger for constraint reply_count_contributions_source_event_id_fkey on events: time=1.084 calls=100
+Trigger for constraint reaction_count_contributions_source_event_id_fkey on events: time=0.889 calls=100
+Trigger for constraint repost_count_contributions_source_event_id_fkey on events: time=0.780 calls=100
+Trigger for constraint thread_edges_child_event_id_fkey on events: time=0.802 calls=100
+Trigger for constraint unresolved_thread_references_source_event_id_fkey on events: time=0.938 calls=100
+Trigger for constraint reaction_events_event_id_fkey on events: time=0.836 calls=100
+Trigger for constraint repost_events_event_id_fkey on events: time=0.743 calls=100
+Trigger for constraint contact_lists_latest_event_id_fkey on events: time=1.137 calls=100
+Trigger for constraint relay_lists_latest_event_id_fkey on events: time=0.986 calls=100
+Trigger for constraint follower_edges_source_event_id_fkey on events: time=1.188 calls=100
+Trigger for constraint zap_receipts_zap_receipt_id_fkey on events: time=0.782 calls=100
+Trigger for constraint event_hashtags_event_id_fkey on events: time=0.557 calls=100
+Trigger for constraint note_discovery_stats_event_id_fkey on events: time=1.237 calls=100
+Trigger for constraint thread_summaries_root_event_id_fkey on events: time=1.354 calls=100
+Trigger for constraint event_urls_event_id_fkey on events: time=0.864 calls=100
+Trigger for constraint comment_edges_source_event_id_fkey on events: time=0.785 calls=100
+Trigger for constraint address_repost_contributions_source_event_id_fkey on events: time=0.840 calls=100
+Trigger for constraint report_targets_report_event_id_fkey on events: time=0.823 calls=100
+Trigger for constraint quote_contributions_source_event_id_fkey on events: time=0.797 calls=100
+Trigger for constraint bookmark_edges_list_event_id_fkey on events: time=1.152 calls=100
+Trigger for constraint note_bookmark_stats_event_id_fkey on events: time=0.826 calls=100
+Trigger for constraint event_attributes_event_id_fkey on events: time=1.903 calls=100
+Trigger for constraint dm_relay_lists_latest_event_id_fkey on events: time=0.645 calls=100
+Trigger for constraint nutzap_receipts_event_id_fkey on events: time=0.864 calls=100
+Trigger for constraint nutzap_info_latest_event_id_fkey on events: time=0.494 calls=100
+Trigger for constraint reaction_content_edges_source_event_id_fkey on events: time=0.762 calls=100
+Trigger for constraint event_labels_event_id_fkey on events: time=0.857 calls=100
+Trigger for constraint group_messages_event_id_fkey on events: time=0.799 calls=100
+Trigger for constraint polls_event_id_fkey on events: time=0.838 calls=100
+Trigger for constraint zap_goals_event_id_fkey on events: time=0.765 calls=100
+Trigger for constraint file_metadata_event_id_fkey on events: time=0.742 calls=100
+Trigger for constraint author_feed_events_event_id_fkey on events: time=0.663 calls=100
+Trigger for constraint relay_config_heads_event_id_fkey on events: time=1273.082 calls=100
+Trigger for constraint relay_role_memberships_source_event_id_fkey on events: time=6634.046 calls=100
+Trigger trg_search_document_note_delete on events: time=1.272 calls=100
+Execution Time: 7970.879 ms
+
+## diagnostic candidate selection without deletes
+Limit  (cost=170.60..170.61 rows=1 width=73) (actual time=8.328..8.334 rows=100.00 loops=1)
+  Buffers: shared hit=7175 read=1122 dirtied=32
+  ->  Sort  (cost=170.60..170.61 rows=1 width=73) (actual time=8.327..8.329 rows=100.00 loops=1)
+        Sort Key: p.created_at, p.event_id
+        Sort Method: top-N heapsort  Memory: 38kB
+        Buffers: shared hit=7175 read=1122 dirtied=32
+        ->  Nested Loop Anti Join  (cost=1.25..170.59 rows=1 width=73) (actual time=0.047..8.013 rows=1201.00 loops=1)
+              Buffers: shared hit=7175 read=1122 dirtied=32
+              ->  Nested Loop  (cost=0.82..166.58 rows=1 width=73) (actual time=0.041..2.393 rows=1201.00 loops=1)
+                    Buffers: shared hit=4558 read=136 dirtied=32
+                    ->  Index Only Scan using idx_events_kind_first_seen on events e  (cost=0.55..158.27 rows=1 width=65) (actual time=0.032..0.720 rows=1201.00 loops=1)
+                          Index Cond: ((kind = ANY ('{0,3,10000,10001,10002,10003,10006,10007,10009,10012,10013,10015,10019,10030,10050,10051,10063,10102,30000,30002,30004,30005,30008,30009,30015,30023,30311,30315,34235,34236,39000,39001,39002,39003}'::integer[])) AND (first_seen_at < '2026-11-26 17:56:14.670406+00'::timestamp with time zone))
+                          Heap Fetches: 1201
+                          Index Searches: 11
+                          Buffers: shared hit=984 read=107 dirtied=21
+                    ->  Index Scan using replaceable_event_purge_pkey on replaceable_event_purge p  (cost=0.28..8.29 rows=1 width=73) (actual time=0.001..0.001 rows=1.00 loops=1201)
+                          Index Cond: (event_id = e.id)
+                          Index Searches: 1201
+                          Buffers: shared hit=3574 read=29 dirtied=11
+              ->  Index Only Scan using idx_replaceable_state_event_id on replaceable_state rs  (cost=0.42..4.01 rows=1 width=65) (actual time=0.005..0.005 rows=0.00 loops=1201)
+                    Index Cond: (event_id = p.event_id)
+                    Heap Fetches: 0
+                    Index Searches: 1201
+                    Buffers: shared hit=2617 read=986
+Planning:
+  Buffers: shared hit=16 read=14 dirtied=2
+Planning Time: 1.252 ms
+Execution Time: 8.357 ms

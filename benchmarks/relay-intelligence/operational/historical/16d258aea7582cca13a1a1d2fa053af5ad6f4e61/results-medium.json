@@ -1,0 +1,2057 @@
+{
+  "generated_at": "2026-11-26T17:32:56Z",
+  "commit": "16d258aea7582cca13a1a1d2fa053af5ad6f4e61",
+  "scale": "medium",
+  "accounts": 100000,
+  "environment": {
+    "cpu_brand": "Apple M4 Pro",
+    "database_size_before": "144 MB",
+    "docker_stats": "nostrmash-postgres-1 cpu=0.07% mem=289.2MiB / 7.653GiB\nsmartflowsocial-postgres-1 cpu=0.00% mem=53.77MiB / 7.653GiB\nsmartflowsocial-redis-1 cpu=0.41% mem=20.2MiB / 7.653GiB",
+    "effective_cache_size": "4GB",
+    "go": "go1.26.11",
+    "goarch": "arm64",
+    "gomaxprocs": 14,
+    "goos": "darwin",
+    "logical_cpus": "14",
+    "maintenance_work_mem": "64MB",
+    "max_connections": "100",
+    "max_wal_size": "1GB",
+    "memsize_bytes": "25769803776",
+    "os": "27.0.1",
+    "other_sessions": 2,
+    "physical_cpus": "14",
+    "pool_max_conns": 20,
+    "pool_min_conns": 2,
+    "postgres_cache_note": "API timings are not cold-database measurements. Shared buffers stay warm from seeding and ANALYZE. Buffer hits versus reads are in the execution plans.",
+    "postgres_version": "18.6",
+    "schema": "bench_ri_1795714376112487000",
+    "seed_session_work_mem": "64MB on the seed connection only",
+    "shared_buffers": "128MB",
+    "synchronous_commit": "on",
+    "wal_compression": "off",
+    "work_mem": "4MB"
+  },
+  "fixture": {
+    "accounts_without_relay_head": 8000,
+    "author_activity": 33866,
+    "capability_observations": 720,
+    "client_side_heads": 6000,
+    "deletion_events": 40,
+    "effective_memberships": 1104200,
+    "event_relays": 71000,
+    "events": 309600,
+    "explicitly_empty_heads": 5000,
+    "follower_edges": 35904,
+    "legacy_heads": 8000,
+    "memberships_by_role": {
+      "blocked": 22000,
+      "dm_inbox": 44000,
+      "favorite": 44000,
+      "keypackage": 6000,
+      "public_inbox": 482200,
+      "public_outbox": 229000,
+      "relay_set": 44000,
+      "search": 22000
+    },
+    "personas": {
+      "creator": "a2b2b9811961adbf32e000953c1284f8d7b8421eaa5ced9e89f419b80ee921d2",
+      "dense": "d6ea4ce0b0e3112f995efea294a46007928069a9e2982eae381a750834678f19",
+      "empty": "29fe99462a33af0ed1c6b49c06d317b8e1a7418c1c8dabd2879aa38bbd4b7107",
+      "legacy": "42fc29bbaf4105b68ff90d4b03c8004b5dfed3980c8ca14aca34267b7b2401d3",
+      "missing": "943a0e7c1acadea520de19d33d0068e20e67b4b04ab43d1980cd0a40718bde20",
+      "multi": "bb49b6e0636cd7f0546f31189fd7eed2ff6eace365ba795064b68ba494527838",
+      "note_id": "b9719ef51c90f4f4660e0d6329fdd35c1521d88cb536d71a89132ee32dcaf624",
+      "privacy": "a4ead1cee7ccb3b26312a7ed4fbab88d54feb48c2ca4fa3c3d26dd4c2d1c050f",
+      "shared": "ae843d07d4a6d1682b9742d8124d4bcb7408230d54e3ddd49d9bfe5f5d15d9a6",
+      "sparse": "67517d99e351f168da12248418e59fc393bfbbbd67b20098d104e02e025925f7",
+      "truncated": "236d52aebdece3a55daedee247b7153437b61ba2967c4e78c5b31fbd2783aebb"
+    },
+    "popular_relay": "wss://r0.op0.example",
+    "probe_attempts": 160,
+    "probe_followups": 180,
+    "purge_queue": 1000,
+    "relay_config_heads": 208200,
+    "relay_registry": 240,
+    "relay_role_memberships": 893200,
+    "replaceable_state": 308200,
+    "seed_ms": 347506,
+    "target_accounts": 100000,
+    "top_inbox_relays": [
+      {
+        "inbox_users": 10500,
+        "url": "wss://r0.op0.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r1.op1.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r2.op2.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r3.op3.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r4.op4.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r5.op5.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r6.op6.example"
+      },
+      {
+        "inbox_users": 10500,
+        "url": "wss://r7.op7.example"
+      }
+    ],
+    "truncated_heads": 5000,
+    "trust_scores": 20360
+  },
+  "api": {
+    "capabilities_cold": {
+      "name": "capabilities",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.956,
+      "p95_ms": 1.024,
+      "max_ms": 1.394,
+      "throughput_per_s": 1031.571450558637,
+      "query_count_median": 4,
+      "alloc_bytes_per_op": 49707,
+      "cpu_seconds": 0.008646,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "capabilities_warm": {
+      "name": "capabilities",
+      "samples": 100,
+      "errors": 0,
+      "meaningful": 100,
+      "error_rate": 0,
+      "median_ms": 0.031,
+      "p95_ms": 0.04,
+      "p99_ms": 0.047,
+      "max_ms": 0.952,
+      "throughput_per_s": 24243.89356930723,
+      "alloc_bytes_per_op": 34228,
+      "cpu_seconds": 0.003475,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "config_dense_cold": {
+      "name": "config_dense",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 2.423,
+      "p95_ms": 3.939,
+      "max_ms": 4.39,
+      "throughput_per_s": 383.1163754876856,
+      "query_count_median": 9,
+      "alloc_bytes_per_op": 277570,
+      "cpu_seconds": 0.013946,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "config_dense_warm": {
+      "name": "config_dense",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.051,
+      "p95_ms": 0.062,
+      "max_ms": 2.427,
+      "throughput_per_s": 9003.600765035957,
+      "alloc_bytes_per_op": 56986,
+      "cpu_seconds": 0.002707,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "config_empty_cold": {
+      "name": "config_empty",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 1.938,
+      "p95_ms": 2.331,
+      "max_ms": 2.366,
+      "throughput_per_s": 500.2673303546583,
+      "query_count_median": 9,
+      "alloc_bytes_per_op": 37880,
+      "cpu_seconds": 0.007795,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 1,
+        "status": 200
+      }
+    },
+    "config_empty_warm": {
+      "name": "config_empty",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.016,
+      "p95_ms": 0.031,
+      "max_ms": 2.292,
+      "throughput_per_s": 13256.371260584798,
+      "alloc_bytes_per_op": 21194,
+      "cpu_seconds": 0.001265,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 1,
+        "status": 200
+      }
+    },
+    "config_missing_cold": {
+      "name": "config_missing",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 1.481,
+      "p95_ms": 1.75,
+      "max_ms": 3.333,
+      "throughput_per_s": 649.2909061549336,
+      "query_count_median": 7,
+      "alloc_bytes_per_op": 29122,
+      "cpu_seconds": 0.005711,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "config_missing_warm": {
+      "name": "config_missing",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.012,
+      "p95_ms": 0.02,
+      "max_ms": 1.406,
+      "throughput_per_s": 20861.398433413284,
+      "alloc_bytes_per_op": 18170,
+      "cpu_seconds": 0.000825,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "diagnostics_dense_cold": {
+      "name": "diagnostics_dense",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 3.007,
+      "p95_ms": 3.107,
+      "max_ms": 4.11,
+      "throughput_per_s": 327.29876240155465,
+      "query_count_median": 11,
+      "alloc_bytes_per_op": 385209,
+      "cpu_seconds": 0.016007,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "diagnostics_dense_warm": {
+      "name": "diagnostics_dense",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.019,
+      "p95_ms": 0.032,
+      "max_ms": 4.391,
+      "throughput_per_s": 7629.279572851895,
+      "alloc_bytes_per_op": 31510,
+      "cpu_seconds": 0.002044,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "event_existing": {
+      "name": "event",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 2.911,
+      "p95_ms": 3.771,
+      "max_ms": 6.612,
+      "throughput_per_s": 324.4754904396339,
+      "query_count_median": 7,
+      "alloc_bytes_per_op": 43873,
+      "cpu_seconds": 0.014119,
+      "cache": "existing event handler",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "optimize_balanced": {
+      "name": "optimize_balanced",
+      "samples": 30,
+      "errors": 0,
+      "meaningful": 30,
+      "error_rate": 0,
+      "median_ms": 93.751,
+      "p95_ms": 100.993,
+      "max_ms": 102.7,
+      "throughput_per_s": 10.611582960119156,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 13047240,
+      "cpu_seconds": 1.365315,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 10,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "optimize_constraints": {
+      "name": "optimize_constraints",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 88.501,
+      "p95_ms": 103.412,
+      "max_ms": 109.084,
+      "throughput_per_s": 11.02473815527517,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 11489835,
+      "cpu_seconds": 0.706002,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 10,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "optimize_creator": {
+      "name": "optimize_creator",
+      "samples": 30,
+      "errors": 0,
+      "meaningful": 30,
+      "error_rate": 0,
+      "median_ms": 12.153,
+      "p95_ms": 13.772,
+      "max_ms": 17.716,
+      "throughput_per_s": 79.24798941246861,
+      "query_count_median": 32,
+      "alloc_bytes_per_op": 7318590,
+      "cpu_seconds": 0.333508,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "2c44fcacdc8c574a3e64f3fa4c4aa9a85aa97e3ce9b55b139a688ef695008257",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "creator",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 2,
+        "selected": 6,
+        "sources": 2,
+        "status": 200
+      }
+    },
+    "optimize_dense_cohort": {
+      "name": "optimize_dense_cohort",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 81.95,
+      "p95_ms": 84.052,
+      "max_ms": 84.395,
+      "throughput_per_s": 12.201227519868183,
+      "query_count_median": 32,
+      "alloc_bytes_per_op": 10288869,
+      "cpu_seconds": 0.720552,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 2,
+        "selected": 7,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "optimize_max_lists": {
+      "name": "optimize_max_lists",
+      "samples": 15,
+      "errors": 0,
+      "meaningful": 15,
+      "error_rate": 0,
+      "median_ms": 151.244,
+      "p95_ms": 154.853,
+      "max_ms": 155.211,
+      "throughput_per_s": 6.600375792395741,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 25925260,
+      "cpu_seconds": 1.530316,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "decentralization",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 15,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "optimize_multi_role": {
+      "name": "optimize_multi_role",
+      "samples": 30,
+      "errors": 0,
+      "meaningful": 30,
+      "error_rate": 0,
+      "median_ms": 24.987,
+      "p95_ms": 27.649,
+      "max_ms": 32.682,
+      "throughput_per_s": 39.254474672851345,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 10266289,
+      "cpu_seconds": 0.486825,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "5ac807888dec91c04741c795f4eea9ca1eaa5a6c9dc24a0b848d697da5585c6e",
+        "cohort_size": 40,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 10,
+        "sources": 7,
+        "status": 200
+      }
+    },
+    "optimize_privacy": {
+      "name": "optimize_privacy",
+      "samples": 30,
+      "errors": 0,
+      "meaningful": 30,
+      "error_rate": 0,
+      "median_ms": 14.097,
+      "p95_ms": 16.684,
+      "max_ms": 20.496,
+      "throughput_per_s": 68.19454002824804,
+      "query_count_median": 40,
+      "alloc_bytes_per_op": 4463467,
+      "cpu_seconds": 0.132073,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "1080e8b0d250fb55dc29560885dc06d28fd6966aa6e76f3e0123f6fbb47e156d",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "privacy",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 3,
+        "selected": 6,
+        "sources": 4,
+        "status": 200
+      }
+    },
+    "optimize_shared_keypackage": {
+      "name": "optimize_shared_keypackage",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 11.797,
+      "p95_ms": 14.223,
+      "max_ms": 14.269,
+      "throughput_per_s": 82.38514620858943,
+      "query_count_median": 32,
+      "alloc_bytes_per_op": 4029617,
+      "cpu_seconds": 0.074727,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "2b338a757b082056707327d801b2ac94607221d4272aea2d695034695573563a",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 2,
+        "selected": 4,
+        "sources": 2,
+        "status": 200
+      }
+    },
+    "optimize_signed_source": {
+      "name": "optimize_signed_source",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 81.771,
+      "p95_ms": 85.144,
+      "max_ms": 88.757,
+      "throughput_per_s": 12.26131748479249,
+      "query_count_median": 32,
+      "alloc_bytes_per_op": 10655143,
+      "cpu_seconds": 0.936562,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "5866d1c7a214ebc68fa9b58c792db0e84b840332fc42ccab047be657d9b22647",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 2,
+        "selected": 8,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "optimize_sparse": {
+      "name": "optimize_sparse",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 11.647,
+      "p95_ms": 15.007,
+      "max_ms": 16.898,
+      "throughput_per_s": 80.71121365524614,
+      "query_count_median": 32,
+      "alloc_bytes_per_op": 4143913,
+      "cpu_seconds": 0.305991,
+      "cache": "optimize is not application-cached",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "290a8f767c196e106450a37d3efc996bf2ae328a9591fe37658b427766b8be58",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 2,
+        "selected": 4,
+        "sources": 2,
+        "status": 200
+      }
+    },
+    "profile_existing": {
+      "name": "profile",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.437,
+      "p95_ms": 0.49,
+      "max_ms": 1.385,
+      "throughput_per_s": 2092.3648299626643,
+      "query_count_median": 2,
+      "alloc_bytes_per_op": 12656,
+      "cpu_seconds": 0.003385,
+      "cache": "existing profile handler",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "rankings_cold": {
+      "name": "rankings",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 3.966,
+      "p95_ms": 5.019,
+      "max_ms": 7.636,
+      "throughput_per_s": 233.75733504950176,
+      "query_count_median": 6,
+      "alloc_bytes_per_op": 1577543,
+      "cpu_seconds": 0.098303,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "rankings_warm": {
+      "name": "rankings",
+      "samples": 100,
+      "errors": 0,
+      "meaningful": 100,
+      "error_rate": 0,
+      "median_ms": 0.676,
+      "p95_ms": 1.079,
+      "p99_ms": 1.365,
+      "max_ms": 3.627,
+      "throughput_per_s": 1350.188929911679,
+      "alloc_bytes_per_op": 549528,
+      "cpu_seconds": 0.072139,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 0,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "recommendations_dense_cold": {
+      "name": "recommendations_dense",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 100.743,
+      "p95_ms": 169.929,
+      "max_ms": 209.236,
+      "throughput_per_s": 8.954792347817238,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 13111816,
+      "cpu_seconds": 1.111056,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 10,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "recommendations_dense_warm": {
+      "name": "recommendations_dense",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 1.118,
+      "p95_ms": 1.158,
+      "max_ms": 96.814,
+      "throughput_per_s": 285.00389518386095,
+      "alloc_bytes_per_op": 1390619,
+      "cpu_seconds": 0.082994,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "efe1f76d17d19c91e348b8490e9e48ecbf2f0167891fa3cfb72ff5ae50ba2d5d",
+        "cohort_size": 400,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": true,
+        "roles": 4,
+        "selected": 10,
+        "sources": 6,
+        "status": 200
+      }
+    },
+    "recommendations_sparse_cold": {
+      "name": "recommendations_sparse",
+      "samples": 20,
+      "errors": 0,
+      "meaningful": 20,
+      "error_rate": 0,
+      "median_ms": 17.356,
+      "p95_ms": 19.662,
+      "max_ms": 22.75,
+      "throughput_per_s": 55.64889622209021,
+      "query_count_median": 48,
+      "alloc_bytes_per_op": 5862390,
+      "cpu_seconds": 0.108522,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "290a8f767c196e106450a37d3efc996bf2ae328a9591fe37658b427766b8be58",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": false,
+        "roles": 4,
+        "selected": 6,
+        "sources": 2,
+        "status": 200
+      }
+    },
+    "recommendations_sparse_warm": {
+      "name": "recommendations_sparse",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 1.117,
+      "p95_ms": 1.143,
+      "max_ms": 17.244,
+      "throughput_per_s": 657.8978964833186,
+      "alloc_bytes_per_op": 1218303,
+      "cpu_seconds": 0.049114,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "based_on_event_id": "290a8f767c196e106450a37d3efc996bf2ae328a9591fe37658b427766b8be58",
+        "cohort_size": 3,
+        "cohort_truncated": false,
+        "cohort_used": "personalized",
+        "constraints_satisfied": true,
+        "preset": "balanced",
+        "proposal_kind": 10002,
+        "proposal_safe": false,
+        "roles": 4,
+        "selected": 6,
+        "sources": 2,
+        "status": 200
+      }
+    },
+    "roles_cold": {
+      "name": "roles",
+      "samples": 40,
+      "errors": 0,
+      "meaningful": 40,
+      "error_rate": 0,
+      "median_ms": 0.053,
+      "p95_ms": 0.08,
+      "max_ms": 0.164,
+      "throughput_per_s": 16410.82195242831,
+      "alloc_bytes_per_op": 24416,
+      "cpu_seconds": 0.002696,
+      "cache": "application cache cold",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 11,
+        "selected": 0,
+        "status": 200
+      }
+    },
+    "roles_warm": {
+      "name": "roles",
+      "samples": 100,
+      "errors": 0,
+      "meaningful": 100,
+      "error_rate": 0,
+      "median_ms": 0.053,
+      "p95_ms": 0.076,
+      "p99_ms": 0.093,
+      "max_ms": 0.104,
+      "throughput_per_s": 17556.56505804639,
+      "alloc_bytes_per_op": 24211,
+      "cpu_seconds": 0.005857,
+      "cache": "application cache warm",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "proof": {
+        "constraints_satisfied": null,
+        "preset": null,
+        "roles": 11,
+        "selected": 0,
+        "status": 200
+      }
+    }
+  },
+  "maintenance": {
+    "candidate_shortlist": {
+      "samples": 40,
+      "median_ms": 0.252,
+      "p95_ms": 0.298,
+      "max_ms": 0.51
+    },
+    "canonical_head": {
+      "samples": 100,
+      "median_ms": 0.213,
+      "p95_ms": 0.228,
+      "max_ms": 0.454
+    },
+    "canonical_replaceable": {
+      "samples": 100,
+      "median_ms": 0.213,
+      "p95_ms": 0.233,
+      "max_ms": 0.587
+    },
+    "deletion_address_backfill": {
+      "inserted": 200,
+      "wall_ms": 4
+    },
+    "deletion_address_noop": {
+      "inserted": 0,
+      "note": "Second call after the missing addresses were inserted. This is the no-op scan, not the successful insert.",
+      "wall_ms": 0
+    },
+    "effective_known": {
+      "samples": 20,
+      "median_ms": 10.863,
+      "p95_ms": 47.22,
+      "max_ms": 48.603
+    },
+    "effective_membership_cohort": {
+      "samples": 15,
+      "median_ms": 8.812,
+      "p95_ms": 47.683,
+      "max_ms": 49.623
+    },
+    "effective_membership_one": {
+      "samples": 50,
+      "median_ms": 0.338,
+      "p95_ms": 0.737,
+      "max_ms": 1.144
+    },
+    "global_role_count": {
+      "samples": 10,
+      "median_ms": 0.289,
+      "p95_ms": 0.598,
+      "max_ms": 1.916
+    },
+    "missing_projection_reconcile": {
+      "wall_ms": 1195
+    },
+    "repair_lifecycle_derivation": {
+      "errors": 0,
+      "processed": 200,
+      "wall_ms": 5623
+    },
+    "replaceable_retention": {
+      "deleted": 100,
+      "limit": 100,
+      "wal_bytes": 1029072,
+      "wall_ms": 7814
+    },
+    "retention_candidates": {
+      "due": 180,
+      "wall_ms": 0
+    },
+    "stale_projection_backfill": {
+      "needs_replay_remaining": 0,
+      "note": "One BackfillBatch reconciles stale heads and projects one kind page. It is not a full-table rewrite.",
+      "wal_bytes": 3856936,
+      "wall_ms": 1216
+    },
+    "statistics_refresh": {
+      "last_duration_ms": 17522,
+      "queries": 14018,
+      "wal_bytes": 1259408,
+      "wall_ms": 17529
+    },
+    "statistics_refresh_skipped": {
+      "error": "relay intelligence statistics were refreshed recently",
+      "wall_ms": 1
+    },
+    "tie_repair_cursor_page": {
+      "last_rows": 200,
+      "note": "Separate from the successful page. repaired is the number of ties fixed on this page, not a blend with the previous call.",
+      "repaired": 0,
+      "wall_ms": 13
+    },
+    "tie_repair_idle_check": {
+      "note": "Tie scan is skipped while the cursor is idle. The function still inspects deletion tombstones.",
+      "repaired": 0,
+      "wall_ms": 9
+    },
+    "tie_repair_successful_page": {
+      "last_rows": 200,
+      "repaired": 200,
+      "wal_bytes": 1489880,
+      "wall_ms": 45
+    }
+  },
+  "probes": {
+    "active_lease_rejection": {
+      "before": {
+        "active_leases_for_key": 1,
+        "attempts_last_hour": 1,
+        "host_attempts_last_hour": 1,
+        "key_attempts_last_hour": 1
+      },
+      "expected": "active lease",
+      "token_empty": true,
+      "wall_ms": 0.229
+    },
+    "budget_window_note": "Each scenario starts by deleting relay_probe_attempts from the last 2 hours and all relay_probe_leases. Seeded history is 3 hours old and stays in place, outside the 1 hour budget window. The delete simulates a new hour so a successful-claim sample cannot exhaust the global cap before a later scenario.",
+    "concurrent_distinct_urls": {
+      "errors": [],
+      "latencies_ms": [
+        1.156,
+        4.758,
+        4.225,
+        3.573,
+        2.239,
+        2.994,
+        2.441,
+        1.667
+      ],
+      "successes": 8,
+      "wall_ms": 4,
+      "workers": 8
+    },
+    "concurrent_same_url": {
+      "errors": [],
+      "latencies_ms": [
+        0.815,
+        9.379,
+        10.294,
+        8.448,
+        6.587,
+        5.655,
+        7.518,
+        3.972
+      ],
+      "successes": 1,
+      "workers": 8
+    },
+    "cooldown_rejection": {
+      "before": {
+        "active_leases_for_key": 0,
+        "attempts_last_hour": 2,
+        "host_attempts_last_hour": 1,
+        "key_attempts_last_hour": 1
+      },
+      "expected": "recent attempt inside min_seconds",
+      "token_empty": true,
+      "wall_ms": 0.215
+    },
+    "duplicate_completion": {
+      "error": "",
+      "note": "A repeated status and detail for the same attempt does not insert another sample.",
+      "sample_rows": 1,
+      "wall_ms": 1.183
+    },
+    "expired_lease_reclaim": {
+      "before": {
+        "active_leases_for_key": 0,
+        "attempts_last_hour": 1,
+        "host_attempts_last_hour": 1,
+        "key_attempts_last_hour": 1
+      },
+      "cooldown_wall_ms": 1.785,
+      "note": "claim_relay_probe checks the recent-attempt cooldown before it replaces an expired lease. The successful reclaim ages that attempt by 30 seconds, which is outside the 1 second minimum used here, and sets the lease expiry in the past.",
+      "obtained": true,
+      "still_inside_cooldown_rejected": true,
+      "wall_ms": 0.321
+    },
+    "global_budget_rejection": {
+      "before": {
+        "active_leases_for_key": 0,
+        "attempts_last_hour": 60,
+        "host_attempts_last_hour": 0,
+        "key_attempts_last_hour": 0
+      },
+      "expected": "recent attempts \u003e= global limit of 60",
+      "token_empty": true,
+      "wall_ms": 0.221,
+      "window_1_claims": 60
+    },
+    "multi_capability_completion": {
+      "error": "",
+      "wall_ms": 4.04
+    },
+    "per_host_budget_rejection": {
+      "before": {
+        "active_leases_for_key": 0,
+        "attempts_last_hour": 6,
+        "host_attempts_last_hour": 4,
+        "key_attempts_last_hour": 0
+      },
+      "expected": "host attempt count in the last hour reached 4",
+      "successful_before_rejection": 4,
+      "token_empty": true,
+      "wall_ms": 0.219
+    },
+    "retention_followup_claim": {
+      "obtained": true,
+      "url": "wss://r0.op0.example",
+      "wall_ms": 3.346
+    },
+    "retention_followup_completion": {
+      "error": "",
+      "wall_ms": 2.238
+    },
+    "rows_after": {
+      "attempts": 174,
+      "leases": 11,
+      "samples": 5
+    },
+    "single_capability_completion": {
+      "error": "",
+      "wall_ms": 3.776
+    },
+    "successful_claims": {
+      "name": "successful lease claim",
+      "samples": 120,
+      "errors": 0,
+      "meaningful": 120,
+      "error_rate": 0,
+      "median_ms": 0.315,
+      "p95_ms": 0.431,
+      "p99_ms": 0.483,
+      "max_ms": 1.366,
+      "throughput_per_s": 2996.665834675694,
+      "cache": "none",
+      "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement",
+      "note": "two budget hours, 60 distinct hosts each; an empty token stops that hour and is excluded from the latency sample",
+      "proof": {
+        "claimed": 120
+      }
+    },
+    "successful_claims_window_1_wal_bytes": 91376,
+    "successful_claims_window_2_wal_bytes": 60888
+  },
+  "synthetic": {
+    "concurrent_800_lookups_ms": 49,
+    "concurrent_800_queries": 800,
+    "derivation_ordinary_authors": {
+      "errors": 0,
+      "events": 25,
+      "last_event_id": "b444951f6e23b1bc6e16f103b0e78379e2e176716bee1e009247ba446f45861d",
+      "synthetic": false,
+      "wall_ms": 1100
+    },
+    "derivation_synthetic_authors": {
+      "errors": 0,
+      "events": 25,
+      "last_event_id": "efa784214f7105c9a9a3c50786e3afbd587822cdf5b52481485ec32031743ecc",
+      "synthetic": true,
+      "wall_ms": 1329
+    },
+    "distinct_ordinary_cold": {
+      "keys": 1000,
+      "per_lookup_us": 190,
+      "positive": 0,
+      "queries": 1000,
+      "queries_per_key": 1,
+      "wall_ms": 190
+    },
+    "lookup_after_registry_growth": {
+      "keys": 2,
+      "per_lookup_us": 443,
+      "positive": 1,
+      "queries": 2,
+      "queries_per_key": 1,
+      "wall_ms": 0
+    },
+    "negative_after_ttl": {
+      "keys": 1,
+      "per_lookup_us": 2052,
+      "positive": 0,
+      "queries": 1,
+      "queries_per_key": 1,
+      "wall_ms": 2
+    },
+    "negative_cache_hit": {
+      "keys": 1,
+      "per_lookup_us": 0,
+      "positive": 0,
+      "queries": 0,
+      "queries_per_key": 0,
+      "wall_ms": 0
+    },
+    "negative_cold": {
+      "keys": 1,
+      "per_lookup_us": 136,
+      "positive": 0,
+      "queries": 1,
+      "queries_per_key": 1,
+      "wall_ms": 0
+    },
+    "newly_registered": {
+      "keys": 1,
+      "per_lookup_us": 535,
+      "positive": 1,
+      "queries": 1,
+      "queries_per_key": 1,
+      "wall_ms": 0
+    },
+    "positive_cache_hit": {
+      "keys": 1,
+      "per_lookup_us": 0,
+      "positive": 1,
+      "queries": 0,
+      "queries_per_key": 0,
+      "wall_ms": 0
+    },
+    "positive_cold": {
+      "keys": 1,
+      "per_lookup_us": 181,
+      "positive": 1,
+      "queries": 1,
+      "queries_per_key": 1,
+      "wall_ms": 0
+    },
+    "registry_insert_2000_ms": 13,
+    "registry_load_ms": 0,
+    "registry_rows_before_growth": 2,
+    "repeated_ordinary": {
+      "keys": 1000,
+      "per_lookup_us": 0,
+      "positive": 0,
+      "queries": 0,
+      "queries_per_key": 0,
+      "wall_ms": 0
+    },
+    "search_sync": "Meilisearch was not reachable at 127.0.0.1:7700, so HTTP indexing was not measured. DeriveEventBundle still marks the event only when a client is configured; the synthetic gate inside SyncMeilisearch was not on that path."
+  },
+  "storage": {
+    "after_mixed": [
+      {
+        "heap_bytes": 285155328,
+        "index_bytes": 305102848,
+        "relation": "events",
+        "reltuples": 309621,
+        "total_bytes": 590389248
+      },
+      {
+        "heap_bytes": 258342912,
+        "index_bytes": 176971776,
+        "relation": "relay_role_memberships",
+        "reltuples": 893018,
+        "total_bytes": 435412992
+      },
+      {
+        "heap_bytes": 61661184,
+        "index_bytes": 128663552,
+        "relation": "replaceable_state",
+        "reltuples": 308200,
+        "total_bytes": 190373888
+      },
+      {
+        "heap_bytes": 47603712,
+        "index_bytes": 30490624,
+        "relation": "relay_config_heads",
+        "reltuples": 208200,
+        "total_bytes": 78143488
+      },
+      {
+        "heap_bytes": 14401536,
+        "index_bytes": 40075264,
+        "relation": "event_relays",
+        "reltuples": 71029,
+        "total_bytes": 54517760
+      },
+      {
+        "heap_bytes": 9428992,
+        "index_bytes": 39370752,
+        "relation": "follower_edges",
+        "reltuples": 35904,
+        "total_bytes": 48840704
+      },
+      {
+        "heap_bytes": 5726208,
+        "index_bytes": 6856704,
+        "relation": "author_activity_daily",
+        "reltuples": 33867,
+        "total_bytes": 12623872
+      },
+      {
+        "heap_bytes": 3555328,
+        "index_bytes": 2465792,
+        "relation": "trust_scores_global",
+        "reltuples": 20360,
+        "total_bytes": 6062080
+      },
+      {
+        "heap_bytes": 958464,
+        "index_bytes": 1302528,
+        "relation": "applied_stat_deltas",
+        "reltuples": 1162,
+        "total_bytes": 2301952
+      },
+      {
+        "heap_bytes": 245760,
+        "index_bytes": 1015808,
+        "relation": "author_recent_events",
+        "reltuples": -1,
+        "total_bytes": 1294336
+      },
+      {
+        "heap_bytes": 286720,
+        "index_bytes": 933888,
+        "relation": "note_discovery_stats",
+        "reltuples": 0,
+        "total_bytes": 1253376
+      },
+      {
+        "heap_bytes": 499712,
+        "index_bytes": 475136,
+        "relation": "jobs",
+        "reltuples": 229,
+        "total_bytes": 1015808
+      },
+      {
+        "heap_bytes": 180224,
+        "index_bytes": 589824,
+        "relation": "event_hashtags",
+        "reltuples": 0,
+        "total_bytes": 802816
+      },
+      {
+        "heap_bytes": 147456,
+        "index_bytes": 507904,
+        "relation": "pending_profile_stats_recomputes",
+        "reltuples": -1,
+        "total_bytes": 688128
+      },
+      {
+        "heap_bytes": 491520,
+        "index_bytes": 114688,
+        "relation": "search_documents",
+        "reltuples": -1,
+        "total_bytes": 638976
+      },
+      {
+        "heap_bytes": 139264,
+        "index_bytes": 401408,
+        "relation": "replaceable_event_purge",
+        "reltuples": 1101,
+        "total_bytes": 581632
+      },
+      {
+        "heap_bytes": 204800,
+        "index_bytes": 311296,
+        "relation": "author_feed_events",
+        "reltuples": -1,
+        "total_bytes": 548864
+      },
+      {
+        "heap_bytes": 204800,
+        "index_bytes": 262144,
+        "relation": "profile_public_stats",
+        "reltuples": 609,
+        "total_bytes": 507904
+      },
+      {
+        "heap_bytes": 229376,
+        "index_bytes": 212992,
+        "relation": "relay_probe_identities",
+        "reltuples": -1,
+        "total_bytes": 475136
+      },
+      {
+        "heap_bytes": 155648,
+        "index_bytes": 278528,
+        "relation": "primal_notifications",
+        "reltuples": 453,
+        "total_bytes": 466944
+      },
+      {
+        "heap_bytes": 90112,
+        "index_bytes": 327680,
+        "relation": "follower_gain_events",
+        "reltuples": 453,
+        "total_bytes": 450560
+      },
+      {
+        "heap_bytes": 212992,
+        "index_bytes": 180224,
+        "relation": "event_attributes",
+        "reltuples": 229,
+        "total_bytes": 425984
+      },
+      {
+        "heap_bytes": 188416,
+        "index_bytes": 180224,
+        "relation": "relay_role_stats",
+        "reltuples": 1095,
+        "total_bytes": 409600
+      },
+      {
+        "heap_bytes": 221184,
+        "index_bytes": 155648,
+        "relation": "thread_summaries",
+        "reltuples": -1,
+        "total_bytes": 409600
+      },
+      {
+        "heap_bytes": 163840,
+        "index_bytes": 163840,
+        "relation": "event_tags",
+        "reltuples": 200,
+        "total_bytes": 360448
+      },
+      {
+        "heap_bytes": 229376,
+        "index_bytes": 73728,
+        "relation": "relay_intel_repairs",
+        "reltuples": 200,
+        "total_bytes": 344064
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 237568,
+        "relation": "pending_author_analytics_recomputes",
+        "reltuples": -1,
+        "total_bytes": 319488
+      },
+      {
+        "heap_bytes": 155648,
+        "index_bytes": 114688,
+        "relation": "relay_registry",
+        "reltuples": 240,
+        "total_bytes": 303104
+      },
+      {
+        "heap_bytes": 147456,
+        "index_bytes": 122880,
+        "relation": "author_hourly_activity",
+        "reltuples": 209,
+        "total_bytes": 303104
+      },
+      {
+        "heap_bytes": 81920,
+        "index_bytes": 172032,
+        "relation": "relay_lists_latest",
+        "reltuples": 208,
+        "total_bytes": 286720
+      },
+      {
+        "heap_bytes": 98304,
+        "index_bytes": 122880,
+        "relation": "relay_role_adoption_daily",
+        "reltuples": 1048,
+        "total_bytes": 262144
+      },
+      {
+        "heap_bytes": 114688,
+        "index_bytes": 81920,
+        "relation": "relay_capability_observations",
+        "reltuples": 720,
+        "total_bytes": 229376
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 122880,
+        "relation": "relay_probe_attempts",
+        "reltuples": 174,
+        "total_bytes": 212992
+      },
+      {
+        "heap_bytes": 106496,
+        "index_bytes": 73728,
+        "relation": "author_first_seen",
+        "reltuples": 209,
+        "total_bytes": 212992
+      },
+      {
+        "heap_bytes": 81920,
+        "index_bytes": 81920,
+        "relation": "kind_author_daily",
+        "reltuples": 228,
+        "total_bytes": 196608
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 106496,
+        "relation": "relay_probe_followups",
+        "reltuples": 180,
+        "total_bytes": 180224
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 90112,
+        "relation": "trust_interaction_edge_weights",
+        "reltuples": 201,
+        "total_bytes": 163840
+      },
+      {
+        "heap_bytes": 73728,
+        "index_bytes": 57344,
+        "relation": "profile_discovery_recent_activity",
+        "reltuples": 209,
+        "total_bytes": 163840
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 73728,
+        "relation": "primal_notification_counts",
+        "reltuples": 400,
+        "total_bytes": 155648
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 81920,
+        "relation": "deletion_addresses",
+        "reltuples": 200,
+        "total_bytes": 155648
+      }
+    ],
+    "after_population": [
+      {
+        "heap_bytes": 284401664,
+        "index_bytes": 304234496,
+        "relation": "events",
+        "reltuples": 309621,
+        "total_bytes": 588767232
+      },
+      {
+        "heap_bytes": 257400832,
+        "index_bytes": 176955392,
+        "relation": "relay_role_memberships",
+        "reltuples": 893018,
+        "total_bytes": 434454528
+      },
+      {
+        "heap_bytes": 61628416,
+        "index_bytes": 128647168,
+        "relation": "replaceable_state",
+        "reltuples": 308200,
+        "total_bytes": 190324736
+      },
+      {
+        "heap_bytes": 47423488,
+        "index_bytes": 30457856,
+        "relation": "relay_config_heads",
+        "reltuples": 208200,
+        "total_bytes": 77930496
+      },
+      {
+        "heap_bytes": 14204928,
+        "index_bytes": 39469056,
+        "relation": "event_relays",
+        "reltuples": 71029,
+        "total_bytes": 53714944
+      },
+      {
+        "heap_bytes": 9428992,
+        "index_bytes": 39370752,
+        "relation": "follower_edges",
+        "reltuples": 35904,
+        "total_bytes": 48840704
+      },
+      {
+        "heap_bytes": 5668864,
+        "index_bytes": 6823936,
+        "relation": "author_activity_daily",
+        "reltuples": 33867,
+        "total_bytes": 12533760
+      },
+      {
+        "heap_bytes": 3555328,
+        "index_bytes": 2465792,
+        "relation": "trust_scores_global",
+        "reltuples": 20360,
+        "total_bytes": 6062080
+      },
+      {
+        "heap_bytes": 180224,
+        "index_bytes": 327680,
+        "relation": "applied_stat_deltas",
+        "reltuples": 1162,
+        "total_bytes": 548864
+      },
+      {
+        "heap_bytes": 139264,
+        "index_bytes": 368640,
+        "relation": "replaceable_event_purge",
+        "reltuples": 1101,
+        "total_bytes": 548864
+      },
+      {
+        "heap_bytes": 98304,
+        "index_bytes": 352256,
+        "relation": "pending_profile_stats_recomputes",
+        "reltuples": -1,
+        "total_bytes": 483328
+      },
+      {
+        "heap_bytes": 229376,
+        "index_bytes": 212992,
+        "relation": "relay_probe_identities",
+        "reltuples": -1,
+        "total_bytes": 475136
+      },
+      {
+        "heap_bytes": 155648,
+        "index_bytes": 278528,
+        "relation": "primal_notifications",
+        "reltuples": 453,
+        "total_bytes": 466944
+      },
+      {
+        "heap_bytes": 90112,
+        "index_bytes": 327680,
+        "relation": "follower_gain_events",
+        "reltuples": 453,
+        "total_bytes": 450560
+      },
+      {
+        "heap_bytes": 57344,
+        "index_bytes": 360448,
+        "relation": "author_recent_events",
+        "reltuples": -1,
+        "total_bytes": 450560
+      },
+      {
+        "heap_bytes": 188416,
+        "index_bytes": 180224,
+        "relation": "relay_role_stats",
+        "reltuples": 1095,
+        "total_bytes": 409600
+      },
+      {
+        "heap_bytes": 139264,
+        "index_bytes": 212992,
+        "relation": "profile_public_stats",
+        "reltuples": 609,
+        "total_bytes": 393216
+      },
+      {
+        "heap_bytes": 229376,
+        "index_bytes": 73728,
+        "relation": "relay_intel_repairs",
+        "reltuples": 200,
+        "total_bytes": 344064
+      },
+      {
+        "heap_bytes": 131072,
+        "index_bytes": 155648,
+        "relation": "jobs",
+        "reltuples": 229,
+        "total_bytes": 327680
+      },
+      {
+        "heap_bytes": 155648,
+        "index_bytes": 114688,
+        "relation": "relay_registry",
+        "reltuples": 240,
+        "total_bytes": 303104
+      },
+      {
+        "heap_bytes": 98304,
+        "index_bytes": 122880,
+        "relation": "relay_role_adoption_daily",
+        "reltuples": 1048,
+        "total_bytes": 262144
+      },
+      {
+        "heap_bytes": 114688,
+        "index_bytes": 81920,
+        "relation": "relay_capability_observations",
+        "reltuples": 720,
+        "total_bytes": 229376
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 139264,
+        "relation": "relay_lists_latest",
+        "reltuples": 208,
+        "total_bytes": 221184
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 122880,
+        "relation": "relay_probe_attempts",
+        "reltuples": 174,
+        "total_bytes": 212992
+      },
+      {
+        "heap_bytes": 16384,
+        "index_bytes": 155648,
+        "relation": "note_discovery_stats",
+        "reltuples": 0,
+        "total_bytes": 204800
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 106496,
+        "relation": "relay_probe_followups",
+        "reltuples": 180,
+        "total_bytes": 180224
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 90112,
+        "relation": "event_attributes",
+        "reltuples": 229,
+        "total_bytes": 172032
+      },
+      {
+        "heap_bytes": 57344,
+        "index_bytes": 81920,
+        "relation": "author_hourly_activity",
+        "reltuples": 209,
+        "total_bytes": 172032
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 90112,
+        "relation": "trust_interaction_edge_weights",
+        "reltuples": 201,
+        "total_bytes": 163840
+      },
+      {
+        "heap_bytes": 49152,
+        "index_bytes": 73728,
+        "relation": "primal_notification_counts",
+        "reltuples": 400,
+        "total_bytes": 155648
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 81920,
+        "relation": "deletion_addresses",
+        "reltuples": 200,
+        "total_bytes": 155648
+      },
+      {
+        "heap_bytes": 57344,
+        "index_bytes": 57344,
+        "relation": "author_first_seen",
+        "reltuples": 209,
+        "total_bytes": 147456
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 65536,
+        "relation": "event_tags",
+        "reltuples": 200,
+        "total_bytes": 139264
+      },
+      {
+        "heap_bytes": 32768,
+        "index_bytes": 73728,
+        "relation": "kind_author_daily",
+        "reltuples": 228,
+        "total_bytes": 139264
+      },
+      {
+        "heap_bytes": 8192,
+        "index_bytes": 122880,
+        "relation": "profiles_latest",
+        "reltuples": -1,
+        "total_bytes": 139264
+      },
+      {
+        "heap_bytes": 8192,
+        "index_bytes": 114688,
+        "relation": "trust_runs",
+        "reltuples": -1,
+        "total_bytes": 131072
+      },
+      {
+        "heap_bytes": 16384,
+        "index_bytes": 73728,
+        "relation": "thread_summaries",
+        "reltuples": -1,
+        "total_bytes": 122880
+      },
+      {
+        "heap_bytes": 0,
+        "index_bytes": 106496,
+        "relation": "profile_discovery_stats",
+        "reltuples": -1,
+        "total_bytes": 114688
+      },
+      {
+        "heap_bytes": 8192,
+        "index_bytes": 98304,
+        "relation": "event_hashtags",
+        "reltuples": 0,
+        "total_bytes": 114688
+      },
+      {
+        "heap_bytes": 40960,
+        "index_bytes": 40960,
+        "relation": "profile_discovery_recent_activity",
+        "reltuples": 209,
+        "total_bytes": 114688
+      }
+    ]
+  },
+  "mixed": [
+    {
+      "canonical_repair_enabled": true,
+      "database": {
+        "blks_hit": 999836,
+        "blks_read": 1236147,
+        "deadlocks": 0,
+        "temp_bytes": 0,
+        "temp_files": 0,
+        "tup_inserted": 5238,
+        "tup_updated": 2959,
+        "xact_commit": 36789
+      },
+      "derive_errors": 0,
+      "derive_ok": 200,
+      "derive_per_s": 20.791689941269897,
+      "events_attempted": 200,
+      "existing_api": {
+        "name": "profile",
+        "samples": 10519,
+        "errors": 0,
+        "meaningful": 10519,
+        "error_rate": 0,
+        "median_ms": 0.562,
+        "p95_ms": 1.711,
+        "p99_ms": 2.041,
+        "max_ms": 8.271,
+        "throughput_per_s": 1093.5389324610903,
+        "cache": "handler",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "ingest_errors": 0,
+      "ingest_ok": 200,
+      "ingest_per_s": 658.0155887643667,
+      "ingest_wall_ms": 303,
+      "lock_wait_samples": 0,
+      "maintenance_cycles": 2,
+      "max_lock_waiters": 0,
+      "pass": 1,
+      "pending_jobs_after": 0,
+      "pool_acquires": 36951,
+      "pool_empty_acquires": 0,
+      "pool_max_conns": 20,
+      "projection_enabled": false,
+      "queries": 62959,
+      "relay_intel_api": {
+        "name": "relay intel during mixed",
+        "samples": 0,
+        "errors": 0,
+        "meaningful": 0,
+        "error_rate": 0,
+        "cache": "warm-or-miss",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "scenario": "baseline",
+      "wal_bytes": 5445352,
+      "wall_ms": 9619
+    },
+    {
+      "canonical_repair_enabled": true,
+      "database": {
+        "blks_hit": 1087520,
+        "blks_read": 1616601,
+        "deadlocks": 0,
+        "temp_bytes": 0,
+        "temp_files": 0,
+        "tup_inserted": 5849,
+        "tup_updated": 3318,
+        "xact_commit": 46457
+      },
+      "derive_errors": 0,
+      "derive_ok": 200,
+      "derive_per_s": 17.01176822333362,
+      "events_attempted": 200,
+      "existing_api": {
+        "name": "profile",
+        "samples": 10544,
+        "errors": 0,
+        "meaningful": 10544,
+        "error_rate": 0,
+        "median_ms": 0.638,
+        "p95_ms": 1.937,
+        "p99_ms": 2.969,
+        "max_ms": 7.715,
+        "throughput_per_s": 896.8604207341484,
+        "cache": "handler",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "ingest_errors": 0,
+      "ingest_ok": 200,
+      "ingest_per_s": 776.4935975676339,
+      "ingest_wall_ms": 257,
+      "lock_wait_samples": 0,
+      "maintenance_cycles": 2,
+      "max_lock_waiters": 0,
+      "pass": 1,
+      "pending_jobs_after": 0,
+      "pool_acquires": 47629,
+      "pool_empty_acquires": 0,
+      "pool_max_conns": 20,
+      "projection_enabled": true,
+      "queries": 81805,
+      "relay_intel_api": {
+        "name": "relay intel during mixed",
+        "samples": 810,
+        "errors": 0,
+        "meaningful": 810,
+        "error_rate": 0,
+        "median_ms": 15.446,
+        "p95_ms": 25.598,
+        "p99_ms": 28.485,
+        "max_ms": 303.006,
+        "throughput_per_s": 68.89766130450116,
+        "cache": "warm-or-miss",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "scenario": "relay_intel_on",
+      "wal_bytes": 15425896,
+      "wall_ms": 11756
+    },
+    {
+      "canonical_repair_enabled": true,
+      "database": {
+        "blks_hit": 827275,
+        "blks_read": 1359505,
+        "deadlocks": 0,
+        "temp_bytes": 0,
+        "temp_files": 0,
+        "tup_inserted": 3334,
+        "tup_updated": 2868,
+        "xact_commit": 36831
+      },
+      "derive_errors": 0,
+      "derive_ok": 200,
+      "derive_per_s": 20.24820041587779,
+      "events_attempted": 200,
+      "existing_api": {
+        "name": "profile",
+        "samples": 9935,
+        "errors": 0,
+        "meaningful": 9935,
+        "error_rate": 0,
+        "median_ms": 0.716,
+        "p95_ms": 1.866,
+        "p99_ms": 2.883,
+        "max_ms": 37.722,
+        "throughput_per_s": 1005.8293556587291,
+        "cache": "handler",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "ingest_errors": 0,
+      "ingest_ok": 200,
+      "ingest_per_s": 824.7016009000265,
+      "ingest_wall_ms": 242,
+      "lock_wait_samples": 0,
+      "maintenance_cycles": 2,
+      "max_lock_waiters": 0,
+      "pass": 2,
+      "pending_jobs_after": 0,
+      "pool_acquires": 35783,
+      "pool_empty_acquires": 0,
+      "pool_max_conns": 20,
+      "projection_enabled": false,
+      "queries": 61791,
+      "relay_intel_api": {
+        "name": "relay intel during mixed",
+        "samples": 0,
+        "errors": 0,
+        "meaningful": 0,
+        "error_rate": 0,
+        "cache": "warm-or-miss",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "scenario": "baseline",
+      "wal_bytes": 4596992,
+      "wall_ms": 9877
+    },
+    {
+      "canonical_repair_enabled": true,
+      "database": {
+        "blks_hit": 1345603,
+        "blks_read": 1735199,
+        "deadlocks": 0,
+        "temp_bytes": 0,
+        "temp_files": 0,
+        "tup_inserted": 22336,
+        "tup_updated": 5525,
+        "xact_commit": 47512
+      },
+      "derive_errors": 0,
+      "derive_ok": 200,
+      "derive_per_s": 15.872109367721924,
+      "events_attempted": 200,
+      "existing_api": {
+        "name": "profile",
+        "samples": 10374,
+        "errors": 0,
+        "meaningful": 10374,
+        "error_rate": 0,
+        "median_ms": 0.844,
+        "p95_ms": 2.291,
+        "p99_ms": 3.59,
+        "max_ms": 11.237,
+        "throughput_per_s": 823.2863129037362,
+        "cache": "handler",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "ingest_errors": 0,
+      "ingest_ok": 200,
+      "ingest_per_s": 648.2227480828432,
+      "ingest_wall_ms": 308,
+      "lock_wait_samples": 0,
+      "maintenance_cycles": 2,
+      "max_lock_waiters": 0,
+      "pass": 2,
+      "pending_jobs_after": 0,
+      "pool_acquires": 47489,
+      "pool_empty_acquires": 0,
+      "pool_max_conns": 20,
+      "projection_enabled": true,
+      "queries": 81721,
+      "relay_intel_api": {
+        "name": "relay intel during mixed",
+        "samples": 826,
+        "errors": 0,
+        "meaningful": 826,
+        "error_rate": 0,
+        "median_ms": 15.756,
+        "p95_ms": 31.091,
+        "p99_ms": 38.964,
+        "max_ms": 161.085,
+        "throughput_per_s": 65.55181168869154,
+        "cache": "warm-or-miss",
+        "postgres_cache": "postgres shared buffers were not flushed; this is not a cold-database measurement"
+      },
+      "scenario": "relay_intel_on",
+      "wal_bytes": 30743600,
+      "wall_ms": 12600
+    }
+  ],
+  "plans": [
+    "/Users/ivmitko/Documents/Dev/nostrmash-perf-relay-intel/benchmarks/relay-intelligence/operational/plans-medium.txt"
+  ],
+  "notes": [
+    "fixture derivation queue drain processed 29 jobs in 980ms",
+    "mixed workload prep drained 50 queued jobs in 1.669s so the comparison starts from an empty claimable queue"
+  ]
+}
