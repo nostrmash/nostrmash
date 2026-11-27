@@ -235,7 +235,33 @@ func (s *Service) Optimize(ctx context.Context, req PlanRequest) (PlanResponse, 
 	if s.pool == nil {
 		return PlanResponse{}, ErrNotReady
 	}
+	runOptimizeHook(ctx)
+	if err := ctx.Err(); err != nil {
+		return PlanResponse{}, err
+	}
 	return s.plan(ctx, req)
+}
+
+var (
+	optimizeHookMu sync.Mutex
+	optimizeHook   func(context.Context)
+)
+
+// SetOptimizeHook installs a test hook that runs after an optimization has
+// been admitted and before it reads the database. Production leaves it unset.
+func SetOptimizeHook(fn func(context.Context)) {
+	optimizeHookMu.Lock()
+	optimizeHook = fn
+	optimizeHookMu.Unlock()
+}
+
+func runOptimizeHook(ctx context.Context) {
+	optimizeHookMu.Lock()
+	fn := optimizeHook
+	optimizeHookMu.Unlock()
+	if fn != nil {
+		fn(ctx)
+	}
 }
 
 // Verify checks a signed event on the relays the client names. It does not publish.

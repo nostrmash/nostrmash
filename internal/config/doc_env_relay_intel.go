@@ -36,7 +36,7 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Name:         "RELAY_INTEL_BACKFILL_ENABLED",
 			Runtimes:     []string{"worker"},
 			DefaultValue: "true",
-			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. Turning this off does not stop historical tie repair or deletion-address backfill. Re-enabling it walks relay heads that are missing or stale.",
+			Description:  "Project role rows from events already stored in Postgres. This does not crawl the network. Reset relay_intel_backfill_cursor to run it again. Turning this off does not stop historical tie repair or deletion-address backfill. Re-enabling it walks relay heads that are missing, stale, or still missing membership integrity metadata.",
 		},
 		{
 			Name:         "RELAY_INTEL_BACKFILL_BATCH",
@@ -73,6 +73,12 @@ func configEnvDocsRelayIntel() []EnvVarDoc {
 			Runtimes:     []string{"worker"},
 			DefaultValue: "false",
 			Description:  "Also publish one synthetic NIP-17 gift wrap to approved DM relays and check recipient retrieval against an unrelated observer. Off by default. Requires active probes and the probe allowlist. Acceptance alone is not stored as private access.",
+		},
+		{
+			Name:         "RELAY_INTEL_OPTIMIZE_CONCURRENCY",
+			Runtimes:     []string{"api"},
+			DefaultValue: "4",
+			Description:  "Maximum optimizations running at once in one API process. A further request returns 503 with error code overloaded and Retry-After, and is not queued. This does not limit configuration inspection, diagnostics, recommendations, or cached rankings. Raise it for a self-hosted deployment with spare database connections.",
 		},
 		{
 			Name:         "RELAY_INTEL_PROBE_GLOBAL_PER_HOUR",

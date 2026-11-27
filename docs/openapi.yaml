@@ -950,7 +950,12 @@ paths:
         '404':
           description: Relay intelligence is disabled.
         '503':
-          description: Migration 000133 has not been applied.
+          description: >
+            Migration 000133 has not been applied, or this process is already
+            running RELAY_INTEL_OPTIMIZE_CONCURRENCY optimizations. The overload
+            body uses error code overloaded and sets Retry-After. That refusal
+            is not a completed optimization and it is not the per-client 429
+            rate_limited response.
   /api/v1/relays/verify:
     post:
       tags: [public]

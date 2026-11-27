@@ -59,6 +59,7 @@ type Handlers struct {
 	hydrationLimiter      *minuteRateLimiter
 	relayCatalogFreshness time.Duration
 	relayIntel            *relayintel.Service
+	optimizeGate          *optimizeGate
 }
 
 var apiErrLog = logging.New("api")
@@ -114,10 +115,12 @@ func NewHandlersWithOptions(reader EventReader, options HandlersOptions) (Handle
 		catalogFreshness = time.Hour
 	}
 	var relayIntelService *relayintel.Service
+	var optimizeGate *optimizeGate
 	if options.RelayIntel.Enabled && options.Pool != nil {
 		relayIntelService = relayintel.NewService(options.Pool, relayintel.Options{
 			AllowPrivateNetwork: options.RelayIntel.AllowPrivateNetwork,
 		})
+		optimizeGate = newOptimizeGate(options.RelayIntel.OptimizeConcurrency)
 	}
 	return Handlers{
 		service:               service,
@@ -132,6 +135,7 @@ func NewHandlersWithOptions(reader EventReader, options HandlersOptions) (Handle
 		hydrationLimiter:      hydrationLimiter,
 		relayCatalogFreshness: catalogFreshness,
 		relayIntel:            relayIntelService,
+		optimizeGate:          optimizeGate,
 	}, nil
 }
 
