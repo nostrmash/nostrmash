@@ -95,7 +95,9 @@ jobs:
           COVERAGE_PROFILE=.tmp/ci/coverage.out make cover
 
       - name: Test benchmark-tagged workload reporting
-        run: go test -tags relayintelbench ./internal/api/ -run '^TestOperationalMixedReporting$' -count=1
+        run: |
+          RELAY_INTEL_OPERATIONAL_COMPILE=1 scripts/relay_intel_operational_bench.sh
+          go test -tags relayintelbench ./internal/api/ -run '^TestOperationalMixedReporting$' -count=1
 
       - name: Summarize coverage
         run: go tool cover -func=.tmp/ci/coverage.out | tee .tmp/ci/coverage-summary.txt

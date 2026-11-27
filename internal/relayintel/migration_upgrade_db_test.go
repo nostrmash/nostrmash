@@ -11,6 +11,63 @@ import (
 	"github.com/nostrmash/nostrmash/internal/testutil/dbtest"
 )
 
+func TestUpgradeFromProductionWithPrebuiltIndexes(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "production upgrade"), "upmain")
+	// The previous production revision (07b64c1) ends at migration 000132.
+	if err := dbmigrate.MigrateMatching(ctx, pool, "test", func(name string) bool {
+		return name < "000133_"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var oldChecksum string
+	if err := pool.QueryRow(ctx, `SELECT checksum FROM schema_migrations_audit
+		WHERE migration_id = 'migrations/000132_pending_meilisearch_note_claim_index.sql'`).Scan(&oldChecksum); err != nil {
+		t.Fatal(err)
+	}
+	// These are the target tables that already exist in the production schema.
+	for _, ddl := range []string{
+		`CREATE INDEX CONCURRENTLY idx_replaceable_state_kind_pubkey ON replaceable_state (kind, pubkey, d_tag)`,
+		`CREATE INDEX CONCURRENTLY idx_dm_relay_lists_latest_event_id ON dm_relay_lists_latest (event_id)`,
+		`CREATE INDEX CONCURRENTLY idx_nutzap_info_latest_event_id ON nutzap_info_latest (event_id)`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var originalIndex uint32
+	if err := pool.QueryRow(ctx, `SELECT 'idx_replaceable_state_kind_pubkey'::regclass::oid`).Scan(&originalIndex); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbmigrate.Migrate(ctx, pool, "test"); err != nil {
+		t.Fatal(err)
+	}
+	var checksum string
+	var index uint32
+	var validIndexes int
+	if err := pool.QueryRow(ctx, `
+		SELECT checksum, 'idx_replaceable_state_kind_pubkey'::regclass::oid,
+		       (SELECT count(*) FROM pg_index
+		        WHERE indisvalid AND indisready AND indexrelid IN (
+		          'idx_replaceable_state_kind_pubkey'::regclass,
+		          'idx_dm_relay_lists_latest_event_id'::regclass,
+		          'idx_nutzap_info_latest_event_id'::regclass,
+		          'idx_relay_config_heads_event_id'::regclass,
+		          'idx_relay_role_memberships_source_event'::regclass))
+		FROM schema_migrations_audit WHERE migration_id = 'migrations/000132_pending_meilisearch_note_claim_index.sql'
+	`).Scan(&checksum, &index, &validIndexes); err != nil {
+		t.Fatal(err)
+	}
+	if checksum != oldChecksum || index != originalIndex || validIndexes != 5 {
+		t.Fatalf("production upgrade changed prior checksum or index, or left indexes invalid: checksum unchanged=%t, index unchanged=%t, valid indexes=%d",
+			checksum == oldChecksum, index == originalIndex, validIndexes)
+	}
+	assertProbeSchema(t, ctx, pool)
+}
+
 func TestUpgradeFromDevelopPreservesHistoricalRows(t *testing.T) {
 	ctx := context.Background()
 	pool := dbtest.SetupSchemaPool(t, ctx, dbtest.DatabaseURL(t, "develop upgrade"), "updev")
