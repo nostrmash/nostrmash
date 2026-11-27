@@ -63,9 +63,9 @@ func TestOperationalProbeCompletion(t *testing.T) {
 	out := map[string]any{
 		"generated_at":          time.Now().UTC().Format(time.RFC3339),
 		"commit":                strings.TrimSpace(commandOutput("git", "rev-parse", "HEAD")),
-		"implementation_commit": strings.TrimSpace(commandOutput("git", "rev-parse", "origin/feat/relay-capability-probes")),
-		"core_commit":           reviewedCoreCommit,
-		"core_incorporated":     commandOK("git", "merge-base", "--is-ancestor", reviewedCoreCommit, "HEAD"),
+		"implementation_commit": integratedImplementationCommit,
+		"core_commit":           frozenCoreCommit,
+		"core_incorporated":     commandOK("git", "merge-base", "--is-ancestor", frozenCoreCommit, "HEAD") && commandOK("git", "merge-base", "--is-ancestor", integratedImplementationCommit, "HEAD"),
 		"schema":                schema,
 		"scope":                 "Atomic completion on an empty disposable schema. This is not the account-scale benchmark.",
 	}
@@ -138,9 +138,14 @@ func (q *queryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryE
 
 func (q *queryCounter) snapshot() int64 { return q.n.Load() }
 
-// reviewedCoreCommit is the retention-index and membership-metadata commit.
-// The final account-scale run requires this commit in the capability branch.
-const reviewedCoreCommit = "31df4c808129f633593d7bcd605cb178dad40727"
+// frozenCoreCommit is the membership-metadata and retention-index implementation
+// required for a final account-scale run.
+// integratedImplementationCommit is the capability commit that contains it.
+// Both are explicit. The benchmark does not follow a moving branch tip.
+const (
+	frozenCoreCommit               = "678254924cb49f9a34db19aa879563b48f8e7d91"
+	integratedImplementationCommit = "1b144ea9b0a90e77788ba1b0752fd5674d8f3f21"
+)
 
 type opReport struct {
 	mu                   sync.Mutex
@@ -150,6 +155,7 @@ type opReport struct {
 	ImplementationCommit string         `json:"implementation_commit"`
 	CoreCommit           string         `json:"core_commit"`
 	CoreIncorporated     bool           `json:"core_incorporated"`
+	FinalSignoff         bool           `json:"final_signoff"`
 	Scale                string         `json:"scale"`
 	Accounts             int            `json:"accounts"`
 	Environment          map[string]any `json:"environment"`
@@ -167,14 +173,13 @@ type opReport struct {
 
 func newOpReport(path, scale string, accounts int) *opReport {
 	commit := strings.TrimSpace(commandOutput("git", "rev-parse", "HEAD"))
-	implementation := strings.TrimSpace(commandOutput("git", "rev-parse", "origin/feat/relay-capability-probes"))
 	return &opReport{
 		path:                 path,
 		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
 		Commit:               commit,
-		ImplementationCommit: implementation,
-		CoreCommit:           reviewedCoreCommit,
-		CoreIncorporated:     commandOK("git", "merge-base", "--is-ancestor", reviewedCoreCommit, "HEAD"),
+		ImplementationCommit: integratedImplementationCommit,
+		CoreCommit:           frozenCoreCommit,
+		CoreIncorporated:     commandOK("git", "merge-base", "--is-ancestor", frozenCoreCommit, "HEAD") && commandOK("git", "merge-base", "--is-ancestor", integratedImplementationCommit, "HEAD"),
 		Scale:                scale,
 		Accounts:             accounts,
 		Environment:          map[string]any{},

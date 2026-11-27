@@ -43,7 +43,11 @@ func runOperationalScale(t *testing.T, accounts int, outDir string) {
 		scale = "medium"
 	}
 	report := newOpReport(filepath.Join(outDir, "results-"+scale+".json"), scale, accounts)
-	report.note(fmt.Sprintf("Benchmark tooling commit %s. Capability commit %s. Core commit %s incorporated=%t.", report.Commit, report.ImplementationCommit, report.CoreCommit, report.CoreIncorporated))
+	partial := os.Getenv("RELAY_INTEL_OPERATIONAL_PARTIAL") == "1"
+	report.note(fmt.Sprintf("Benchmark tooling commit %s. Tested implementation %s. Frozen core %s incorporated=%t.", report.Commit, report.ImplementationCommit, report.CoreCommit, report.CoreIncorporated))
+	if partial {
+		report.note("PARTIAL benchmark. This output is not operational sign-off.")
+	}
 	report.Environment = collectEnvironment(ctx, pool, schema)
 	report.Environment["seed_session_work_mem"] = "64MB on the seed connection only"
 	report.save()
@@ -54,9 +58,11 @@ func runOperationalScale(t *testing.T, accounts int, outDir string) {
 	membershipColumn := membershipColumnPresent(ctx, pool)
 	report.Environment["core_membership_column"] = membershipColumn
 	report.Environment["core_incorporated"] = report.CoreIncorporated
+	report.Environment["tested_implementation_commit"] = integratedImplementationCommit
+	report.FinalSignoff = report.CoreIncorporated && membershipColumn && !partial
 	report.save()
-	if os.Getenv("RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL") == "1" && !membershipColumn {
-		t.Fatalf("final benchmark refused: core commit %s is not in this schema (relay_config_heads.membership_count is absent)", reviewedCoreCommit)
+	if os.Getenv("RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL") == "1" && !report.FinalSignoff {
+		t.Fatalf("final benchmark refused: implementation %s containing core %s must be in HEAD and relay_config_heads.membership_count must exist (incorporated=%t column=%t partial=%t)", integratedImplementationCommit, frozenCoreCommit, report.CoreIncorporated, membershipColumn, partial)
 	}
 	if err := derivation.EnsureRegisteredDerivations(ctx, pool); err != nil {
 		t.Fatal(err)
@@ -233,7 +239,7 @@ func newBenchHandlers(t *testing.T, pool *pgxpool.Pool) Handlers {
 	handlers, err := NewHandlersWithOptions(pgStore, HandlersOptions{
 		Pool:         pool,
 		MaxBatchSize: 50,
-		RelayIntel:   config.RelayIntelConfig{Enabled: true},
+		RelayIntel:   config.RelayIntelConfig{Enabled: true, OptimizeConcurrency: 4},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -638,6 +644,7 @@ func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 		LIMIT 80`)
 	out["global_role_count"] = timeSQL(t, ctx, pool, 10, `
 		SELECT role, count(*) FROM relay_role_stats GROUP BY role`)
+	out["membership_metadata"] = measureMembershipMetadata(t, ctx, pool)
 
 	resetTieCursor(t, ctx, pool)
 	var repaired int
@@ -775,7 +782,6 @@ func measureMaintenance(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 	`); err != nil {
 		t.Fatal(err)
 	}
-	out["membership_metadata"] = measureMembershipMetadata(t, ctx, pool)
 	if planPath != "" {
 		out["retention_indexes_before_rebuild"] = listRetentionEventIndexes(ctx, pool)
 		out["retention_indexes_removed_for_baseline"] = dropRetentionEventIndexes(ctx, pool)

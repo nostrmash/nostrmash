@@ -15,10 +15,12 @@ export RELAY_INTEL_OPERATIONAL_MIXED_WINDOW_MS="${RELAY_INTEL_OPERATIONAL_MIXED_
 export RELAY_INTEL_OPERATIONAL_BURST_REPEATS="${RELAY_INTEL_OPERATIONAL_BURST_REPEATS:-2}"
 
 mkdir -p "$RELAY_INTEL_OPERATIONAL_OUT"
-echo "commit $(git rev-parse HEAD)"
-echo "implementation $(git rev-parse origin/feat/relay-capability-probes)"
-echo "core $(git rev-parse origin/fix/relay-intelligence)"
-CORE=31df4c808129f633593d7bcd605cb178dad40727
+FROZEN_CORE=678254924cb49f9a34db19aa879563b48f8e7d91
+INTEGRATED=1b144ea9b0a90e77788ba1b0752fd5674d8f3f21
+echo "tooling $(git rev-parse HEAD)"
+echo "implementation $INTEGRATED"
+echo "core $FROZEN_CORE"
+echo "remote_capability_tip $(git rev-parse origin/feat/relay-capability-probes 2>/dev/null || echo absent)"
 if [ "${RELAY_INTEL_OPERATIONAL_COMPILE:-}" = "1" ]; then
   compiled="${TMPDIR:-/tmp}/relayintelbench.test"
   go test -tags relayintelbench -c -o "$compiled" ./internal/api/
@@ -26,15 +28,28 @@ if [ "${RELAY_INTEL_OPERATIONAL_COMPILE:-}" = "1" ]; then
   echo "tagged compile ok"
   exit 0
 fi
-if git merge-base --is-ancestor "$CORE" HEAD; then
-  echo "core incorporated $CORE"
+if ! git cat-file -e "$INTEGRATED^{commit}" || ! git cat-file -e "$FROZEN_CORE^{commit}"; then
+  echo "required commit is not in this repository" >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "$FROZEN_CORE" "$INTEGRATED"; then
+  echo "implementation $INTEGRATED does not contain frozen core $FROZEN_CORE" >&2
+  exit 1
+fi
+if git merge-base --is-ancestor "$INTEGRATED" HEAD && git merge-base --is-ancestor "$FROZEN_CORE" HEAD; then
+  echo "implementation incorporated $INTEGRATED"
+  echo "core incorporated $FROZEN_CORE"
   export RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL=1
+  unset RELAY_INTEL_OPERATIONAL_PARTIAL
 else
-  echo "core not incorporated $CORE"
+  echo "HEAD does not contain implementation $INTEGRATED and core $FROZEN_CORE" >&2
   if [ "${RELAY_INTEL_OPERATIONAL_ALLOW_PARTIAL:-}" != "1" ]; then
-    echo "refusing the account-scale benchmark until that core commit is in HEAD" >&2
+    echo "refusing the account-scale benchmark" >&2
     exit 1
   fi
+  echo "PARTIAL benchmark. This output is not operational sign-off." >&2
+  export RELAY_INTEL_OPERATIONAL_PARTIAL=1
+  unset RELAY_INTEL_OPERATIONAL_REQUIRE_FINAL
 fi
 echo "scale $RELAY_INTEL_OPERATIONAL_SCALE"
 echo "output $RELAY_INTEL_OPERATIONAL_OUT"

@@ -67,21 +67,20 @@ candidates AS (
         FROM replaceable_state rs
         WHERE rs.pubkey = e.pubkey
           AND rs.kind = e.kind
+          AND rs.d_tag = CASE
+                WHEN e.kind >= 30000 AND e.kind < 40000 THEN COALESCE((
+                    SELECT et.value
+                    FROM event_tags et
+                    WHERE et.event_id = e.id
+                      AND et.tag_name = 'd'
+                      AND et.value_index = 0
+                    ORDER BY et.tag_index ASC
+                    LIMIT 1
+                ), '')
+                ELSE ''
+              END
           AND rs.created_at = e.created_at
           AND rs.event_id > e.id
-          AND (
-            (e.kind >= 30000 AND e.kind < 40000 AND rs.d_tag = COALESCE((
-                SELECT et.value
-                FROM event_tags et
-                WHERE et.event_id = e.id
-                  AND et.tag_name = 'd'
-                  AND et.value_index = 0
-                ORDER BY et.tag_index ASC
-                LIMIT 1
-            ), ''))
-            OR e.kind < 30000
-            OR e.kind >= 40000
-          )
       )
       AND NOT EXISTS (
         SELECT 1
@@ -404,9 +403,9 @@ func dropRetentionEventIndexes(ctx context.Context, pool *pgxpool.Pool) []string
 func measurePopulatedIndexBuild(ctx context.Context, pool *pgxpool.Pool, planPath string) map[string]any {
 	var section strings.Builder
 	section.WriteString("\n## populated event-id index build\n")
-	section.WriteString("Disposable schema. These statements replay the index definitions from core commit " + reviewedCoreCommit + ". They are not a production migration.\n")
+	section.WriteString("Disposable schema. These statements replay the index definitions from core commit " + frozenCoreCommit + ". They are not a production migration.\n")
 	out := map[string]any{
-		"core_commit": reviewedCoreCommit,
+		"core_commit": frozenCoreCommit,
 		"label":       "Indexes were created on this populated disposable schema. CREATE INDEX takes ShareLock. The membership index is then rebuilt with CREATE INDEX CONCURRENTLY so a writer can be compared.",
 	}
 	lookups := map[string]string{
@@ -643,184 +642,200 @@ func measureMembershipMetadata(t *testing.T, ctx context.Context, pool *pgxpool.
 	if !membershipColumnPresent(ctx, pool) {
 		return map[string]any{
 			"measured":    false,
-			"core_commit": reviewedCoreCommit,
-			"blocker":     "relay_config_heads.membership_count is absent. Core commit " + reviewedCoreCommit + " is not in this schema, so historical heads were not discovered or processed and no reconciliation throughput is reported.",
+			"core_commit": frozenCoreCommit,
+			"blocker":     "relay_config_heads.membership_count is absent. Frozen core " + frozenCoreCommit + " is not in this schema, so historical heads were not discovered or processed.",
 		}
 	}
-	var unresolved int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_config_heads WHERE membership_count < 0`).Scan(&unresolved); err != nil {
+	deletedTag, err := pool.Exec(ctx, `
+		WITH chosen AS (
+			SELECT h.event_id, h.pubkey, h.created_at
+			FROM relay_config_heads h
+			WHERE h.membership_count = -1
+			  AND NOT EXISTS (
+			      SELECT 1 FROM deletion_events de
+			      WHERE de.target_event_id = h.event_id AND de.deleter_pubkey = h.pubkey
+			  )
+			ORDER BY h.pubkey, h.source_kind, h.d_tag
+			LIMIT 20
+		)
+		INSERT INTO deletion_events (event_id, deleter_pubkey, target_event_id, created_at, derivation_version)
+		SELECT 'bd' || substr(md5(event_id), 1, 40), pubkey, event_id, created_at, 1
+		FROM chosen
+		ON CONFLICT (event_id) DO NOTHING
+	`)
+	if err != nil {
 		return map[string]any{"measured": false, "error": err.Error()}
 	}
+	before := membershipCensus(ctx, pool)
+	beforeStatus, statusErr := relayintel.ReadProjectionReconcileStatus(ctx, pool)
 	out := map[string]any{
-		"measured": true, "unreconciled_heads": unresolved,
-		"discovery": "membership_count < 0 is the historical unreconciled state",
+		"measured":             true,
+		"path":                 "BackfillBatch",
+		"deleted_heads_marked": deletedTag.RowsAffected(),
+		"before":               before,
+		"pending_before":       beforeStatus.PendingEligible,
+		"status_error":         errorText(statusErr),
+		"note":                 "Seeded heads omit membership_count, so they keep the migration default of -1. BackfillBatch reconciles those heads from the authoritative event. Deleted events stay out of the eligible backlog.",
 	}
-	var functionReady bool
-	_ = pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM pg_proc p
-			JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE p.proname = 'relay_intel_projection_ready' AND n.nspname = current_schema()
-		)`).Scan(&functionReady)
-	out["projection_ready_function"] = functionReady
-	if unresolved == 0 {
-		out["note"] = "No head has membership_count < 0. There is no historical set to process."
+	if err := relayintel.ResetProjectionReconcile(ctx, pool); err != nil {
+		out["reset_error"] = err.Error()
 		return out
 	}
-	rows, err := pool.Query(ctx, `
-		SELECT pubkey, source_kind, d_tag, event_id, created_at
-		FROM relay_config_heads
-		WHERE membership_count < 0
-		ORDER BY pubkey, source_kind, d_tag
-		LIMIT 200`)
-	if err != nil {
-		out["error"] = err.Error()
-		return out
-	}
-	defer rows.Close()
-	var heads []storedHead
-	for rows.Next() {
-		var row storedHead
-		if err := rows.Scan(&row.pubkey, &row.kind, &row.dTag, &row.eventID, &row.created); err != nil {
-			out["error"] = err.Error()
-			return out
-		}
-		heads = append(heads, row)
-	}
-	if len(heads) == 0 {
-		return out
-	}
-	if functionReady {
-		var ready bool
-		err := pool.QueryRow(ctx, `SELECT relay_intel_projection_ready($1, $2, $3, $4, true)`,
-			heads[0].pubkey, heads[0].kind, heads[0].dTag, heads[0].eventID).Scan(&ready)
-		out["sample_ready_before"] = ready
-		if err != nil {
-			out["sample_ready_before_error"] = err.Error()
-		}
-	}
-	child, cancel := context.WithCancel(ctx)
-	defer cancel()
 	started := time.Now()
-	processed, failures := 0, 0
-	interrupted := len(heads)
+	batches := 0
 	var failure string
-	for i, head := range heads {
-		if i == 20 && len(heads) > 21 {
-			cancel()
-			interrupted = i
+	run := func(c context.Context) error {
+		err := relayintel.BackfillBatch(c, pool, 200)
+		if err != nil {
+			return err
+		}
+		batches++
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		if err := run(ctx); err != nil {
+			failure = err.Error()
 			break
 		}
-		err := projectStoredHead(child, pool, head)
-		if err != nil {
-			failures++
-			if failure == "" {
-				failure = err.Error()
-			}
-			continue
-		}
-		processed++
 	}
-	if interrupted < len(heads) {
-		dead, deadCancel := context.WithCancel(ctx)
-		deadCancel()
-		out["canceled_project_error"] = errorText(projectStoredHead(dead, pool, heads[interrupted]))
-	}
-	interruptWall := time.Since(started)
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	out["canceled_backfill_error"] = errorText(run(dead))
 	resumeStart := time.Now()
-	resumed := 0
-	for _, head := range heads[interrupted:] {
-		if err := projectStoredHead(ctx, pool, head); err != nil {
-			failures++
-			if failure == "" {
-				failure = err.Error()
-			}
-			continue
+	stalled := 0
+	lastPending := -1
+	for failure == "" && time.Since(started) < 90*time.Minute {
+		status, err := relayintel.ReadProjectionReconcileStatus(ctx, pool)
+		if err != nil {
+			failure = err.Error()
+			break
 		}
-		resumed++
+		if status.PendingEligible == 0 && status.UpgradeComplete {
+			break
+		}
+		if status.PendingEligible == lastPending {
+			stalled++
+			if stalled > 5 {
+				failure = "reconciliation made no progress"
+				break
+			}
+		} else {
+			stalled = 0
+		}
+		lastPending = status.PendingEligible
+		if batches%20 == 0 {
+			t.Logf("membership reconciliation batches=%d pending=%d", batches, status.PendingEligible)
+		}
+		if err := run(ctx); err != nil {
+			failure = err.Error()
+			break
+		}
 	}
-	var still int64
-	_ = pool.QueryRow(ctx, `
-		SELECT count(*) FROM relay_config_heads
-		WHERE membership_count < 0 AND event_id = ANY($1::text[])`, retentionHeadIDs(heads)).Scan(&still)
-	out["batch_limit"] = len(heads)
-	out["processed_before_interrupt"] = processed
-	out["interrupt_at"] = interrupted
-	out["interrupt_wall_ms"] = interruptWall.Milliseconds()
-	out["resumed"] = resumed
+	steadyStart := time.Now()
+	steadyErr := relayintel.BackfillBatch(ctx, pool, 200)
+	afterStatus, _ := relayintel.ReadProjectionReconcileStatus(ctx, pool)
+	after := membershipCensus(ctx, pool)
+	elapsed := time.Since(started)
+	processed := before["unknown"] - after["unknown"]
+	out["batches"] = batches
+	out["wall_ms"] = elapsed.Milliseconds()
 	out["resume_wall_ms"] = time.Since(resumeStart).Milliseconds()
-	out["failures"] = failures
-	out["still_unreconciled_in_batch"] = still
-	out["reconciled_in_batch"] = int64(len(heads)) - still
-	if len(heads) > 0 && interruptWall > 0 {
-		out["heads_per_second_before_interrupt"] = float64(processed) / interruptWall.Seconds()
+	out["after"] = after
+	out["pending_after"] = afterStatus.PendingEligible
+	out["upgrade_complete"] = afterStatus.UpgradeComplete
+	out["integrity_recorded"] = afterStatus.IntegrityRecorded
+	out["steady_state_wall_ms"] = time.Since(steadyStart).Milliseconds()
+	out["steady_state_error"] = errorText(steadyErr)
+	mismatches, checked := membershipDigestMismatches(ctx, pool)
+	out["digest_mismatches"] = mismatches
+	out["digest_heads_checked"] = checked
+	out["deleted_configs_rewritten"] = deletedConfigsRewritten(ctx, pool)
+	if processed > 0 && elapsed > 0 {
+		out["heads_per_second"] = float64(processed) / elapsed.Seconds()
 	}
 	if failure != "" {
 		out["failure"] = failure
 	}
-	out["accepted"] = failures == 0 && still == 0 && processed+resumed == len(heads) && processed > 0
-	if still > 0 {
-		out["note"] = "Project ran on the historical heads. membership_count stayed below 0, so this build did not write the membership metadata."
+	out["accepted"] = failure == "" && afterStatus.UpgradeComplete && afterStatus.PendingEligible == 0 &&
+		mismatches == 0 && deletedConfigsRewritten(ctx, pool) == 0 &&
+		after["unknown_live"] == 0 && after["empty_nonzero"] == 0 && after["truncated_unknown"] == 0
+	return out
+}
+
+func membershipCensus(ctx context.Context, pool *pgxpool.Pool) map[string]int64 {
+	var unknown, unreadable, zero, emptyZero, emptyNonzero, truncatedOK, truncatedUnknown, positive, unknownLive int64
+	err := pool.QueryRow(ctx, `
+		SELECT
+			count(*) FILTER (WHERE h.membership_count = -1),
+			count(*) FILTER (WHERE h.membership_count = -2),
+			count(*) FILTER (WHERE h.membership_count = 0),
+			count(*) FILTER (WHERE h.explicitly_empty AND h.membership_count = 0),
+			count(*) FILTER (WHERE h.explicitly_empty AND h.membership_count > 0),
+			count(*) FILTER (WHERE h.truncated AND h.membership_count >= 0),
+			count(*) FILTER (WHERE h.truncated AND h.membership_count < 0),
+			count(*) FILTER (WHERE h.membership_count > 0),
+			count(*) FILTER (
+				WHERE h.membership_count = -1
+				  AND EXISTS (SELECT 1 FROM events e WHERE e.id = h.event_id)
+				  AND NOT EXISTS (
+				      SELECT 1 FROM deletion_events de
+				      WHERE de.target_event_id = h.event_id AND de.deleter_pubkey = h.pubkey
+				  )
+			)
+		FROM relay_config_heads h
+	`).Scan(&unknown, &unreadable, &zero, &emptyZero, &emptyNonzero, &truncatedOK, &truncatedUnknown, &positive, &unknownLive)
+	out := map[string]int64{
+		"unknown": unknown, "unreadable": unreadable, "zero": zero,
+		"empty_zero": emptyZero, "empty_nonzero": emptyNonzero,
+		"truncated_recorded": truncatedOK, "truncated_unknown": truncatedUnknown,
+		"positive": positive, "unknown_live": unknownLive,
+	}
+	if err != nil {
+		out["error_sentinel"] = 1
 	}
 	return out
 }
 
-type storedHead struct {
-	pubkey, dTag, eventID string
-	kind                  int
-	created               int64
+func membershipDigestMismatches(ctx context.Context, pool *pgxpool.Pool) (int64, int64) {
+	var eligible int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM relay_config_heads WHERE membership_count >= 0`).Scan(&eligible); err != nil {
+		return -1, 0
+	}
+	checked := eligible
+	if checked > 400 {
+		checked = 400
+	}
+	var n int64
+	err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM (
+			SELECT pubkey, source_kind, d_tag, membership_count, membership_digest
+			FROM relay_config_heads
+			WHERE membership_count >= 0
+			ORDER BY pubkey, source_kind, d_tag
+			LIMIT $1
+		) h
+		WHERE (h.membership_count, h.membership_digest) IS DISTINCT FROM (
+			SELECT d.membership_count, d.membership_digest
+			FROM relay_intel_membership_digest(h.pubkey, h.source_kind, h.d_tag) d
+		)`, checked).Scan(&n)
+	if err != nil {
+		return -1, checked
+	}
+	return n, checked
 }
 
-func projectStoredHead(ctx context.Context, pool *pgxpool.Pool, head storedHead) error {
-	var content string
-	if err := pool.QueryRow(ctx, `SELECT COALESCE(content, '') FROM events WHERE id = $1`, head.eventID).Scan(&content); err != nil {
-		return err
-	}
-	rows, err := pool.Query(ctx, `
-		SELECT tag_index, tag_name, value
-		FROM event_tags
-		WHERE event_id = $1
-		ORDER BY tag_index, value_index`, head.eventID)
+func deletedConfigsRewritten(ctx context.Context, pool *pgxpool.Pool) int64 {
+	var n int64
+	err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM relay_config_heads h
+		JOIN deletion_events de
+		  ON de.target_event_id = h.event_id AND de.deleter_pubkey = h.pubkey
+		WHERE h.membership_count >= 0
+	`).Scan(&n)
 	if err != nil {
-		return err
+		return -1
 	}
-	defer rows.Close()
-	var tags [][]string
-	var current = -1
-	for rows.Next() {
-		var index int
-		var name, value string
-		if err := rows.Scan(&index, &name, &value); err != nil {
-			return err
-		}
-		if index != current {
-			tags = append(tags, []string{name, value})
-			current = index
-			continue
-		}
-		tags[len(tags)-1] = append(tags[len(tags)-1], value)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := relayintel.Project(ctx, tx, relayintel.EventInput{
-		Pubkey: head.pubkey, EventID: head.eventID, Kind: head.kind,
-		CreatedAt: head.created, Content: content, Tags: tags,
-	}); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
-func retentionHeadIDs(heads []storedHead) []string {
-	ids := make([]string, len(heads))
-	for i, head := range heads {
-		ids[i] = head.eventID
-	}
-	return ids
+	return n
 }
