@@ -62,20 +62,23 @@ func TestStatsRefreshSkipsARecentSharedSnapshot(t *testing.T) {
 	}
 }
 
-func TestStatsRefreshScopesTimeoutToItsTransaction(t *testing.T) {
+func TestStatsRefreshScopesSettingsToItsTransaction(t *testing.T) {
 	ctx := context.Background()
 	pool := repairPool(t, ctx)
 	if _, err := pool.Exec(ctx, `
-		CREATE FUNCTION assert_relay_stats_timeout() RETURNS trigger LANGUAGE plpgsql AS $$
+		CREATE FUNCTION assert_relay_stats_settings() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			IF (SELECT setting FROM pg_settings WHERE name = 'statement_timeout') <> '120000' THEN
 				RAISE EXCEPTION 'unexpected statement timeout for relay statistics';
 			END IF;
+			IF current_setting('enable_nestloop') <> 'off' THEN
+				RAISE EXCEPTION 'unexpected nested-loop setting for relay statistics';
+			END IF;
 			RETURN NULL;
 		END;
 		$$;
-		CREATE TRIGGER assert_relay_stats_timeout BEFORE INSERT ON relay_role_stats
-		FOR EACH STATEMENT EXECUTE FUNCTION assert_relay_stats_timeout();
+		CREATE TRIGGER assert_relay_stats_settings BEFORE INSERT ON relay_role_stats
+		FOR EACH STATEMENT EXECUTE FUNCTION assert_relay_stats_settings();
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -83,19 +86,26 @@ func TestStatsRefreshScopesTimeoutToItsTransaction(t *testing.T) {
 	cfg.MaxConns = 1
 	cfg.MinConns = 0
 	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "15s"
+	cfg.ConnConfig.RuntimeParams["enable_nestloop"] = "on"
 	refreshPool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer refreshPool.Close()
 	if err := relayintel.RefreshStats(ctx, refreshPool, "", 0); err != nil {
-		t.Fatalf("refresh with the production timeout: %v", err)
+		t.Fatalf("refresh with production session settings: %v", err)
 	}
-	var sessionTimeout string
-	if err := refreshPool.QueryRow(ctx, `SELECT setting FROM pg_settings WHERE name = 'statement_timeout'`).Scan(&sessionTimeout); err != nil {
+	var sessionTimeout, sessionNestloop string
+	if err := refreshPool.QueryRow(ctx, `
+		SELECT (SELECT setting FROM pg_settings WHERE name = 'statement_timeout'),
+		       current_setting('enable_nestloop')
+	`).Scan(&sessionTimeout, &sessionNestloop); err != nil {
 		t.Fatal(err)
 	}
 	if sessionTimeout != "15000" {
 		t.Fatalf("timeout after refresh = %q, want 15000", sessionTimeout)
+	}
+	if sessionNestloop != "on" {
+		t.Fatalf("nested-loop setting after refresh = %q, want on", sessionNestloop)
 	}
 }

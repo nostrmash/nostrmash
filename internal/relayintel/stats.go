@@ -48,10 +48,15 @@ func RefreshStats(ctx context.Context, pool *pgxpool.Pool, excludePubkey string,
 			return err
 		}
 	}
-	// Give the aggregate time to finish under the production query limit.
-	// SET LOCAL restores the caller's timeout when this transaction ends.
-	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = '2min'`); err != nil {
-		return fmt.Errorf("set relay statistics statement timeout: %w", err)
+	// The planner can underestimate the effective memberships and repeatedly scan
+	// the deletion tables in a nested-loop anti join. Favor set-based joins for
+	// this bulk refresh and give it longer than the interactive query timeout.
+	// Both settings are restored when this transaction ends.
+	if _, err := tx.Exec(ctx, `
+		SET LOCAL enable_nestloop = off;
+		SET LOCAL statement_timeout = '2min';
+	`); err != nil {
+		return fmt.Errorf("set relay statistics transaction options: %w", err)
 	}
 	started := time.Now()
 
